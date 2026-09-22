@@ -104,7 +104,30 @@ def get_chromium_path() -> str | None:
     return _find_chromium()
 
 
-CHROMIUM_PATH = get_chromium_path()
+def ensure_chromium_installed() -> str | None:
+    """自动检测 Playwright Chromium 浏览器，若未检测到则在后台秒级全自动补全下载。"""
+    found = get_chromium_path()
+    if found:
+        return found
+
+    print("[提示] 未检测到 Playwright Chromium 独立浏览器，正在启动全自动触发下载补全...")
+    import subprocess
+    target_dir = BASE_DIR / "ms-playwright"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(target_dir)
+
+    try:
+        if sys.platform != "win32":
+            subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=False)
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        print("[OK] Playwright Chromium 浏览器全自动下载并补全成功！")
+    except Exception as e:
+        print(f"[警告] 自动下载 Chromium 过程中出现提示: {e}")
+
+    return _find_chromium()
+
+
+CHROMIUM_PATH = ensure_chromium_installed()
 
 
 # ── Azure 相关 URL ────────────────────────────────────────────

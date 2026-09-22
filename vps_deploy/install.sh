@@ -68,10 +68,16 @@ pip install -r requirements.txt
 
 export PLAYWRIGHT_BROWSERS_PATH="$SCRIPT_DIR/ms-playwright"
 mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
-python -m playwright install chromium
+
 if command -v apt-get >/dev/null 2>&1; then
     python -m playwright install-deps chromium || true
 fi
+
+echo -e "${CYAN}[提示] 正在全自动下载 Playwright Chromium 独立浏览器...${NC}"
+python -m playwright install chromium || python3 -m playwright install chromium || {
+    echo -e "${YELLOW}[警告] 首次下载 Chromium 遇阻，正在重试强制下载...${NC}"
+    python -m playwright install --force chromium
+}
 
 # 4. 初始化配置与目录
 echo -e "\n${GREEN}[4/5] 检查配置文件与工作目录...${NC}"
@@ -81,6 +87,10 @@ if [ ! -f ".env" ]; then
         cp .env.example .env
         echo -e "${GREEN}[OK] 已生成默认 .env 配置文件 (已开启 HEADLESS=true 与省流量)${NC}"
     fi
+fi
+
+if ! grep -q "PLAYWRIGHT_BROWSERS_PATH" .env 2>/dev/null; then
+    echo "PLAYWRIGHT_BROWSERS_PATH=$SCRIPT_DIR/ms-playwright" >> .env
 fi
 
 # 5. 配置并启动 Systemd 守护进程
