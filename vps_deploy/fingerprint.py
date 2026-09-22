@@ -1400,6 +1400,11 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
     """创建带高拟真独立随机指纹的 Playwright BrowserContext，纯净环境隔离并与代理 IP 精准对齐。
     返回 (browser, ctx, fp, stats)。
     """
+    if sys.platform != "win32" and "DISPLAY" not in os.environ:
+        if not headless:
+            log.info("[提示] 检测到 Linux 纯终端环境 (无 XServer/DISPLAY)，全自动强制开启无头模式 (headless=True)")
+            headless = True
+
     fp = random_fingerprint(major_ver="131")
 
     # 动态探测动态代理出口 IP 物理信息（时区、国家、经纬度），与主进程/子进程严格对齐

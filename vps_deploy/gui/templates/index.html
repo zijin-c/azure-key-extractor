@@ -304,7 +304,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
 
       <div class="toggle-row">
         <label class="toggle">
-          <input type="checkbox" id="headless-toggle">
+          <input type="checkbox" id="headless-toggle" checked>
           <span class="slider"></span>
         </label>
         <label for="headless-toggle">无头模式（后台运行）</label>
@@ -733,7 +733,7 @@ async function loadForm(){
   const acc = lsGet(LS.ACC, ''); if(acc) document.getElementById('accounts').value = acc;
   const proxy = lsGet(LS.PROXY, ''); if(proxy) document.getElementById('proxy-input').value = proxy;
   const concurrency = lsGet('azure_concurrency', '3'); if(concurrency) document.getElementById('concurrency-input').value = concurrency;
-  document.getElementById('headless-toggle').checked = lsGet(LS.HEADLESS, '0') === '1';
+  document.getElementById('headless-toggle').checked = lsGet(LS.HEADLESS, '1') === '1';
   updateAccountCount();
   const n = document.querySelectorAll('.product-cb:checked').length;
   document.getElementById('product-count-label').textContent = `（已选 ${n} 个）`;

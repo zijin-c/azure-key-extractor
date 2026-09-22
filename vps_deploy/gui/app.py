@@ -334,6 +334,8 @@ def api_start():
 
     raw_accounts = data.get("accounts", "").strip()
     headless     = data.get("headless", False)
+    if sys.platform != "win32" and "DISPLAY" not in os.environ:
+        headless = True
     proxy        = data.get("proxy", "").strip() or None
     vless_proxy  = data.get("vless_proxy", "").strip() or None
     selected_products = data.get("products", None)  # 用户选择的产品列表
