@@ -1462,15 +1462,8 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         browser_args.extend(["--no-sandbox"])
 
     if not exe_path or not os.path.exists(exe_path):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        ms_pw = os.path.join(base_dir, "ms-playwright")
-        if os.path.exists(ms_pw):
-            for root, dirs, files in os.walk(ms_pw):
-                if "chrome.exe" in files:
-                    candidate = os.path.join(root, "chrome.exe")
-                    if "chrome-win64" in candidate:
-                        exe_path = candidate
-                        break
+        import config
+        exe_path = config.ensure_chromium_installed()
 
     launch_kwargs = {
         "headless": headless,
@@ -1490,11 +1483,19 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
 
     try:
         browser = await pw.chromium.launch(**launch_kwargs)
-    except Exception:
+    except Exception as e:
+        log.warning(f"首次启动 Playwright Chromium 路径失败 ({e})，正在清理路径参数进行智能兼容启动...")
+        clean_kwargs = {k: v for k, v in launch_kwargs.items() if k != "executable_path"}
         try:
-            browser = await pw.chromium.launch(**launch_kwargs, channel="chrome")
-        except Exception:
-            browser = await pw.chromium.launch(**launch_kwargs, channel="msedge")
+            browser = await pw.chromium.launch(**clean_kwargs)
+        except Exception as e2:
+            if sys.platform == "win32":
+                try:
+                    browser = await pw.chromium.launch(**clean_kwargs, channel="msedge")
+                except Exception:
+                    browser = await pw.chromium.launch(**clean_kwargs, channel="chrome")
+            else:
+                raise e2
 
     real_ver = getattr(browser, "version", "") or "131.0.0.0"
     major_ver = real_ver.split(".")[0] if "." in real_ver else "131"
