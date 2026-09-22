@@ -802,12 +802,13 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 "button:has-text('I want to use a different authenticator app')",
                 "a:has-text('Set up a different authentication app')",
                 "a:has-text('Other options')",
+                "text='I want to use a different authenticator app'",
             ]:
                 try:
                     loc = page.locator(alt_sel).first
                     if await loc.is_visible(timeout=80):
                         await loc.click(force=True)
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2)
                         break
                 except Exception:
                     pass
@@ -820,7 +821,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 "input[value='Next']",
                 "button:has-text('下一步')",
                 "input[value='下一步']"
-            ], timeout=2000)
+            ], timeout=1500)
             try:
                 await page.evaluate("""() => {
                     const btn = document.querySelector('#idSubmit_SAOTCC_Continue') ||
