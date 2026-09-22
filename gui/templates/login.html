@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - Azure Key 提取工具</title>
+<style>
+:root {
+  --bg: linear-gradient(135deg, #e0e7ff 0%, #fae8ff 50%, #fef2f2 100%);
+  --surface: rgba(255, 255, 255, 0.7);
+  --border: rgba(255, 255, 255, 0.5);
+  --input-border: #e2e8f0;
+  --input-bg: rgba(255, 255, 255, 0.85);
+  --input-focus-bg: #ffffff;
+  --text: #1e293b;
+  --muted: #64748b;
+  --icon-color: #94a3b8;
+  --accent: #1e70f6;
+  --accent-hover: #1b63db;
+  --accent-shadow: rgba(30, 112, 246, 0.25);
+  --sans: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --radius: 12px;
+  --radius-lg: 24px;
+  --shadow: 0 20px 40px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.02);
+  --red-bg: rgba(248, 113, 113, 0.1);
+  --red-border: rgba(248, 113, 113, 0.25);
+  --red-text: #dc2626;
+  --green-bg: rgba(52, 211, 153, 0.1);
+  --green-border: rgba(52, 211, 153, 0.25);
+  --green-text: #16a34a;
+}
+
+[data-theme="dark"] {
+  --bg: linear-gradient(135deg, #090d16 0%, #151025 50%, #1c0e12 100%);
+  --surface: rgba(21, 29, 54, 0.7);
+  --border: rgba(255, 255, 255, 0.06);
+  --input-border: rgba(255, 255, 255, 0.08);
+  --input-bg: rgba(15, 21, 41, 0.85);
+  --input-focus-bg: #0f1529;
+  --text: #f1f5f9;
+  --muted: #94a3b8;
+  --icon-color: #64748b;
+  --accent: #2563eb;
+  --accent-hover: #3b82f6;
+  --accent-shadow: rgba(37, 99, 235, 0.35);
+  --shadow: 0 20px 40px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --red-bg: rgba(248, 113, 113, 0.08);
+  --red-border: rgba(248, 113, 113, 0.2);
+  --red-text: #f87171;
+  --green-bg: rgba(52, 211, 153, 0.08);
+  --green-border: rgba(52, 211, 153, 0.2);
+  --green-text: #34d399;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+  transition: background .25s, color .25s;
+}
+
+/* 动感炫彩模糊背景环绕 */
+.blur-circle {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(120px);
+  z-index: 0;
+  opacity: 0.65;
+  pointer-events: none;
+}
+.circle-1 {
+  top: -10%;
+  left: -10%;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, #c7d2fe, transparent 70%);
+}
+.circle-2 {
+  bottom: -15%;
+  right: -10%;
+  width: 500px;
+  height: 500px;
+  background: radial-gradient(circle, #fbcfe8, transparent 70%);
+}
+.circle-3 {
+  top: 30%;
+  right: 15%;
+  width: 400px;
+  height: 400px;
+  background: radial-gradient(circle, #fed7aa, transparent 70%);
+}
+[data-theme="dark"] .circle-1 {
+  background: radial-gradient(circle, rgba(99, 102, 241, 0.15), transparent 70%);
+}
+[data-theme="dark"] .circle-2 {
+  background: radial-gradient(circle, rgba(236, 72, 153, 0.1), transparent 70%);
+}
+[data-theme="dark"] .circle-3 {
+  background: radial-gradient(circle, rgba(249, 115, 22, 0.08), transparent 70%);
+}
+
+/* 极具质感的细密网格背景 */
+.grid-overlay {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(rgba(255, 255, 255, 0.25) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 255, 255, 0.25) 1px, transparent 1px);
+  background-size: 40px 40px;
+  z-index: 1;
+  pointer-events: none;
+}
+[data-theme="dark"] .grid-overlay {
+  background-image: linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
+
+.login-card {
+  position: relative;
+  z-index: 10;
+  width: 100%;
+  max-width: 440px;
+  padding: 48px 40px;
+  background: var(--surface);
+  backdrop-filter: blur(25px) saturate(180%);
+  -webkit-backdrop-filter: blur(25px) saturate(180%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+  transition: transform 0.3s ease, border-color 0.25s, background-color 0.25s;
+}
+
+/* 渐变标题 */
+.brand-name {
+  font-size: 1.6rem;
+  font-weight: 800;
+  text-align: center;
+  background: linear-gradient(135deg, #7c3aed, #ec4899);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: 0.05em;
+}
+.brand-line {
+  width: 36px;
+  height: 4px;
+  background: linear-gradient(90deg, #7c3aed, #ec4899);
+  border-radius: 2px;
+  margin: 10px auto 14px;
+}
+.welcome-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  text-align: center;
+  color: var(--text);
+  margin-bottom: 30px;
+  letter-spacing: -0.01em;
+}
+
+.form-group {
+  margin-bottom: 20px;
+}
+.form-group label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+/* 输入框组合区 */
+.input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.input-icon {
+  position: absolute;
+  left: 14px;
+  color: var(--icon-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  width: 18px;
+  height: 18px;
+}
+.form-group input {
+  width: 100%;
+  padding: 13px 14px 13px 44px;
+  border: 1px solid var(--input-border);
+  border-radius: var(--radius);
+  background: var(--input-bg);
+  color: var(--text);
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.2s ease;
+}
+.form-group input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(30, 112, 246, 0.15);
+  background: var(--input-focus-bg);
+}
+
+/* 密码明密文切换 */
+.password-toggle {
+  position: absolute;
+  right: 14px;
+  background: none;
+  border: none;
+  color: var(--icon-color);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 4px;
+  transition: color 0.2s;
+}
+.password-toggle:hover {
+  color: var(--text);
+}
+
+.btn-submit {
+  width: 100%;
+  padding: 14px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px var(--accent-shadow);
+  transition: all 0.2s ease;
+  margin-top: 10px;
+}
+.btn-submit:hover {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px var(--accent-shadow);
+}
+.btn-submit:active {
+  transform: translateY(0);
+}
+.btn-submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* 提示信息框 */
+.msg {
+  margin-top: 16px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  font-size: 0.88rem;
+  display: none;
+  text-align: center;
+  font-weight: 550;
+  animation: slideDown 0.3s ease;
+}
+.msg.err {
+  display: block;
+  background: var(--red-bg);
+  color: var(--red-text);
+  border: 1px solid var(--red-border);
+}
+.msg.ok {
+  display: block;
+  background: var(--green-bg);
+  color: var(--green-text);
+  border: 1px solid var(--green-border);
+}
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 右上角按钮栏 */
+.top-actions {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  gap: 10px;
+  z-index: 100;
+}
+.action-btn {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text);
+  transition: all 0.2s ease;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+}
+.action-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+</style>
+</head>
+<body>
+
+<!-- 动效彩色球 -->
+<div class="blur-circle circle-1"></div>
+<div class="blur-circle circle-2"></div>
+<div class="blur-circle circle-3"></div>
+
+<!-- 细密背景网格 -->
+<div class="grid-overlay"></div>
+
+<!-- 右上角工具按钮 -->
+<div class="top-actions">
+  <button class="action-btn" id="theme-btn" onclick="toggleTheme()" title="切换主题">☀️</button>
+</div>
+
+<div class="login-card">
+  <div class="brand-name">KEY EXTRACTOR</div>
+  <div class="brand-line"></div>
+  <h2 class="welcome-title">你好</h2>
+
+  <form id="auth-form" onsubmit="handleSubmit(event)">
+    <div class="form-group">
+      <label for="username">用户名</label>
+      <div class="input-wrapper">
+        <div class="input-icon">
+          <!-- User Icon SVG -->
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z" />
+          </svg>
+        </div>
+        <input type="text" id="username" name="username" autocomplete="username"
+               placeholder="用户名" required minlength="2" maxlength="32">
+      </div>
+    </div>
+    <div class="form-group">
+      <label for="password">密码</label>
+      <div class="input-wrapper">
+        <div class="input-icon">
+          <!-- Lock Icon SVG -->
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+          </svg>
+        </div>
+        <input type="password" id="password" name="password" autocomplete="current-password"
+               placeholder="密码" required minlength="4">
+        <button type="button" class="password-toggle" onclick="togglePasswordVisibility()" title="切换密码显示">
+          <!-- Eye Icon SVG (Default Locked) -->
+          <svg id="eye-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width: 18px; height: 18px;">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 0 0 1.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.451 10.451 0 0 1 12 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 0 1-4.293 5.774M6.228 6.228 3 3m3.228 3.228 3.65 3.65m7.894 7.894L21 21m-3.228-3.228-3.65-3.65m0 0a3 3 0 1 0-4.243-4.243m4.242 4.242L9.88 9.88" />
+          </svg>
+        </button>
+      </div>
+    </div>
+    <button type="submit" class="btn-submit" id="btn-submit">登 录</button>
+  </form>
+
+  <div class="msg" id="msg"></div>
+</div>
+
+<script>
+async function handleSubmit(e) {
+  e.preventDefault();
+  const btn = document.getElementById('btn-submit');
+  const msg = document.getElementById('msg');
+  btn.disabled = true;
+  msg.className = 'msg';
+  msg.textContent = '';
+
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+
+  try {
+    const r = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const j = await r.json();
+
+    if (j.ok) {
+      msg.className = 'msg ok';
+      msg.textContent = j.msg || '成功';
+      setTimeout(() => { window.location.href = '/'; }, 400);
+    } else {
+      msg.className = 'msg err';
+      msg.textContent = j.msg || '操作失败';
+    }
+  } catch (err) {
+    msg.className = 'msg err';
+    msg.textContent = '网络错误: ' + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 密码显示切换
+function togglePasswordVisibility() {
+  const pwdInput = document.getElementById('password');
+  const eyeIcon = document.getElementById('eye-icon');
+  
+  if (pwdInput.type === 'password') {
+    pwdInput.type = 'text';
+    // Eye Open SVG
+    eyeIcon.innerHTML = `
+      <path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
+      <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+    `;
+  } else {
+    pwdInput.type = 'password';
+    // Eye Slash SVG
+    eyeIcon.innerHTML = `
+      <path stroke-linecap="round" stroke-linejoin="round" d="M3.98 8.223A10.477 10.477 0 0 0 1.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.451 10.451 0 0 1 12 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 0 1-4.293 5.774M6.228 6.228 3 3m3.228 3.228 3.65 3.65m7.894 7.894L21 21m-3.228-3.228-3.65-3.65m0 0a3 3 0 1 0-4.243-4.243m4.242 4.242L9.88 9.88" />
+    `;
+  }
+}
+
+// 主题切换
+function toggleTheme() {
+  const html = document.documentElement;
+  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  document.getElementById('theme-btn').textContent = next === 'dark' ? '🌙' : '☀️';
+  localStorage.setItem('azkey_theme', next);
+}
+(function loadTheme() {
+  const t = localStorage.getItem('azkey_theme') || 'light';
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('theme-btn').textContent = t === 'dark' ? '🌙' : '☀️';
+})();
+</script>
+</body>
+</html>

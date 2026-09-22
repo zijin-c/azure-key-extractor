@@ -1,0 +1,1411 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Azure Education Key 提取工具</title>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+:root{
+  /* dark (default) */
+  --bg:#0a0e1a;--surface:#0f1529;--card:#151d36;--border:#1f2b52;
+  --accent:#6c8cff;--accent2:#a78bfa;--green:#34d399;--red:#f87171;
+  --warn:#fbbf24;--cyan:#7dd3fc;--text:#e0e7ff;--muted:#64748b;
+  --mono:'Cascadia Code','JetBrains Mono','Consolas','Monaco',monospace;
+  --sans:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+  --radius-sm:8px;--radius:12px;--radius-lg:16px;
+  --log-bg:#020617;--log-ts:#334155;--log-text:#94a3b8;
+  --shadow:0 4px 16px rgba(0,0,0,.3);
+}
+[data-theme="light"]{
+  --bg:#eef2f7;--surface:#ffffff;--card:#ffffff;--border:#e2e8f0;
+  --accent:#2563eb;--accent2:#7c3aed;--green:#16a34a;--red:#dc2626;
+  --warn:#d97706;--cyan:#0891b2;--text:#0f172a;--muted:#64748b;
+  --log-bg:#f8fafc;--log-ts:#94a3b8;--log-text:#334155;
+  --shadow:0 4px 16px rgba(15,23,42,.08);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);
+  min-height:100vh;overflow-x:hidden;transition:background .25s,color .25s}
+body::before{content:'';position:fixed;top:-30%;left:-10%;width:50vw;height:50vw;
+  background:radial-gradient(circle,rgba(108,140,255,.1),transparent 70%);pointer-events:none;z-index:0}
+body::after{content:'';position:fixed;bottom:-20%;right:-10%;width:40vw;height:40vw;
+  background:radial-gradient(circle,rgba(167,139,250,.08),transparent 70%);pointer-events:none;z-index:0}
+[data-theme="light"] body::before{background:radial-gradient(circle,rgba(37,99,235,.06),transparent 70%)}
+[data-theme="light"] body::after{background:radial-gradient(circle,rgba(124,58,237,.04),transparent 70%)}
+.wrapper{max-width:1500px;margin:0 auto;padding:18px;position:relative;z-index:1}
+
+/* ── 顶部导航栏 ── */
+nav.topbar{display:flex;align-items:center;gap:14px;padding:14px 22px;
+  background:linear-gradient(135deg,rgba(108,140,255,.1),rgba(167,139,250,.06));
+  border:1px solid rgba(108,140,255,.2);border-radius:var(--radius-lg);
+  margin-bottom:18px;backdrop-filter:blur(16px)}
+[data-theme="light"] nav.topbar{background:linear-gradient(135deg,rgba(37,99,235,.06),rgba(124,58,237,.04));
+  border-color:rgba(37,99,235,.15)}
+.logo{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));font-size:22px;flex-shrink:0;
+  box-shadow:0 0 24px rgba(108,140,255,.3)}
+nav.topbar h1{font-size:1.25rem;font-weight:700;letter-spacing:-.02em;
+  background:linear-gradient(135deg,var(--text),var(--accent));-webkit-background-clip:text;
+  background-clip:text;-webkit-text-fill-color:transparent}
+nav.topbar p{font-size:.74rem;color:var(--muted);margin-top:1px}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+#mode-badge{padding:5px 14px;border:1px solid var(--border);border-radius:18px;
+  font-size:.7rem;font-weight:600;letter-spacing:.05em;text-transform:uppercase}
+#mode-badge.idle{background:rgba(108,140,255,.1);color:var(--accent);border-color:rgba(108,140,255,.25)}
+#mode-badge.running{background:rgba(52,211,153,.1);color:var(--green);border-color:rgba(52,211,153,.3);
+  animation:pulse 1.5s infinite}
+#mode-badge.done{background:rgba(108,140,255,.12);color:var(--accent)}
+#theme-btn{width:36px;height:36px;border:1px solid var(--border);background:var(--surface);
+  border-radius:10px;font-size:1rem;cursor:pointer;color:var(--text);transition:all .2s}
+#theme-btn:hover{border-color:var(--accent);transform:rotate(15deg)}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+/* ── 主网格 ── */
+.grid{display:grid;grid-template-columns:430px 1fr;gap:18px}
+@media(max-width:1100px){.grid{grid-template-columns:1fr}}
+
+/* ── 卡片 ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:18px 20px;transition:border-color .25s,box-shadow .25s}
+.card:hover{border-color:rgba(108,140,255,.3);box-shadow:var(--shadow)}
+.card-title{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--accent);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.card-title::before{content:'';width:4px;height:14px;
+  background:linear-gradient(var(--accent),var(--accent2));border-radius:2px}
+
+label{display:block;font-size:.74rem;color:var(--muted);margin-bottom:5px}
+.field{margin-bottom:12px}
+textarea,input[type=text],input[type=password],input[type=number]{
+  width:100%;padding:9px 12px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);
+  font-family:inherit;font-size:.84rem;outline:none;
+  transition:border-color .2s,box-shadow .2s;resize:vertical}
+textarea:focus,input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(108,140,255,.12)}
+textarea{min-height:240px;font-family:var(--mono);font-size:.74rem;line-height:1.65}
+[data-theme="light"] textarea,[data-theme="light"] input[type=text]{background:#f6f8fa}
+
+/* ── 开关 ── */
+.toggle-row{display:flex;align-items:center;gap:10px;margin:10px 0}
+.toggle{position:relative;width:38px;height:21px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:var(--border);border-radius:11px;cursor:pointer;transition:.25s}
+.slider::before{content:'';position:absolute;width:15px;height:15px;left:3px;top:3px;
+  background:#fff;border-radius:50%;transition:.25s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+.toggle input:checked+.slider{background:var(--accent)}
+.toggle input:checked+.slider::before{transform:translateX(17px)}
+.toggle-row label{margin:0;font-size:.8rem;color:var(--text);cursor:pointer}
+
+/* ── 按钮 ── */
+.btn-row{display:flex;gap:8px;margin-top:6px}
+.btn{flex:1;padding:11px 18px;border:none;border-radius:var(--radius-sm);
+  font-family:inherit;font-size:.86rem;font-weight:600;cursor:pointer;
+  transition:all .2s;letter-spacing:.02em}
+#btn-start{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
+  box-shadow:0 4px 16px rgba(108,140,255,.25);position:relative;overflow:hidden}
+#btn-start:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 22px rgba(108,140,255,.4)}
+#btn-start:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+#btn-start.loading::after{content:'';position:absolute;top:0;left:-100%;width:100%;height:100%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.2),transparent);
+  animation:btnShine 1.5s infinite}
+@keyframes btnShine{to{left:100%}}
+#btn-stop{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.25);color:var(--red)}
+#btn-stop:hover:not(:disabled){background:rgba(248,113,113,.18)}
+#btn-stop:disabled{opacity:.35;cursor:not-allowed}
+
+/* ── 统计 ── */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.stat{text-align:center;padding:12px 4px;background:var(--surface);
+  border:1px solid var(--border);border-radius:var(--radius-sm);transition:all .3s}
+.stat:hover{border-color:var(--accent);transform:translateY(-1px)}
+.stat-val{font-size:1.5rem;font-weight:700;font-family:var(--mono);
+  transition:color .3s, transform .2s}
+.stat-val.ok{color:var(--green)}.stat-val.fail{color:var(--red)}
+.stat-val.total{color:var(--accent)}.stat-val.rate{color:var(--cyan)}
+.stat-val.updated{animation:statPop .3s ease}
+@keyframes statPop{0%{transform:scale(1)}50%{transform:scale(1.2)}100%{transform:scale(1)}}
+.stat-label{font-size:.62rem;color:var(--muted);text-transform:uppercase;
+  letter-spacing:.06em;margin-top:3px}
+
+/* ── 状态条 ── */
+.status-bar{display:flex;align-items:center;gap:10px;padding:9px 13px;
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm);margin-bottom:10px;font-size:.78rem}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.dot.running{background:var(--green);animation:pulse 1.2s infinite}
+
+/* ── 日志 ── */
+.log-wrap{display:flex;flex-direction:column;height:100%;min-height:0;max-height:100%}
+.log-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+.log-toolbar input[type=text]{flex:1;min-width:120px;padding:6px 10px;font-size:.74rem}
+.log-toolbar select{padding:6px 8px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm);color:var(--text);font-family:inherit;font-size:.74rem;cursor:pointer}
+.log-toolbar button{padding:6px 12px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm);color:var(--text);font-size:.72rem;cursor:pointer;font-family:inherit}
+.log-toolbar button:hover{border-color:var(--accent)}
+.log-count{font-size:.7rem;color:var(--muted);font-family:var(--mono)}
+#log{flex:1;height:0;min-height:360px;max-height:calc(100vh - 240px);max-height:750px;background:var(--log-bg);border:1px solid var(--border);border-radius:var(--radius-sm);
+  padding:14px;font-family:var(--mono);font-size:.74rem;line-height:1.7;
+  overflow-y:auto;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+
+/* ── 进度条 ── */
+.progress-wrap{position:relative;height:6px;background:var(--surface);
+  border:1px solid var(--border);border-radius:6px;margin-bottom:10px;overflow:hidden}
+.progress-bar{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));
+  border-radius:5px;transition:width .4s ease;width:0;
+  background-size:200% 100%;animation:progressShine 2s linear infinite}
+@keyframes progressShine{0%{background-position:100% 0}100%{background-position:-100% 0}}
+#log::-webkit-scrollbar{width:6px}
+#log::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.log-line{display:flex;gap:8px;padding:1px 0}
+.log-line.hidden{display:none}
+.log-ts{color:var(--log-ts);flex-shrink:0;font-size:.68rem;min-width:58px;opacity:.7}
+.log-msg{color:var(--log-text);white-space:pre-wrap;word-break:break-all;font-size:.72rem}
+.log-msg.ok{color:var(--green);font-weight:500}
+.log-msg.err{color:var(--red);font-weight:500}
+.log-msg.warn{color:var(--warn)}
+.log-msg.info{color:var(--accent);font-weight:500}
+.log-msg.key{color:var(--cyan);font-weight:700;background:rgba(125,211,252,.06);
+  padding:1px 4px;border-radius:3px;border:1px solid rgba(125,211,252,.15)}
+
+/* ── 产品列表 ── */
+.product-list{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
+.product-item{display:flex;align-items:center;gap:8px;padding:7px 11px;
+  background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-sm);font-size:.76rem;transition:all .25s}
+.product-item.got{border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.04);
+  box-shadow:0 0 8px rgba(52,211,153,.1)}
+.product-idx{font-size:.65rem;color:var(--muted);font-weight:700;min-width:16px;
+  font-family:var(--mono)}
+.product-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);
+  flex-shrink:0;transition:all .3s}
+.product-dot.got{background:var(--green);box-shadow:0 0 8px rgba(52,211,153,.7)}
+.product-name{flex:1;color:var(--text);font-size:.74rem}
+.product-key{font-family:var(--mono);font-size:.68rem;color:var(--cyan);
+  letter-spacing:.03em;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── 代理 ── */
+.proxy-row{display:flex;gap:6px;align-items:flex-end}
+.proxy-row input{flex:1}
+.proxy-row button{flex-shrink:0;padding:9px 12px;background:rgba(108,140,255,.1);
+  border:1px solid rgba(108,140,255,.28);border-radius:var(--radius-sm);
+  color:var(--accent);font-size:.76rem;font-weight:600;cursor:pointer;
+  white-space:nowrap;transition:all .2s;font-family:inherit}
+.proxy-row button:hover{background:rgba(108,140,255,.2)}
+.proxy-row button:disabled{opacity:.4;cursor:not-allowed}
+.proxy-row button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.ip-badge{display:inline-flex;align-items:center;gap:6px;margin-top:6px;padding:4px 11px;
+  border-radius:5px;font-size:.72rem;font-family:var(--mono);font-weight:600;
+  opacity:0;transition:opacity .3s}
+.ip-badge.show{opacity:1}
+.ip-badge.ok{background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.25);color:var(--green)}
+.ip-badge.err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.25);color:var(--red)}
+
+.hint{font-size:.68rem;color:var(--muted);margin-top:4px;line-height:1.55}
+.hint code{font-family:var(--mono);color:var(--green);font-size:.66rem;
+  background:rgba(52,211,153,.08);padding:1px 5px;border-radius:3px}
+[data-theme="light"] .hint code{color:#1a7f37;background:rgba(26,127,55,.08)}
+
+/* ── 结果表格 ── */
+#results-section{margin-top:18px}
+.tbl-wrap{overflow-x:auto;border-radius:var(--radius-sm);border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:.76rem;min-width:1100px}
+th{text-align:left;padding:9px 10px;background:var(--surface);font-size:.65rem;
+  font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0;z-index:1}
+td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-size:.74rem}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(108,140,255,.04)}
+.s-ok{color:var(--green);font-weight:600}.s-err{color:var(--red);font-weight:600}
+.key-cell{font-family:var(--mono);font-size:.68rem;color:var(--cyan);white-space:nowrap}
+.key-empty{color:var(--muted);font-size:.7rem;text-align:center}
+.pwd-cell{font-family:var(--mono);font-size:.68rem;color:var(--warn);max-width:120px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.email-cell{font-family:var(--mono);font-size:.72rem;max-width:240px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+.tbl-actions{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.btn-action{padding:5px 12px;border-radius:5px;font-size:.72rem;cursor:pointer;
+  font-family:inherit;font-weight:600;transition:all .2s;border:1px solid}
+.btn-action.green{background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.25);color:var(--green)}
+.btn-action.green:hover{background:rgba(52,211,153,.22)}
+.btn-action.warn{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3);color:var(--warn)}
+.btn-action.warn:hover{background:rgba(251,191,36,.22)}
+.btn-action.accent{background:rgba(108,140,255,.1);border-color:rgba(108,140,255,.28);color:var(--accent)}
+.btn-action.accent:hover{background:rgba(108,140,255,.22)}
+.btn-action.red{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.25);color:var(--red)}
+.btn-action.red:hover{background:rgba(248,113,113,.22)}
+.export-sep{width:1px;height:18px;background:var(--border);flex-shrink:0;margin:0 4px}
+
+/* ── Toast ── */
+#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;
+  flex-direction:column;gap:8px;pointer-events:none}
+.toast{padding:10px 16px;border-radius:var(--radius-sm);background:var(--card);
+  border:1px solid var(--border);font-size:.8rem;box-shadow:var(--shadow);
+  animation:toastIn .3s ease;pointer-events:auto;max-width:320px}
+.toast.ok{border-color:rgba(52,211,153,.4);color:var(--green)}
+.toast.err{border-color:rgba(248,113,113,.4);color:var(--red)}
+.toast.info{border-color:rgba(108,140,255,.4);color:var(--accent)}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+
+<script id="tpl-data" type="application/json">
+{
+  "sid":          "{{ sid }}",
+  "username":     "{{ username }}",
+  "products":     {{ products | tojson }},
+  "productShort": {{ product_short | tojson }}
+}
+</script>
+
+<div class="wrapper">
+
+<nav class="topbar">
+  <div class="logo">🔑</div>
+  <div>
+    <h1>Azure Education Key 提取工具</h1>
+    <p>自动登录 Azure for Students → 提取 6 个产品 License Key → Excel 导出</p>
+  </div>
+  <div class="topbar-right">
+    <span id="mode-badge" class="idle">就绪</span>
+    <span style="font-size:.8rem;color:var(--muted);padding:5px 10px;border:1px solid var(--border);border-radius:8px">👤 {{ username }}</span>
+    <button onclick="openUserPanel()" title="个人设置" style="width:36px;height:36px;border:1px solid var(--border);background:var(--surface);border-radius:10px;font-size:1rem;cursor:pointer;color:var(--text);transition:all .2s">⚙️</button>
+    <button id="theme-btn" onclick="toggleTheme()" title="切换主题">☀️</button>
+    <button onclick="doLogout()" title="退出登录" style="width:36px;height:36px;border:1px solid var(--border);background:var(--surface);border-radius:10px;font-size:1rem;cursor:pointer;color:var(--text);transition:all .2s">🚪</button>
+  </div>
+</nav>
+
+<div class="grid">
+  <!-- 左侧控制面板 -->
+  <div>
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title">目标产品 <span id="product-count-label" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem"></span>（已选 6 个）</span></div>
+      <div class="product-list">
+        {% for p in products %}
+        <div class="product-item" id="prod-{{ loop.index0 }}">
+          <input type="checkbox" class="product-cb" data-idx="{{ loop.index0 }}" checked
+            onchange="updateProductCount()" style="accent-color:var(--accent);width:15px;height:15px;cursor:pointer;flex-shrink:0">
+          <span class="product-idx">{{ loop.index }}</span>
+          <div class="product-dot" id="dot-{{ loop.index0 }}"></div>
+          <div class="product-name">{{ product_short[p] }}</div>
+          <div class="product-key" id="key-{{ loop.index0 }}" title="—">—</div>
+        </div>
+        {% endfor %}
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <button onclick="selectAllProducts(true)" style="padding:3px 10px;font-size:.7rem;background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--accent);cursor:pointer;font-family:inherit">全选</button>
+        <button onclick="selectAllProducts(false)" style="padding:3px 10px;font-size:.7rem;background:var(--surface);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer;font-family:inherit">全不选</button>
+      </div>
+
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" id="headless-toggle">
+          <span class="slider"></span>
+        </label>
+        <label for="headless-toggle">无头模式（后台运行）</label>
+      </div>
+
+      <div class="field">
+        <label for="concurrency-input">⚡ 并发进程数（同时运行几线程）</label>
+        <div style="display:flex;align-items:center;gap:10px">
+          <input type="number" id="concurrency-input" min="1" max="20" value="3" style="width:100px;font-weight:600">
+          <span style="font-size:.72rem;color:var(--muted)">推荐 2 ~ 5 线程并发</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>🌐 代理池（支持多行/逗号分隔，轮询分发，留空直连）</label>
+        <textarea id="proxy-input" style="min-height:70px;font-family:var(--mono);font-size:.74rem;line-height:1.4" placeholder="# 支持多代理自动轮询分发，每行一个:&#10;socks5://user:pass@1.2.3.4:1080&#10;socks5://user:pass@5.6.7.8:1080"></textarea>
+        <div class="proxy-row" style="margin-top:6px">
+          <button id="btn-check-ip" onclick="checkProxy()" style="flex:1">🔍 检测代理池</button>
+          <button id="btn-auto-ip" onclick="toggleAutoCheck()" title="每30秒自动检测">⏱ 自动</button>
+        </div>
+        <div id="ip-badge" class="ip-badge"></div>
+      </div>
+
+      <div class="field">
+        <label>账号列表（每行：edu邮箱 [TAB/空格/----] 密码）
+          <span id="acc-count" style="float:right;color:var(--cyan);font-size:.68rem">0 个账号</span>
+        </label>
+        <textarea id="accounts" placeholder="# 每行一个账号:&#10;student@university.edu	password123&#10;mhernandez261@liberty.edu  Nuun/974j-Z^&#10;&#10;# 或 ---- 分隔:&#10;jjackson663@liberty.edu----PassWord123&#10;&#10;# 或带标签（中/英文皆可）:&#10;账号: jthomas655@liberty.edu 密码: kk-!tpkY6y27&#10;账号: jjones1312@liberty.edu&#10;密码: SomePass!23"></textarea>
+        <div class="hint">
+          <b>格式：</b><code>邮箱 TAB 密码</code> 或 <code>邮箱----密码</code> 或 <code>邮箱 空格 密码</code><br>
+          <b>带标签：</b><code>账号: xxx 密码: yyy</code>（中英文标签均可，可单行或跨行）<br>
+          <b>注意：</b>邮箱即 Azure 登录账号
+        </div>
+      </div>
+
+      <div class="field" style="margin-bottom:14px">
+        <label style="font-weight:600;color:var(--text);margin-bottom:8px;display:flex;align-items:center;gap:6px">
+          🎯 任务模式选择
+        </label>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;font-size:.78rem">
+            <input type="radio" name="run-mode" value="azure_student" checked style="accent-color:var(--accent);width:16px;height:16px">
+            <div>
+              <div style="font-weight:600;color:var(--text)">Azure 学生认证 + Key 提取</div>
+              <div style="font-size:.68rem;color:var(--muted);margin-top:2px">自动填表/认证注册并提取</div>
+            </div>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;font-size:.78rem">
+            <input type="radio" name="run-mode" value="direct_ms" style="accent-color:var(--accent);width:16px;height:16px">
+            <div>
+              <div style="font-weight:600;color:var(--accent)">微软账号 Key 直提</div>
+              <div style="font-size:.68rem;color:var(--muted);margin-top:2px">免 Azure 认证，直登 Portal 提取</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="btn-row">
+
+        <button class="btn" id="btn-start" onclick="startTask()">▶ 开始提取</button>
+        <button class="btn" id="btn-stop" onclick="stopTask()" disabled>■ 停止</button>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="stat-val total" id="s-total">0</div><div class="stat-label">总数</div></div>
+      <div class="stat"><div class="stat-val ok" id="s-ok">0</div><div class="stat-label">成功</div></div>
+      <div class="stat"><div class="stat-val fail" id="s-fail">0</div><div class="stat-label">失败</div></div>
+      <div class="stat"><div class="stat-val rate" id="s-rate">0%</div><div class="stat-label">成功率</div></div>
+    </div>
+  </div>
+
+  <!-- 右侧日志 -->
+  <div class="log-wrap">
+    <div class="status-bar">
+      <div class="dot" id="status-dot"></div>
+      <span id="status-text">空闲</span>
+      <span style="margin-left:8px;font-family:var(--mono);font-size:.72rem;color:var(--muted)" id="current-account"></span>
+      <span style="margin-left:auto;font-size:.72rem;color:var(--muted)" id="elapsed-time"></span>
+    </div>
+    <div id="progress-section" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+        <span style="font-size:.8rem;font-weight:700;color:var(--text)" id="progress-title">处理第 0 / 0 个账号</span>
+        <span style="font-size:.8rem;font-weight:700;color:var(--accent)" id="progress-pct">0%</span>
+      </div>
+      <div class="progress-wrap" id="progress-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;font-size:.72rem;color:var(--muted);margin-top:4px">
+        <span id="progress-stats">📊 0 / 0</span>
+        <span>✅ <span id="progress-ok">0</span> 成功</span>
+        <span>❌ <span id="progress-fail">0</span> 失败</span>
+        <span id="progress-eta">⏱ 剩余约 --</span>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1;display:flex;flex-direction:column;padding:14px">
+      <div class="log-toolbar">
+        <select id="log-level" onchange="filterLog()">
+          <option value="">全部</option>
+          <option value="ok">✅ 成功</option>
+          <option value="err">❌ 错误</option>
+          <option value="warn">⚠️ 警告</option>
+          <option value="key">🔑 Key</option>
+        </select>
+        <button onclick="clearLog()">清空</button>
+        <button onclick="copyLog()">复制</button>
+        <span class="log-count" id="log-count">0 条</span>
+      </div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 结果表格 -->
+<div id="results-section" style="display:none">
+  <div class="card" style="margin-top:18px">
+    <div class="card-title">提取结果（含密码 / TOTP / Key）</div>
+    <div class="tbl-actions">
+      <button class="btn-action green" onclick="exportExcel('all')">📥 导出全部历史</button>
+      <button class="btn-action green" onclick="exportExcel('success')">✅ 导出历史成功</button>
+      <button class="btn-action warn" onclick="exportExcel('failed')">❌ 导出历史失败</button>
+      <div class="export-sep"></div>
+      <button class="btn-action accent" onclick="exportExcel('current-success')">🌟 导出本次成功</button>
+      <button class="btn-action accent" onclick="exportExcel('current-failed')">⛔ 导出本次失败</button>
+      <div class="export-sep"></div>
+      <button class="btn-action accent" id="btn-export-sel" onclick="exportSelected()" style="display:none">📤 导出选中</button>
+      <button class="btn-action red" id="btn-del-sel" onclick="deleteSelected()" style="display:none">🗑 删除选中</button>
+      <button class="btn-action red" onclick="clearHistory()">🗑 清除历史</button>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:30px"><input type="checkbox" id="cb-all" onchange="toggleAllResultCb(this)" style="cursor:pointer"></th>
+            <th>#</th>
+            <th>账号 (EDU)</th>
+            <th>密码</th>
+            <th>TOTP Secret</th>
+            <th>状态</th>
+            {% for p in products %}
+            <th>{{ product_short[p] }}</th>
+            {% endfor %}
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody id="results-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<div id="toast-container"></div>
+
+<!-- 用户/管理面板弹窗 -->
+<div id="user-panel-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9000;display:none;align-items:center;justify-content:center" onclick="if(event.target===this)closeUserPanel()">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius-lg);padding:28px 32px;width:100%;max-width:560px;max-height:80vh;overflow-y:auto;box-shadow:var(--shadow)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <h3 style="font-size:1.1rem;font-weight:700" id="panel-title">个人设置</h3>
+      <button onclick="closeUserPanel()" style="background:none;border:none;font-size:1.3rem;cursor:pointer;color:var(--muted)">✕</button>
+    </div>
+
+    <!-- 修改密码 -->
+    <div style="margin-bottom:20px;padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)">
+      <h4 style="font-size:.85rem;color:var(--accent);margin-bottom:12px">🔒 修改密码</h4>
+      <input type="password" id="new-pwd" placeholder="新密码（至少4位）" style="width:100%;padding:8px 12px;margin-bottom:8px;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.9rem">
+      <button onclick="changeMyPassword()" style="padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:.85rem;cursor:pointer">确认修改</button>
+    </div>
+
+    <!-- 管理员面板（仅管理员可见） -->
+    <div id="admin-section" style="display:none">
+      <div style="padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px">
+        <h4 style="font-size:.85rem;color:var(--accent);margin-bottom:12px">👥 用户管理（管理员）</h4>
+        <div id="user-list" style="margin-bottom:12px"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input type="text" id="new-username" placeholder="新用户名" style="flex:1;min-width:100px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          <input type="password" id="new-user-pwd" placeholder="密码" style="flex:1;min-width:100px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
+          <button onclick="adminCreateUser()" style="padding:8px 14px;background:var(--green);color:#fff;border:none;border-radius:6px;font-size:.85rem;cursor:pointer;white-space:nowrap">+ 创建用户</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const _TPL = JSON.parse(document.getElementById('tpl-data').textContent);
+const SID  = _TPL.sid;
+const PRODUCTS      = _TPL.products;
+const PRODUCT_SHORT = _TPL.productShort;
+let evtSource=null, isRunning=false;
+
+const LS={ACC:'azkey_accounts',PROXY:'azkey_proxy',
+  HEADLESS:'azkey_headless',HISTORY:'azkey_history',CURRENT:'azkey_current',
+  THEME:'azkey_theme',AMAP:'azkey_account_map'};
+const lsGet=(k,d='')=>{try{return localStorage.getItem(k)??d}catch(e){return d}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+const lsGetJ=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
+const lsSetJ=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+// ── Toast ──────────────────────────────────────────────────
+function showToast(msg,type='info',duration=2500){
+  const c=document.getElementById('toast-container');
+  const t=document.createElement('div');
+  t.className='toast '+type;t.textContent=msg;
+  c.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';
+    setTimeout(()=>t.remove(),300);},duration);
+}
+
+// ── 主题 ──────────────────────────────────────────────────
+function toggleTheme(){
+  const html=document.documentElement;
+  const next=html.getAttribute('data-theme')==='dark'?'light':'dark';
+  html.setAttribute('data-theme',next);
+  document.getElementById('theme-btn').textContent=next==='dark'?'🌙':'☀️';
+  lsSet(LS.THEME,next);
+}
+function loadTheme(){
+  const t=lsGet(LS.THEME,'light');
+  document.documentElement.setAttribute('data-theme',t);
+  document.getElementById('theme-btn').textContent=t==='dark'?'🌙':'☀️';
+}
+
+// ── SSE ──────────────────────────────────────────────────
+function connectSSE(){
+  if(evtSource)return;
+  evtSource=new EventSource('/stream?sid='+SID);
+  evtSource.onmessage=e=>{const d=JSON.parse(e.data);if(d.ping)return;appendLog(d.ts,d.msg)};
+  evtSource.onerror=()=>{setTimeout(connectSSE,3000);evtSource=null};
+}
+
+let _logCount=0;
+let _totalAccounts=0, _doneAccounts=0;
+let _taskStartTime=null, _elapsedTimer=null;
+let _progressOk=0, _progressFail=0;
+
+function updateProgress(done, total){
+  _doneAccounts=done; _totalAccounts=total;
+  const section=document.getElementById('progress-section');
+  const bar=document.getElementById('progress-bar');
+  const title=document.getElementById('progress-title');
+  const pct=document.getElementById('progress-pct');
+  const stats=document.getElementById('progress-stats');
+  const eta=document.getElementById('progress-eta');
+  if(total>0){
+    section.style.display='block';
+    const percent=Math.round(done/total*100);
+    bar.style.width=percent+'%';
+    title.textContent=`处理第 ${done+1} / ${total} 个账号`;
+    pct.textContent=percent+'%';
+    stats.textContent=`📊 ${done} / ${total}`;
+    document.getElementById('progress-ok').textContent=_progressOk;
+    document.getElementById('progress-fail').textContent=_progressFail;
+    // 估算剩余时间
+    if(_taskStartTime && done > 0){
+      const elapsed=(Date.now()-_taskStartTime)/1000;
+      const perAccount=elapsed/done;
+      const remaining=Math.round(perAccount*(total-done));
+      const min=Math.floor(remaining/60);
+      const sec=remaining%60;
+      eta.textContent=`⏱ 剩余约 ${min}m ${sec}s`;
+    }
+  }else{
+    section.style.display='none';
+  }
+}
+
+function updateElapsed(){
+  if(!_taskStartTime)return;
+  const elapsed=Math.round((Date.now()-_taskStartTime)/1000);
+  const min=Math.floor(elapsed/60);
+  const sec=elapsed%60;
+  document.getElementById('elapsed-time').textContent=`⏱ ${min}m ${sec<10?'0':''}${sec}s`;
+}
+
+function appendLog(ts,msg){
+  const log=document.getElementById('log');
+  const div=document.createElement('div');div.className='log-line';
+  let c='';
+  if(msg.includes('✅')||msg.includes('成功'))c='ok';
+  else if(msg.includes('❌')||msg.includes('失败'))c='err';
+  else if(msg.includes('⚠️'))c='warn';
+  else if(msg.includes('🚀')||msg.includes('▶')||msg.includes('🎉'))c='info';
+  else if(msg.match(/[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}/))c='key';
+  div.dataset.level=c;div.dataset.text=msg.toLowerCase();
+  div.innerHTML=`<span class="log-ts">${ts}</span><span class="log-msg ${c}">${esc(msg)}</span>`;
+  log.appendChild(div);
+  // 最多只保留最新 100 条 DOM 节点，避免长时间运行日志条数过多卡死网页
+  while(log.children.length > 100){
+    log.removeChild(log.firstElementChild);
+  }
+  log.scrollTop=log.scrollHeight;
+  _logCount++;document.getElementById('log-count').textContent=_logCount+' 条';
+
+  // 进度从日志解析: "[当前/总数] 处理账号:" 格式
+  const pm=msg.match(/\[(\d+)\/(\d+)\]\s*处理账号/);
+  if(pm){
+    const cur=parseInt(pm[1]);
+    const tot=parseInt(pm[2]);
+    updateProgress(cur-1, tot);
+  }
+
+  // 当前处理的账号
+  const am=msg.match(/开始处理:\s*(\S+)/);
+  if(am){
+    document.getElementById('current-account').textContent='■ '+am[1];
+  }
+
+  // 成功/失败计数
+  if(msg.includes('📊 提取结果:')){
+    const km=msg.match(/(\d+)\/(\d+)\s*个 key/);
+    if(km && parseInt(km[1])>0) _progressOk++;
+    else _progressFail++;
+    updateProgress(_doneAccounts+1, _totalAccounts);
+  }
+  if(msg.includes('账号处理崩溃') || msg.includes('超时跳过') || msg.includes('密码错误') || msg.includes('封禁')){
+    _progressFail++;
+    updateProgress(_doneAccounts+1, _totalAccounts);
+  }
+
+  // 检测账号完成（"📊 提取结果: X/6 个 key" 或 "❌ 失败"）
+  if(msg.includes('📊 提取结果:') || (msg.includes('账号处理崩溃') || msg.includes('超时跳过'))){
+    if(_totalAccounts>0){
+      updateProgress(_doneAccounts+1, _totalAccounts);
+    }
+    // 立即拉取最新结果增量更新
+    fetchAndAppendResults();
+  }
+
+  if(msg.includes('🏁 任务结束'))onTaskDone();
+  applyFilter(div);
+}
+function applyFilter(div){
+  const lv=document.getElementById('log-level').value;
+  let show=true;
+  if(lv && div.dataset.level!==lv)show=false;
+  div.classList.toggle('hidden',!show);
+}
+function filterLog(){
+  const lv=document.getElementById('log-level').value;
+  const lines=document.querySelectorAll('#log .log-line');
+  let visibleCount=0;
+  lines.forEach(div=>{
+    applyFilter(div);
+    if(!div.classList.contains('hidden')) visibleCount++;
+  });
+  
+  const countEl=document.getElementById('log-count');
+  if(lv){
+    countEl.textContent=`${visibleCount} 条匹配 / 共 ${_logCount} 条`;
+  }else{
+    countEl.textContent=`${_logCount} 条`;
+  }
+
+  let tipEl=document.getElementById('log-empty-tip');
+  if(lv && visibleCount === 0 && _logCount > 0){
+    if(!tipEl){
+      tipEl=document.createElement('div');
+      tipEl.id='log-empty-tip';
+      tipEl.style.cssText='color:var(--muted);text-align:center;padding:24px;font-style:italic;font-size:.76rem';
+      document.getElementById('log').appendChild(tipEl);
+    }
+    tipEl.innerHTML=`🔍 当前已按分类过滤，暂无匹配日志（<a href="javascript:clearLogLevel()" style="color:var(--accent);text-decoration:underline">点击恢复全部显示</a>）`;
+  }else if(tipEl){
+    tipEl.remove();
+  }
+}
+function clearLogLevel(){
+  document.getElementById('log-level').value='';
+  filterLog();
+}
+function clearLogSearch(){
+  clearLogLevel();
+}
+function clearLog(){
+  document.getElementById('log').innerHTML='';
+  _logCount=0;
+  document.getElementById('log-count').textContent='0 条';
+}
+async function copyLog(){
+  const lines=[...document.querySelectorAll('#log .log-line:not(.hidden)')].map(l=>l.innerText).join('\n');
+  try{await navigator.clipboard.writeText(lines);showToast('日志已复制','ok');}
+  catch(e){showToast('复制失败: '+e,'err');}
+}
+
+// ── 表单持久化（多端数据同步） ────────────────────────────────
+let _saveTimer = null;
+function saveForm(){
+  const accounts = document.getElementById('accounts').value;
+  const proxy = document.getElementById('proxy-input').value;
+  const headless = document.getElementById('headless-toggle').checked ? '1' : '0';
+  const concurrency = document.getElementById('concurrency-input').value || '3';
+  const products = getSelectedProducts();
+
+  lsSet(LS.ACC, accounts);
+  lsSet(LS.PROXY, proxy);
+  lsSet(LS.HEADLESS, headless);
+  lsSet('azure_concurrency', concurrency);
+
+  // 防抖提交到服务器实现多端同步，避免高频打网络请求
+  if(_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          accounts,
+          proxy,
+          headless,
+          concurrency,
+          products: JSON.stringify(products)
+        })
+      });
+    } catch(e) {
+      console.error('保存同步设置失败:', e);
+    }
+  }, 1000);
+}
+
+async function loadForm(){
+  // 1. 优先使用本地缓存进行瞬间渲染，防止页面加载白屏
+  const acc = lsGet(LS.ACC, ''); if(acc) document.getElementById('accounts').value = acc;
+  const proxy = lsGet(LS.PROXY, ''); if(proxy) document.getElementById('proxy-input').value = proxy;
+  const concurrency = lsGet('azure_concurrency', '3'); if(concurrency) document.getElementById('concurrency-input').value = concurrency;
+  document.getElementById('headless-toggle').checked = lsGet(LS.HEADLESS, '0') === '1';
+  updateAccountCount();
+  const n = document.querySelectorAll('.product-cb:checked').length;
+  document.getElementById('product-count-label').textContent = `（已选 ${n} 个）`;
+
+  // 2. 从服务器加载最新设置并覆盖
+  try {
+    const r = await fetch('/api/settings');
+    const j = await r.json();
+    if(j.ok && j.settings) {
+      const s = j.settings;
+      if (s.accounts !== undefined) {
+        document.getElementById('accounts').value = s.accounts;
+        lsSet(LS.ACC, s.accounts);
+      }
+      if (s.proxy !== undefined) {
+        document.getElementById('proxy-input').value = s.proxy;
+        lsSet(LS.PROXY, s.proxy);
+      }
+      if (s.concurrency !== undefined) {
+        document.getElementById('concurrency-input').value = s.concurrency;
+        lsSet('azure_concurrency', s.concurrency);
+      }
+      if (s.headless !== undefined) {
+        const isHeadless = s.headless === '1' || s.headless === 'true';
+        document.getElementById('headless-toggle').checked = isHeadless;
+        lsSet(LS.HEADLESS, isHeadless ? '1' : '0');
+      }
+      if (s.products !== undefined) {
+        try {
+          const selected = JSON.parse(s.products);
+          const cbs = document.querySelectorAll('.product-cb');
+          cbs.forEach((cb, i) => {
+            cb.checked = selected.includes(PRODUCTS[i]);
+          });
+        } catch(e){}
+      }
+      updateAccountCount();
+      const n2 = document.querySelectorAll('.product-cb:checked').length;
+      document.getElementById('product-count-label').textContent = `（已选 ${n2} 个）`;
+    }
+  } catch(e) {
+    console.error('加载同步设置异常:', e);
+  }
+}
+['accounts','proxy-input','concurrency-input'].forEach(id=>{
+  const el = document.getElementById(id);
+  if(el) el.addEventListener('input',saveForm);
+});
+document.getElementById('headless-toggle').addEventListener('change',saveForm);
+
+// ── 产品选择 ───────────────────────────────────────────────
+function getSelectedProducts(){
+  const cbs=document.querySelectorAll('.product-cb');
+  const selected=[];
+  cbs.forEach((cb,i)=>{if(cb.checked)selected.push(PRODUCTS[i]);});
+  return selected;
+}
+function updateProductCount(){
+  const n=document.querySelectorAll('.product-cb:checked').length;
+  document.getElementById('product-count-label').textContent=`（已选 ${n} 个）`;
+  saveForm(); // 勾选变化时也自动触发同步保存
+}
+function selectAllProducts(checked){
+  document.querySelectorAll('.product-cb').forEach(cb=>{cb.checked=checked;});
+  updateProductCount();
+}
+
+// ── 账号统计 ───────────────────────────────────────────────
+const _LBL_ACC=`(?:账[号戶]|帳[号戶]|邮箱|郵箱|用户名|用戶名|账户|帳戶|account|email|user(?:name)?|登录?名?|登錄?名?)`;
+const _LBL_PWD=`(?:密码|密碼|口令|password|pwd|pass)`;
+const _SEP_RE=`\\s*[:\\uff1a=]\\s*`;
+const _ACC_LABEL_RE=new RegExp(`^\\s*${_LBL_ACC}${_SEP_RE}(\\S+@\\S+)\\s*$`,'i');
+const _PWD_LABEL_RE=new RegExp(`^\\s*${_LBL_PWD}${_SEP_RE}(\\S+)\\s*$`,'i');
+// 多对挤一行：密码非贪婪，遇到下一个"账号"标签或行尾终止
+const _LABELED_PAIR_RE=new RegExp(
+  `${_LBL_ACC}${_SEP_RE}(\\S+?@\\S+?)\\s*${_LBL_PWD}${_SEP_RE}(.+?)(?=${_LBL_ACC}${_SEP_RE}|\\s*$)`,
+  'gim'
+);
+
+function updateAccountCount(){
+  const raw=document.getElementById('accounts').value;
+  let n=0;
+  // 1) "账号:xxx 密码:yyy" 标签格式（可同行多对）
+  const consumed=[];
+  let m;
+  const re=new RegExp(_LABELED_PAIR_RE.source,'gim');
+  while((m=re.exec(raw))!==null){n++;consumed.push([m.index,m.index+m[0].length]);}
+  // 把已匹配区域空格化，避免被旧格式重复计数
+  let leftover=raw;
+  if(consumed.length){
+    const arr=raw.split('');
+    consumed.forEach(([s,e])=>{for(let i=s;i<e;i++)arr[i]=' '}); 
+    leftover=arr.join('');
+  }
+
+  // 2) 跨行 "账号:xxx\n密码:yyy"
+  let pendingAcc=false;
+  const remainLines=[];
+  leftover.split('\n').forEach(line=>{
+    const t=line.trim();
+    if(!t||t.startsWith('#')){remainLines.push(line);return;}
+    if(_ACC_LABEL_RE.test(t)){pendingAcc=true;return;}
+    if(_PWD_LABEL_RE.test(t)&&pendingAcc){n++;pendingAcc=false;return;}
+    remainLines.push(line);
+  });
+
+  // 3) 普通分隔符行
+  remainLines.forEach(line=>{
+    line=line.trim();if(!line||line.startsWith('#'))return;
+    if(line.includes('----')){if(line.split('----').length>=2)n++;}
+    else if(line.includes('\t')){if(line.split('\t').length>=2)n++;}
+    else if(line.split(/\s+/).length>=2)n++;
+  });
+  document.getElementById('acc-count').textContent=`${n} 个账号`;
+}
+document.getElementById('accounts').addEventListener('input',updateAccountCount);
+
+// ── 代理检测 + 自动检测 ─────────────────────────────────────
+let _autoCheckTimer=null,_autoCountdown=null;
+const AUTO_SECS=30;
+
+async function checkProxy(){
+  const proxy=document.getElementById('proxy-input').value.trim();
+  const btn=document.getElementById('btn-check-ip');
+  const badge=document.getElementById('ip-badge');
+  btn.disabled=true;btn.textContent='检测中...';
+  badge.className='ip-badge';badge.textContent='';
+  try{
+    const r=await fetch('/api/check_proxy',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy})});
+    const j=await r.json();
+    if(j.ok){
+      badge.innerHTML = (j.msg || j.ip || '可用').replace(/\n/g, '<br>');
+      badge.className='ip-badge show ok';
+    }else{
+      badge.innerHTML = ('❌ ' + (j.error || j.msg || '无法检测')).replace(/\n/g, '<br>');
+      badge.className='ip-badge show err';
+    }
+  }catch(e){badge.textContent='❌ '+e;badge.className='ip-badge show err';}
+  finally{btn.disabled=false;btn.textContent='🔍 检测代理池';}
+}
+
+function _startCountdown(){
+  const ab=document.getElementById('btn-auto-ip');
+  let s=AUTO_SECS;
+  ab.textContent=`⏹ (${s}s)`;
+  if(_autoCountdown)clearInterval(_autoCountdown);
+  _autoCountdown=setInterval(()=>{
+    s--;if(s<=0)s=AUTO_SECS;
+    ab.textContent=`⏹ (${s}s)`;
+  },1000);
+}
+
+function toggleAutoCheck(){
+  const ab=document.getElementById('btn-auto-ip');
+  if(_autoCheckTimer){
+    clearInterval(_autoCheckTimer);clearInterval(_autoCountdown);
+    _autoCheckTimer=null;_autoCountdown=null;
+    ab.textContent='⏱ 自动';ab.classList.remove('active');
+    showToast('已停止自动检测','info');
+  }else{
+    checkProxy();
+    _autoCheckTimer=setInterval(()=>{checkProxy();_startCountdown();},AUTO_SECS*1000);
+    ab.classList.add('active');_startCountdown();
+    showToast(`已启动每${AUTO_SECS}秒自动检测`,'ok');
+  }
+}
+
+// ── 启动/停止 ─────────────────────────────────────────────
+async function startTask(){
+  const accounts=document.getElementById('accounts').value.trim();
+  const headless=document.getElementById('headless-toggle').checked;
+  const proxy=document.getElementById('proxy-input').value.trim();
+  const concurrency=parseInt(document.getElementById('concurrency-input').value)||3;
+  const selectedProducts=getSelectedProducts();
+  if(!accounts){showToast('请填写账号列表','err');return;}
+  if(!selectedProducts.length){showToast('请至少选择一个产品','err');return;}
+  saveForm();
+  // 保存账号映射（用于失败恢复）
+  const amap={};
+  // 1) "账号:xxx 密码:yyy" 标签格式（同行多对）
+  const labeledRe=new RegExp(
+    `${_LBL_ACC}${_SEP_RE}(\\S+?@\\S+?)\\s*${_LBL_PWD}${_SEP_RE}(.+?)(?=${_LBL_ACC}${_SEP_RE}|\\s*$)`,
+    'gim'
+  );
+  const consumed=[];
+  let mm;
+  while((mm=labeledRe.exec(accounts))!==null){
+    const em=mm[1].replace(/[,;]+$/,'').trim();
+    const pw=mm[2].replace(/[,;\s]+$/,'').trim();
+    if(em&&pw)amap[em]=`${em}\t${pw}`;
+    consumed.push([mm.index,mm.index+mm[0].length]);
+  }
+  let leftover=accounts;
+  if(consumed.length){
+    const arr=accounts.split('');
+    consumed.forEach(([s,e])=>{for(let i=s;i<e;i++)arr[i]=' '});
+    leftover=arr.join('');
+  }
+
+  // 2) 跨行 "账号:xxx\n密码:yyy"
+  let pendingEm=null;
+  const remain=[];
+  leftover.split('\n').forEach(line=>{
+    const t=line.trim();
+    if(!t||t.startsWith('#')){remain.push(line);return;}
+    const ma=_ACC_LABEL_RE.exec(t);
+    const mp=_PWD_LABEL_RE.exec(t);
+    if(ma){pendingEm=ma[1].replace(/[,;]+$/,'').trim();return;}
+    if(mp&&pendingEm){
+      const pw=mp[1].replace(/[,;]+$/,'').trim();
+      if(pw)amap[pendingEm]=`${pendingEm}\t${pw}`;
+      pendingEm=null;return;
+    }
+    remain.push(line);
+  });
+
+  // 3) 普通行
+  remain.forEach(line=>{
+    line=line.trim();if(!line||line.startsWith('#'))return;
+    const sep=line.includes('----')?'----':(line.includes('\t')?'\t':null);
+    const parts=sep?line.split(sep):line.split(/\s+/);
+    if(parts.length>=2)amap[parts[0].trim()]=line;
+  });
+  lsSetJ(LS.AMAP,amap);
+  lsSetJ(LS.CURRENT,[]);  // 清空本次结果
+  _lastResultCount=0;      // 重置增量计数器
+  _progressOk=0; _progressFail=0;
+  _taskStartTime=Date.now();
+  if(_elapsedTimer)clearInterval(_elapsedTimer);
+  _elapsedTimer=setInterval(updateElapsed,1000);
+  clearLog();resetProductDots();
+  const mode=document.querySelector('input[name="run-mode"]:checked')?.value || "azure_student";
+  const r=await fetch('/api/start',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
+
+  const j=await r.json();
+  if(!j.ok){showToast('启动失败: '+j.error,'err');return;}
+  setRunning(true);connectSSE();
+  showToast(`任务已启动（${j.count} 个账号，${concurrency} 并发）`,'ok');
+}
+
+async function stopTask(){
+  await fetch('/api/stop',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:SID})});
+  showToast('停止指令已发送','warn');
+}
+
+function setRunning(v){
+  isRunning=v;
+  const startBtn=document.getElementById('btn-start');
+  startBtn.disabled=v;
+  startBtn.classList.toggle('loading',v);
+  document.getElementById('btn-stop').disabled=!v;
+  document.getElementById('status-dot').className='dot '+(v?'running':'');
+  document.getElementById('status-text').textContent=v?'运行中...':'空闲';
+  const badge=document.getElementById('mode-badge');
+  badge.textContent=v?'运行中':'就绪';
+  badge.className=v?'running':'idle';
+  // 进度区域
+  document.getElementById('progress-section').style.display=v?'block':'none';
+  if(!v){
+    document.getElementById('current-account').textContent='';
+    if(_elapsedTimer){clearInterval(_elapsedTimer);_elapsedTimer=null;}
+  }
+  // 运行时启动定时拉取结果
+  if(v){
+    if(!_resultPollTimer) _resultPollTimer=setInterval(fetchAndAppendResults, 5000);
+  }else{
+    if(_resultPollTimer){clearInterval(_resultPollTimer);_resultPollTimer=null;}
+  }
+}
+let _resultPollTimer=null;
+
+function resetProductDots(){
+  PRODUCTS.forEach((_,i)=>{
+    document.getElementById('dot-'+i).className='product-dot';
+    document.getElementById('key-'+i).textContent='—';
+    document.getElementById('prod-'+i).classList.remove('got');
+  });
+}
+
+// ── 任务结束 ─────────────────────────────────────────────
+// 增量拉取结果（运行中实时更新历史表）
+let _fetchInFlight=false;
+let _lastResultCount=0;  // 上次拉取到的结果数量
+
+async function fetchAndAppendResults(){
+  if(_fetchInFlight)return;
+  _fetchInFlight=true;
+  try{
+    const rows=await fetch('/api/results?sid='+SID).then(r=>r.json()).catch(()=>[]);
+    if(!rows.length || rows.length <= _lastResultCount) return;
+
+    // 有新结果
+    const newRows = rows.slice(_lastResultCount);
+    _lastResultCount = rows.length;
+
+    let current=lsGetJ(LS.CURRENT,[]);
+    const ts=new Date().toLocaleString('zh-CN');
+
+    newRows.forEach(r=>{
+      const entry={ts,email:r.email,password:r.password||'',totp:r.totp_secret||'',
+        success:r.success,keys:r.keys||{},msg:r.msg||''};
+      current.push(entry);
+    });
+
+    lsSetJ(LS.CURRENT,current);
+
+    // 更新产品 dot（显示最新成功账号的 key）
+    const lastOk=newRows.filter(r=>r.success).pop();
+    if(lastOk&&lastOk.keys){
+      PRODUCTS.forEach((p,i)=>{
+        const k=lastOk.keys[p]||'';
+        const dot=document.getElementById('dot-'+i);
+        const keyEl=document.getElementById('key-'+i);
+        const item=document.getElementById('prod-'+i);
+        if(k){dot.className='product-dot got';keyEl.textContent=k;item.classList.add('got');}
+      });
+    }
+
+    // 从服务端重新加载历史
+    await loadServerHistory();
+    showToast(`新增 ${newRows.length} 条结果`,'ok',2000);
+  }finally{
+    _fetchInFlight=false;
+  }
+}
+
+// ── 服务端历史加载 ─────────────────────────────────────────
+let _serverHistory = [];
+
+async function loadServerHistory(){
+  try{
+    const r = await fetch('/api/history');
+    if(r.status === 401){ window.location.href='/login'; return; }
+    const j = await r.json();
+    if(j.ok) _serverHistory = j.rows || [];
+  }catch(e){ console.error('加载历史失败:', e); }
+  renderHistory();
+}
+
+async function onTaskDone(){
+  setRunning(false);
+  // 等一下确保后端最后一个结果已写入
+  await new Promise(r => setTimeout(r, 2000));
+  // 强制重置锁，确保能拉取
+  _fetchInFlight = false;
+  _lastResultCount = 0;  // 重置计数，重新拉取全部结果
+  await fetchAndAppendResults();
+
+  const rows=await fetch('/api/results?sid='+SID).then(r=>r.json()).catch(()=>[]);
+  if(!rows.length)return;
+  // 清空 progress
+  if(_totalAccounts>0)updateProgress(_totalAccounts,_totalAccounts);
+  setTimeout(()=>{document.getElementById('progress-wrap').style.display='none';},3000);
+
+  const ok=rows.filter(r=>r.success).length;
+  showToast(`任务完成: ${ok} 成功 / ${rows.length-ok} 失败`,ok===rows.length?'ok':'info',5000);
+  document.getElementById('mode-badge').className='done';
+  document.getElementById('mode-badge').textContent='已完成';
+}
+
+function renderHistory(){
+  const history = _serverHistory;
+  if(!history.length){
+    document.getElementById('results-section').style.display='none';
+    ['s-total','s-ok','s-fail'].forEach(id=>document.getElementById(id).textContent='0');
+    document.getElementById('s-rate').textContent='0%';
+    return;
+  }
+  document.getElementById('results-section').style.display='block';
+  const ok=history.filter(r=>r.success).length;
+  // 更新统计（带动画）
+  function updateStat(id, val){
+    const el=document.getElementById(id);
+    if(el.textContent !== String(val)){
+      el.textContent=val;
+      el.classList.remove('updated');
+      void el.offsetWidth; // 触发 reflow
+      el.classList.add('updated');
+    }
+  }
+  updateStat('s-total', history.length);
+  updateStat('s-ok', ok);
+  updateStat('s-fail', history.length-ok);
+  updateStat('s-rate', Math.round(ok/history.length*100)+'%');
+
+  const tbody=document.getElementById('results-body');tbody.innerHTML='';
+  document.getElementById('cb-all').checked=false;
+  document.getElementById('btn-export-sel').style.display='none';
+  history.forEach((r,i)=>{
+    const tr=document.createElement('tr');
+    const got=PRODUCTS.filter(p=>r.keys&&r.keys[p]).length;
+    let cells=`<td style="width:30px"><input type="checkbox" class="result-cb" data-idx="${r.id}" onchange="onResultCbChange()" style="cursor:pointer"></td>`;
+    cells+=`<td style="color:var(--muted);font-size:.7rem">${i+1}</td>`;
+    cells+=`<td class="email-cell" title="${esc(r.email)}">${esc(r.email)}</td>`;
+    cells+=`<td class="pwd-cell" title="${esc(r.password||'')}">${esc(r.password||'—')}</td>`;
+    cells+=`<td class="key-cell" title="${esc(r.totp_secret||'')}">${esc(r.totp_secret||'—')}</td>`;
+    cells+=`<td class="${r.success?'s-ok':'s-err'}">${r.success?'✅ '+got+'/'+PRODUCTS.length:'❌'}</td>`;
+    PRODUCTS.forEach(p=>{
+      const k=r.keys&&r.keys[p]?r.keys[p]:'';
+      cells+=k?`<td class="key-cell" title="${esc(k)}">${esc(k)}</td>`:`<td class="key-empty">—</td>`;
+    });
+    cells+=`<td style="font-size:.68rem;color:var(--muted);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.msg||'')}">${esc(r.msg||'')}</td>`;
+    tr.innerHTML=cells;tbody.appendChild(tr);
+  });
+}
+
+async function exportExcel(filter){
+  const ev=event;const btn=ev.target;
+  const orig=btn.textContent;
+  btn.disabled=true;btn.textContent='导出中...';
+  try{
+    const history=_serverHistory;
+    const current=lsGetJ(LS.CURRENT,[]);
+    const dataMap={
+      'all':            history,
+      'success':        history.filter(r=>r.success),
+      'failed':         history.filter(r=>!r.success),
+      'current-success':current.filter(r=>r.success),
+      'current-failed': current.filter(r=>!r.success),
+    };
+    const labelMap={
+      'all':'全部历史','success':'历史成功','failed':'历史失败',
+      'current-success':'本次成功','current-failed':'本次失败',
+    };
+    const rows=dataMap[filter]||[];
+    if(!rows.length){showToast('没有可导出的数据','err');return;}
+
+    // 构建 Excel 数据（产品全称作为列标题）
+    const sheetData=rows.map((r,i)=>{
+      const row={
+        '#':i+1,'时间':r.ts||r.created_at,'账号 (EDU 邮箱)':r.email,
+        '密码':r.password||'','TOTP Secret':r.totp_secret||r.totp||'',
+        '状态':r.success?('✅ '+PRODUCTS.filter(p=>r.keys&&r.keys[p]).length+'/'+PRODUCTS.length):'❌ 失败',
+        '备注':r.msg||'',
+      };
+      PRODUCTS.forEach(p=>{row[p]=r.keys&&r.keys[p]?r.keys[p]:'';});
+      return row;
+    });
+
+    const ws=XLSX.utils.json_to_sheet(sheetData,{
+      header:['#','时间','账号 (EDU 邮箱)','密码','TOTP Secret','状态','备注',...PRODUCTS]
+    });
+    // 设置列宽
+    ws['!cols']=[
+      {wch:4},{wch:18},{wch:38},{wch:22},{wch:28},{wch:10},{wch:30},
+      ...PRODUCTS.map(()=>({wch:42})),
+    ];
+
+    // 汇总 sheet
+    const total=rows.length;
+    const ok=rows.filter(r=>r.success).length;
+    const summaryData=[
+      ['统计项','值'],['导出类型',labelMap[filter]||filter],
+      ['导出时间',new Date().toLocaleString('zh-CN')],
+      ['总账号数',total],['成功账号数',ok],['失败账号数',total-ok],
+      ['成功率',total>0?Math.round(ok/total*100)+'%':'0%'],
+      [],['产品','获取到 key 的账号数'],
+    ];
+    PRODUCTS.forEach(p=>{
+      summaryData.push([p,rows.filter(r=>r.keys&&r.keys[p]).length]);
+    });
+    const ws2=XLSX.utils.aoa_to_sheet(summaryData);
+    ws2['!cols']=[{wch:55},{wch:18}];
+
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,'Azure Keys');
+    XLSX.utils.book_append_sheet(wb,ws2,'汇总统计');
+
+    const ts=new Date().toISOString().slice(0,19).replace(/[-:T]/g,'').slice(0,15);
+    const fname=`azure_keys_${labelMap[filter]||filter}_${ts}.xlsx`;
+    XLSX.writeFile(wb,fname);
+    showToast(`已导出 ${rows.length} 条记录: ${fname}`,'ok',4000);
+  }catch(e){
+    showToast('导出异常: '+e,'err');
+    console.error(e);
+  }finally{
+    btn.disabled=false;btn.textContent=orig;
+  }
+}
+
+function clearHistory(){
+  if(!confirm('确认清除所有历史记录？'))return;
+  fetch('/api/history/clear',{method:'POST',headers:{'Content-Type':'application/json'}})
+    .then(r=>r.json()).then(j=>{
+      if(j.ok){
+        _serverHistory=[];
+        lsSetJ(LS.CURRENT,[]);
+        renderHistory();resetProductDots();
+        showToast('历史已清除','ok');
+      }else{showToast('清除失败','err');}
+    }).catch(e=>showToast('清除失败: '+e,'err'));
+}
+
+function toggleAllResultCb(master){
+  document.querySelectorAll('.result-cb').forEach(cb=>{cb.checked=master.checked;});
+  onResultCbChange();
+}
+function onResultCbChange(){
+  const any=document.querySelectorAll('.result-cb:checked').length>0;
+  document.getElementById('btn-export-sel').style.display=any?'inline-block':'none';
+  document.getElementById('btn-del-sel').style.display=any?'inline-block':'none';
+}
+function exportSelected(){
+  const ids=new Set([...document.querySelectorAll('.result-cb:checked')].map(cb=>parseInt(cb.dataset.idx)));
+  if(!ids.size){showToast('请先勾选要导出的行','err');return;}
+  const rows=_serverHistory.filter(r=>ids.has(r.id));
+  if(!rows.length){showToast('没有可导出的数据','err');return;}
+  _doExportRows(rows, '选中');
+}
+
+function deleteSelected(){
+  const ids=[...document.querySelectorAll('.result-cb:checked')].map(cb=>parseInt(cb.dataset.idx));
+  if(!ids.length)return;
+  if(!confirm(`确认删除选中的 ${ids.length} 条记录？`))return;
+  fetch('/api/history/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ids})
+  }).then(r=>r.json()).then(j=>{
+    if(j.ok){
+      loadServerHistory();
+      showToast(`已删除 ${j.deleted} 条记录`,'ok');
+    }else{showToast('删除失败','err');}
+  }).catch(e=>showToast('删除失败: '+e,'err'));
+}
+
+function _doExportRows(rows, label){
+  try{
+    const sheetData=rows.map((r,i)=>{
+      const row={
+        '#':i+1,'时间':r.ts||r.created_at,'账号 (EDU 邮箱)':r.email,
+        '密码':r.password||'','TOTP Secret':r.totp_secret||r.totp||'',
+        '状态':r.success?('✅ '+PRODUCTS.filter(p=>r.keys&&r.keys[p]).length+'/'+PRODUCTS.length):'❌ 失败',
+        '备注':r.msg||'',
+      };
+      PRODUCTS.forEach(p=>{row[p]=r.keys&&r.keys[p]?r.keys[p]:'';});
+      return row;
+    });
+    const ws=XLSX.utils.json_to_sheet(sheetData,{
+      header:['#','时间','账号 (EDU 邮箱)','密码','TOTP Secret','状态','备注',...PRODUCTS]
+    });
+    ws['!cols']=[{wch:4},{wch:18},{wch:38},{wch:22},{wch:28},{wch:10},{wch:30},
+      ...PRODUCTS.map(()=>({wch:42}))];
+    const wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,'Azure Keys');
+    const ts=new Date().toISOString().slice(0,19).replace(/[-:T]/g,'').slice(0,15);
+    const fname=`azure_keys_${label}_${ts}.xlsx`;
+    XLSX.writeFile(wb,fname);
+    showToast(`已导出 ${rows.length} 条: ${fname}`,'ok',4000);
+  }catch(e){
+    showToast('导出异常: '+e,'err');
+  }
+}
+
+// ── 初始化 ─────────────────────────────────────────────────
+loadTheme();
+loadForm();
+loadServerHistory();  // 从服务端加载历史
+connectSSE();
+syncStatus();  // 立即同步状态，避免 3 秒延迟
+
+// 登出
+async function doLogout(){
+  if(!confirm('确认退出登录？'))return;
+  await fetch('/auth/logout',{method:'POST'});
+  window.location.href='/login';
+}
+
+// ── 用户/管理面板 ─────────────────────────────────────────
+let _isAdmin=false;
+(async function checkAdmin(){
+  try{
+    const r=await fetch('/auth/me');
+    const j=await r.json();
+    if(j.ok && j.is_admin) _isAdmin=true;
+  }catch(e){}
+})();
+
+function openUserPanel(){
+  const overlay=document.getElementById('user-panel-overlay');
+  overlay.style.display='flex';
+  if(_isAdmin){
+    document.getElementById('admin-section').style.display='block';
+    document.getElementById('panel-title').textContent='管理面板';
+    loadUserList();
+  }else{
+    document.getElementById('admin-section').style.display='none';
+    document.getElementById('panel-title').textContent='个人设置';
+  }
+}
+function closeUserPanel(){
+  document.getElementById('user-panel-overlay').style.display='none';
+}
+
+async function changeMyPassword(){
+  const pwd=document.getElementById('new-pwd').value;
+  if(!pwd||pwd.length<4){showToast('密码至少4位','err');return;}
+  try{
+    const r=await fetch('/admin/users/password',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:null,password:pwd,self:true})});
+    const j=await r.json();
+    showToast(j.msg||'已修改',j.ok?'ok':'err');
+    if(j.ok)document.getElementById('new-pwd').value='';
+  }catch(e){showToast('修改失败: '+e,'err');}
+}
+
+async function loadUserList(){
+  try{
+    const r=await fetch('/admin/users');
+    const j=await r.json();
+    if(!j.ok)return;
+    const div=document.getElementById('user-list');
+    div.innerHTML=j.users.map(u=>`
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:.82rem">
+        <span style="flex:1;font-weight:${u.is_admin?'700':'400'}">${u.is_admin?'👑 ':''}${u.username}</span>
+        <span style="color:var(--muted);font-size:.7rem">${u.last_login?u.last_login.substring(0,16):'从未登录'}</span>
+        ${!u.is_admin?`<button onclick="adminDeleteUser(${u.id},'${u.username}')" style="padding:3px 8px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.25);border-radius:4px;color:var(--red);font-size:.7rem;cursor:pointer">删除</button>`:''}
+      </div>
+    `).join('');
+  }catch(e){}
+}
+
+async function adminCreateUser(){
+  const username=document.getElementById('new-username').value.trim();
+  const password=document.getElementById('new-user-pwd').value;
+  if(!username||!password){showToast('请填写用户名和密码','err');return;}
+  try{
+    const r=await fetch('/admin/users/create',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password})});
+    const j=await r.json();
+    showToast(j.msg,j.ok?'ok':'err');
+    if(j.ok){
+      document.getElementById('new-username').value='';
+      document.getElementById('new-user-pwd').value='';
+      loadUserList();
+    }
+  }catch(e){showToast('创建失败: '+e,'err');}
+}
+
+async function adminDeleteUser(id,name){
+  if(!confirm(`确认删除用户 "${name}"？其所有历史记录也会被删除。`))return;
+  try{
+    const r=await fetch('/admin/users/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({user_id:id})});
+    const j=await r.json();
+    showToast(j.ok?'已删除':j.error,j.ok?'ok':'err');
+    if(j.ok)loadUserList();
+  }catch(e){showToast('删除失败: '+e,'err');}
+}
+
+// 全局 401 拦截（session 过期时自动跳转登录）
+const _origFetch = window.fetch;
+window.fetch = async function(...args){
+  const r = await _origFetch(...args);
+  if(r.status === 401){
+    const j = await r.clone().json().catch(()=>null);
+    if(j && j.need_login) window.location.href='/login';
+  }
+  return r;
+};
+
+async function syncStatus(){
+  const s=await fetch('/api/status?sid='+SID).then(r=>r.json()).catch(()=>null);
+  if(s&&s.running!==isRunning)setRunning(s.running);
+}
+setInterval(syncStatus,3000);
+</script>
+</body>
+</html>

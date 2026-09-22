@@ -1,0 +1,22 @@
+[Unit]
+Description=Azure Key Extractor Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+# 如自定义部署目录，请修改 WorkingDirectory 与对应路径
+WorkingDirectory=/opt/azure-key-extractor
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/azure-key-extractor/ms-playwright
+Environment=PATH=/opt/azure-key-extractor/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=HEADLESS=true
+Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_TRIM_THRESHOLD_=131072
+ExecStart=/opt/azure-key-extractor/venv/bin/python run_gui.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
