@@ -712,8 +712,10 @@ class LocalHttpCache:
         "management.azure.com/subscriptions",
         "management.azure.com/tenants",
         "management.azure.com/batch",
-        # 动态学生认证页面与交互接口（100% 实时原生直连，防止旧哈希缓存破坏 Angular 启动）
-        "signup.azure.com",
+        # 动态学生认证交互接口（注意：精确放行动态 API 和认证页面，允许静态 JS/CSS 走本地强缓存与背景图片 Mock）
+        "signup.azure.com/api/",
+        "signup.azure.com/studentverification",
+        "signup.azure.com/signup?offer=",
         # 带有动态临时签名与时间戳的 PoW / challenge 脚本
         "/fc/", "/challenge", "/enforcement",
         "expires=", "signature=", "key-pair-id="
@@ -1172,13 +1174,31 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.continue_()
             return
 
-        # 3. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
+        clean_url = url_lower.split("?")[0].split("#")[0]
+
+        # 3. 字体资源极速 Mock（拦截所有 Web 字体：woff2/woff/ttf/otf/eot，置于 DYNAMIC_SECURITY_PATTERNS 之前，彻底节约 Arkose 及各平台 1.2MB-2MB 字体流量）
+        if r_type == "font" or clean_url.endswith(FONT_EXTS) or "/fonts/" in clean_url or "format=woff" in url_lower:
+            if stats:
+                stats.record_blocked(est_size=50000)
+            fulfilled_request_ids.add(id(request))
+            await route.fulfill(
+                body=_DUMMY_EMPTY_FONT,
+                headers={
+                    "content-type": "font/woff2",
+                    "access-control-allow-origin": "*",
+                    "cache-control": "public, max-age=31536000"
+                },
+                status=200
+            )
+            return
+
+        # 4. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
         # （绝不缓存、不拦截、不 Mock，确保 TOTP 提取与人机验证 100% 成功）
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
             await route.continue_()
             return
 
-        # 4. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
+        # 5. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
         if "extensionmanifest/" in url_lower:
             cached_manifest = LocalHttpCache.get_canonical_manifest(url)
             if cached_manifest:
@@ -1189,8 +1209,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        # 5. 公共无状态静态资源强缓存 (JS/CSS/字体/图标/静态JSON)：本地秒级响应，0 网络流量
-        # （涵盖 portal.azure.com 静态脚本, aadcdn.msauth.net 等）
+        # 6. 公共无状态静态资源强缓存 (JS/CSS/图标/静态JSON)：本地秒级响应，0 网络流量
+        # （涵盖 portal.azure.com 静态脚本, signup.azure.com 静态脚本, aadcdn.msauth.net 等）
         if LocalHttpCache.is_cacheable(url, "GET"):
             cached = LocalHttpCache.get(url)
             if cached:
@@ -1201,16 +1221,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        clean_url = url_lower.split("?")[0].split("#")[0]
-
-        # 6. 拦截大体积音视频及安装包
+        # 7. 拦截大体积音视频及安装包
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
             await route.abort()
             return
 
-        # 7. 拦截非英语多国语言包
+        # 8. 拦截非英语多国语言包
         if NON_EN_LOCALE_PATTERN.search(clean_url):
             if stats:
                 stats.record_blocked(est_size=100000)
@@ -1218,7 +1236,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.fulfill(body=b"{}", headers={"content-type": "application/json"}, status=200)
             return
 
-        # 8. Azure Portal 非 Education 扩展模块剪枝（Mock 空 AMD 模块，节约 4-5MB JS 下载）
+        # 9. Azure Portal 非 Education 扩展模块剪枝（Mock 空 AMD 模块，节约 4-5MB JS 下载）
         if "/extension/" in clean_url and any(ext in clean_url for ext in UNNEEDED_PORTAL_EXTENSIONS):
             if stats:
                 stats.record_blocked(est_size=500000)
@@ -1230,7 +1248,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             )
             return
 
-        # 9. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
+        # 10. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
         # 注意：绝不 Mock Arkose / Cloudflare / SheerID 的人机验证挑战图片！
         is_captcha_img = any(k in url_lower for k in ("arkose", "funcaptcha", "turnstile", "sheerid", "cloudflare", "cf-"))
         if not is_captcha_img and (r_type in ("image", "imageset") or clean_url.endswith(IMAGE_EXTS)):
