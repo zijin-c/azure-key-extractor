@@ -833,7 +833,7 @@ async def run_pipeline(
                         curr_proxy, _ = await rotator.get_next_proxy()
                         retry_proxy_info = f"代理: {curr_proxy}" if curr_proxy else "直连"
                         _account_cb(f"⚠️ [新开浏览器重试] {e}，已关闭旧浏览器{totp_msg}，正在启动全新浏览器重试 (第 {attempt+2}/{1+max_login_retries} 次) | {retry_proxy_info}...")
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(random.uniform(2.5, 4.0))
                         continue
                     else:
                         _account_cb(f"❌ 全新浏览器重试后仍未通过: {e}")

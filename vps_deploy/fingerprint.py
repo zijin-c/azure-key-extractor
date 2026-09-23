@@ -861,9 +861,12 @@ class LocalHttpCache:
         if method.upper() != "GET":
             return False
         url_lower = url.lower()
+        clean = url_lower.split("?")[0].split("#")[0]
+        # Arkose CDN 静态字体与静态样式资产允许强缓存（保证真实字体度量避免触发风控）
+        if "/style-manager/fonts/" in clean or ("/fc/assets/" in clean and clean.endswith(cls.CACHEABLE_EXTENSIONS)):
+            return True
         if any(p in url_lower for p in cls.DYNAMIC_SECURITY_PATTERNS):
             return False
-        clean = url_lower.split("?")[0].split("#")[0]
         if clean.endswith(cls.CACHEABLE_EXTENSIONS):
             return True
         if any(path in clean for path in (
@@ -1176,21 +1179,56 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         clean_url = url_lower.split("?")[0].split("#")[0]
 
-        # 3. 字体资源极速 Mock（拦截所有 Web 字体：woff2/woff/ttf/otf/eot，置于 DYNAMIC_SECURITY_PATTERNS 之前，彻底节约 Arkose 及各平台 1.2MB-2MB 字体流量）
+        # 3. 字体资源智能处理：
+        # 特别注意：Arkose Labs (FunCaptcha) 会通过 Canvas measureText 与 DOM 元素尺寸精确校验 style-manager 字体！
+        # 若暴力 Mock 为空字节 b'' 会导致字体度量偏移，直接被 Arkose 判定为爬虫并强制弹出人机拼图！
+        # 正确做法：Arkose 字体走本地强磁盘缓存（首次下载 1.21MB，后续全部从本地磁盘 0 流量秒级响应，保真真实字体度量）；
+        # 普通网页非风控字体（如门户 Segoe/图标字体等）直接以 200 OK 极简空字体 Mock 响应，彻底省流。
         if r_type == "font" or clean_url.endswith(FONT_EXTS) or "/fonts/" in clean_url or "format=woff" in url_lower:
-            if stats:
-                stats.record_blocked(est_size=50000)
-            fulfilled_request_ids.add(id(request))
-            await route.fulfill(
-                body=_DUMMY_EMPTY_FONT,
-                headers={
-                    "content-type": "font/woff2",
-                    "access-control-allow-origin": "*",
-                    "cache-control": "public, max-age=31536000"
-                },
-                status=200
-            )
-            return
+            is_arkose_font = any(k in url_lower for k in ("arkose", "funcaptcha"))
+            if is_arkose_font:
+                cached = LocalHttpCache.get(url)
+                if cached:
+                    body, headers, status = cached
+                    if stats:
+                        stats.record_cache_hit(len(body))
+                    fulfilled_request_ids.add(id(request))
+                    await route.fulfill(body=body, headers=headers, status=status)
+                    return
+                # 缓存未命中时真实拉取一次并存入本地磁盘缓存
+                try:
+                    fetch_resp = await route.fetch()
+                    if fetch_resp.status == 200:
+                        resp_body = await fetch_resp.body()
+                        if resp_body and len(resp_body) > 10:
+                            resp_headers = dict(fetch_resp.headers)
+                            LocalHttpCache.put(url, resp_body, resp_headers, fetch_resp.status)
+                        if stats:
+                            stats.record_transfer(len(resp_body) + 400, url, r_type, fetch_resp.status)
+                        fulfilled_request_ids.add(id(request))
+                        await route.fulfill(response=fetch_resp, body=resp_body)
+                        return
+                    else:
+                        await route.fulfill(response=fetch_resp)
+                        return
+                except Exception:
+                    await route.continue_()
+                    return
+            else:
+                # 非风控普通字体：极速 Mock，彻底节省流量
+                if stats:
+                    stats.record_blocked(est_size=50000)
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(
+                    body=_DUMMY_EMPTY_FONT,
+                    headers={
+                        "content-type": "font/woff2",
+                        "access-control-allow-origin": "*",
+                        "cache-control": "public, max-age=31536000"
+                    },
+                    status=200
+                )
+                return
 
         # 4. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
         # （绝不缓存、不拦截、不 Mock，确保 TOTP 提取与人机验证 100% 成功）
