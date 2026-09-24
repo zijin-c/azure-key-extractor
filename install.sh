@@ -35,6 +35,31 @@ if [ "$CURRENT_USER" != "root" ]; then
     fi
 fi
 
+# 检查当前目录是否为项目仓库（若通过 curl | bash 远程管道直连执行，则全自动克隆最新项目至 /opt/azure-key-extractor）
+if [ ! -f "$SCRIPT_DIR/run_gui.py" ]; then
+    SCRIPT_DIR="/opt/azure-key-extractor"
+    echo -e "${CYAN}[提示] 检测到通过远程脚本一键执行，正在自动克隆最新项目至 $SCRIPT_DIR...${NC}"
+    if ! command -v git >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y && $SUDO apt-get install -y git
+        elif command -v dnf >/dev/null 2>&1; then
+            $SUDO dnf install -y git
+        elif command -v yum >/dev/null 2>&1; then
+            $SUDO yum install -y git
+        fi
+    fi
+    $SUDO mkdir -p "$SCRIPT_DIR"
+    if [ ! -d "$SCRIPT_DIR/.git" ]; then
+        $SUDO git clone https://github.com/zijin-c/azure-key-extractor.git "$SCRIPT_DIR"
+    else
+        cd "$SCRIPT_DIR" && $SUDO git pull
+    fi
+    if [ "$CURRENT_USER" != "root" ]; then
+        $SUDO chown -R $CURRENT_USER:$CURRENT_USER "$SCRIPT_DIR"
+    fi
+    cd "$SCRIPT_DIR"
+fi
+
 # 1. 更新系统并安装 Playwright 与 Python 依赖
 echo -e "\n${GREEN}[1/5] 更新系统源并安装底层系统库与 Python 环境...${NC}"
 if command -v apt-get >/dev/null 2>&1; then
