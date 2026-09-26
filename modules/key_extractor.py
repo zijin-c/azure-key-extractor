@@ -722,10 +722,18 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback) -> bool:
     sels = [
         "input[name='otc']",
         "input#idTxtBx_SAOTCC_OTC",
+        "input#idTxtBx_OTC",
+        "input[name='VerificationCode']",
+        "input#VerificationCode",
         "input[autocomplete='one-time-code']",
+        "input#otc",
         "input[placeholder*='code' i]",
+        "input[placeholder*='代码' i]",
+        "input[placeholder*='验证码' i]",
+        "input[aria-label*='code' i]",
+        "input[aria-label*='代码' i]",
+        "input[aria-label*='验证码' i]",
         "input[type='tel']",
-        "input[type='text']:not([type='hidden'])",
     ]
     for sel in sels:
         try:

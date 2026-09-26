@@ -210,15 +210,22 @@ async def human_type(
         else:
             loc = locator_or_selector
 
-        await loc.scroll_into_view_if_needed()
-        box = await loc.bounding_box()
+        try:
+            await loc.scroll_into_view_if_needed(timeout=2500)
+        except Exception:
+            pass
+        box = None
+        try:
+            box = await loc.bounding_box(timeout=2000)
+        except Exception:
+            pass
         if box and box["width"] > 0 and box["height"] > 0:
             tx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
             ty = box["y"] + box["height"] * random.uniform(0.3, 0.7)
             await human_bezier_move(page, tx, ty)
             await asyncio.sleep(random.uniform(0.08, 0.15))
 
-        await loc.click()
+        await loc.click(timeout=2500)
         await asyncio.sleep(random.uniform(0.18, 0.35))
 
         # 清空已有文本
