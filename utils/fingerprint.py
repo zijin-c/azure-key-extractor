@@ -722,8 +722,107 @@ class LocalHttpCache:
     )
 
     CANONICAL_DIR = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests")
+    HASH_MAP_FILE = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests", "manifest_hashes.json")
     _manifest_hash_to_type: dict[str, str] = {}
     _canonical_initialized: bool = False
+
+    @classmethod
+    def identify_manifest_by_size(cls, size_bytes: int) -> str | None:
+        """根据 Content-Length 大小（支持 Raw 或 Gzip 传输尺寸）精准反推 Manifest 规范化类型。
+        Azure Portal 7 大清单尺寸阶梯严格非重叠，可实现 0 字节内容下载下的 100% 盲判。
+        """
+        if size_bytes > 10_000_000 or (300_000 <= size_bytes <= 600_000):
+            return "extensionConfiguration"
+        elif (4_000_000 <= size_bytes <= 7_000_000) or (700_000 <= size_bytes <= 1_200_000):
+            return "assetTypes"
+        elif (1_500_000 <= size_bytes <= 3_000_000) or (100_000 <= size_bytes <= 250_000):
+            return "assetTypesBrowse"
+        elif (200_000 <= size_bytes <= 400_000) or (30_000 <= size_bytes <= 80_000):
+            return "browseMenus"
+        elif (115_000 <= size_bytes <= 150_000) or (18_000 <= size_bytes <= 30_000):
+            return "featureCards"
+        elif (90_000 <= size_bytes <= 114_000) or (12_000 <= size_bytes <= 20_000):
+            return "portalServices"
+        elif (10_000 <= size_bytes <= 30_000) or (2_000 <= size_bytes <= 8_000):
+            return "tourGuide"
+        return None
+
+    @classmethod
+    def learn_hashes_from_html(cls, html_content: bytes | str):
+        """从 Azure Portal 入口 HTML 中提取 extensionsManifestHash 映射表，瞬间学习数百个 Hash。"""
+        if not html_content:
+            return
+        try:
+            if isinstance(html_content, bytes):
+                text = html_content.decode("utf-8", errors="ignore")
+            else:
+                text = str(html_content)
+            idx = text.find('"extensionsManifestHash":')
+            if idx == -1:
+                idx = text.find('extensionsManifestHash')
+                if idx != -1:
+                    colon = text.find(':', idx)
+                    if colon != -1:
+                        idx = colon - len('"extensionsManifestHash"')
+            if idx == -1:
+                return
+            start = text.find('{', idx)
+            if start == -1:
+                return
+            depth = 0
+            end = start
+            for i in range(start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            data = json.loads(text[start:end])
+            new_learned = False
+            for m_type, items in data.items():
+                if not isinstance(items, list):
+                    continue
+                for item in items:
+                    if isinstance(item, list):
+                        for h in item:
+                            if isinstance(h, str) and h:
+                                if h not in cls._manifest_hash_to_type:
+                                    cls._manifest_hash_to_type[h] = m_type
+                                    cls._manifest_hash_to_type[f"{h}.json"] = m_type
+                                    new_learned = True
+                    elif isinstance(item, str) and item:
+                        if item not in cls._manifest_hash_to_type:
+                            cls._manifest_hash_to_type[item] = m_type
+                            cls._manifest_hash_to_type[f"{item}.json"] = m_type
+                            new_learned = True
+            if new_learned:
+                cls._persist_hash_map()
+        except Exception:
+            pass
+
+    @classmethod
+    def learn_hash_mapping(cls, hash_name: str, m_type: str):
+        """动态注册单条 Hash 到规范类型的映射并持久化。"""
+        if not hash_name or not m_type:
+            return
+        clean_h = hash_name.split("?")[0].split("#")[0]
+        base_h = clean_h[:-5] if clean_h.endswith(".json") else clean_h
+        cls._manifest_hash_to_type[clean_h] = m_type
+        cls._manifest_hash_to_type[base_h] = m_type
+        cls._manifest_hash_to_type[f"{base_h}.json"] = m_type
+        cls._persist_hash_map()
+
+    @classmethod
+    def _persist_hash_map(cls):
+        """持久化当前学习到的全量 Hash 字典到磁盘。"""
+        try:
+            os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
+            with open(cls.HASH_MAP_FILE, "w", encoding="utf-8") as f:
+                json.dump(cls._manifest_hash_to_type, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     @classmethod
     def detect_manifest_type(cls, data: dict) -> str | None:
@@ -763,10 +862,21 @@ class LocalHttpCache:
 
     @classmethod
     def init_canonical_manifests(cls):
-        """初始化规范化清单元数据缓存池，自动利用现有缓存预热。"""
+        """初始化规范化清单元数据缓存池，自动利用现有缓存与持久化 Hash 字典预热。"""
         if cls._canonical_initialized:
             return
         os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
+        # 1. 优先从磁盘持久化文件加载全量 Hash 字典（包含跨代理节点 CDN 哈希池）
+        if os.path.exists(cls.HASH_MAP_FILE):
+            try:
+                with open(cls.HASH_MAP_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                    if isinstance(saved, dict):
+                        cls._manifest_hash_to_type.update(saved)
+            except Exception:
+                pass
+
+        # 2. 扫描历史 .meta / .body 记录补充
         try:
             for fname in os.listdir(PYTHON_HTTP_CACHE_DIR):
                 if fname.endswith(".meta"):
@@ -779,20 +889,15 @@ class LocalHttpCache:
                             meta = json.load(f)
                         url = meta.get("url", "")
                         if "ExtensionManifest/" in url:
-                            hash_name = url.split("/")[-1].split("?")[0]
-                            with open(b_path, "rb") as f:
-                                body = f.read()
-                            data = json.loads(body.decode("utf-8", errors="ignore"))
-                            m_type = cls.detect_manifest_type(data)
-                            if m_type:
-                                cls._manifest_hash_to_type[hash_name] = m_type
-                                canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
-                                canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
-                                if not os.path.exists(canon_b) or not os.path.exists(canon_m):
-                                    with open(canon_b, "wb") as bf:
-                                        bf.write(body)
-                                    with open(canon_m, "w", encoding="utf-8") as mf:
-                                        json.dump(meta, mf, ensure_ascii=False)
+                            hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
+                            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
+                            if hash_name not in cls._manifest_hash_to_type:
+                                b_size = os.path.getsize(b_path)
+                                m_type = cls.identify_manifest_by_size(b_size)
+                                if m_type:
+                                    cls._manifest_hash_to_type[hash_name] = m_type
+                                    cls._manifest_hash_to_type[clean_h] = m_type
+                                    cls._manifest_hash_to_type[f"{clean_h}.json"] = m_type
                     except Exception:
                         pass
         except Exception:
@@ -809,7 +914,8 @@ class LocalHttpCache:
             m_type = parts.split("&")[0].split("#")[0]
         if not m_type:
             hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-            m_type = cls._manifest_hash_to_type.get(hash_name)
+            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
+            m_type = cls._manifest_hash_to_type.get(hash_name) or cls._manifest_hash_to_type.get(clean_h)
         if not m_type:
             return None
         canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
@@ -831,13 +937,17 @@ class LocalHttpCache:
         """将新拉取的 Manifest 数据解析并更新到规范化缓存中。"""
         cls.init_canonical_manifests()
         try:
-            data = json.loads(body.decode("utf-8", errors="ignore"))
-            m_type = cls.detect_manifest_type(data)
-            if not m_type and "m_type=" in url:
+            m_type = None
+            if "m_type=" in url:
                 m_type = url.split("m_type=", 1)[1].split("&")[0].split("#")[0]
+            if not m_type:
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+                m_type = cls.detect_manifest_type(data)
+            if not m_type:
+                m_type = cls.identify_manifest_by_size(len(body))
             if m_type:
                 hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                cls._manifest_hash_to_type[hash_name] = m_type
+                cls.learn_hash_mapping(hash_name, m_type)
                 canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
                 canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
                 clean_headers = {
@@ -1042,6 +1152,55 @@ _DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return {}; });'
 # Azure Portal ExtensionManifest 客户端 Hook 脚本：在前端发起清单拉取时自动附带 m_type 参数，消除 Hash 漂移
 _PORTAL_MANIFEST_HOOK_JS = """
 (function() {
+    var _hashToType = {};
+    function learnFromConfig(cfg) {
+        try {
+            var env = cfg && (cfg.environment || (cfg.portalServerConfig && cfg.portalServerConfig.environment));
+            var hashes = env && env.extensionsManifestHash;
+            if (hashes && typeof hashes === 'object') {
+                for (var type in hashes) {
+                    var list = hashes[type];
+                    if (Array.isArray(list)) {
+                        for (var i = 0; i < list.length; i++) {
+                            var item = list[i];
+                            if (Array.isArray(item)) {
+                                for (var j = 0; j < item.length; j++) {
+                                    if (typeof item[j] === 'string') _hashToType[item[j]] = type;
+                                }
+                            } else if (typeof item === 'string') {
+                                _hashToType[item] = type;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch(e) {}
+    }
+
+    // 1. Hook MsPortalImpl.redirect 捕获启动配置并学习全部 Hash
+    var _impl = window.MsPortalImpl;
+    function hookImpl(impl) {
+        if (!impl || impl._hooked) return impl;
+        impl._hooked = true;
+        var origRedirect = impl.redirect;
+        if (typeof origRedirect === 'function') {
+            impl.redirect = function(param) {
+                if (param) learnFromConfig(param);
+                return origRedirect.apply(this, arguments);
+            };
+        }
+        return impl;
+    }
+    if (_impl) hookImpl(_impl);
+    try {
+        Object.defineProperty(window, 'MsPortalImpl', {
+            configurable: true, enumerable: true,
+            get: function() { return _impl; },
+            set: function(v) { _impl = hookImpl(v); }
+        });
+    } catch(e) {}
+
+    // 2. Hook MsPortalEarly
     function hookEarly(early) {
         if (!early || early._manifest_tagged) return early;
         early._manifest_tagged = true;
@@ -1079,6 +1238,41 @@ _PORTAL_MANIFEST_HOOK_JS = """
             }
         });
     } catch(e) {}
+
+    // 3. 全局 Hook XHR 与 Fetch，自动在 ExtensionManifest 请求路径上打上 m_type 标签
+    function tagManifestUrl(url) {
+        if (typeof url === 'string' && url.indexOf('ExtensionManifest/') >= 0 && url.indexOf('m_type=') < 0) {
+            var parts = url.split('/');
+            var last = parts[parts.length - 1].split('?')[0].split('#')[0];
+            var hash = last.replace(/\\.json$/i, '');
+            var m_type = _hashToType[hash] || _hashToType[last];
+            if (m_type) {
+                return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'm_type=' + encodeURIComponent(m_type);
+            }
+        }
+        return url;
+    }
+
+    var origXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        arguments[1] = tagManifestUrl(url);
+        return origXhrOpen.apply(this, arguments);
+    };
+
+    var origFetch = window.fetch;
+    if (typeof origFetch === 'function') {
+        window.fetch = function(input, init) {
+            if (typeof input === 'string') {
+                input = tagManifestUrl(input);
+            } else if (input && typeof input.url === 'string') {
+                var tagged = tagManifestUrl(input.url);
+                if (tagged !== input.url) {
+                    input = new Request(tagged, input);
+                }
+            }
+            return origFetch.apply(this, arguments);
+        };
+    }
 })();
 """
 
@@ -1168,18 +1362,58 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url_lower = url.lower()
 
         # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转安全）
+        # 特别优化：当加载 Azure Portal 主页面时，实时嗅探 HTML 响应体中的 extensionsManifestHash，瞬间学习全量 CDN Hash 映射
         if r_type == "document" or request.is_navigation_request():
+            if "portal.azure.com" in url_lower:
+                try:
+                    doc_resp = await route.fetch()
+                    doc_body = await doc_resp.body()
+                    LocalHttpCache.learn_hashes_from_html(doc_body)
+                    if stats:
+                        stats.record_transfer(len(doc_body) + 400, url, r_type, doc_resp.status)
+                    fulfilled_request_ids.add(id(request))
+                    await route.fulfill(response=doc_resp, body=doc_body)
+                    return
+                except Exception:
+                    pass
             await route.continue_()
             return
 
-        # 2. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
+        # 2. 遥测/追踪与后台非业务数据埋点优先拦截（涵盖 POST 与 GET，杜绝 OneCollector / Telemetry API 漏网）：
+        # 注意：严格排除所有动态安全接口与核心认证/2FA
+        if not any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
+            try:
+                parsed = urlparse(url)
+                hostname = (parsed.hostname or "").lower()
+                path = (parsed.path or "").lower()
+            except Exception:
+                hostname = ""
+                path = ""
+
+            is_blocked_domain = any(hostname == d or hostname.endswith("." + d) for d in BLOCKED_DOMAINS)
+            is_blocked_path = any(path.startswith(p) or p in path for p in BLOCKED_PATHS)
+            is_telemetry = is_blocked_domain or is_blocked_path or any(
+                k in url_lower for k in ("onecollector", "/telemetry", "/logger", "/diagnostics")
+            )
+            if is_telemetry:
+                if stats:
+                    stats.record_blocked(est_size=30000)
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(
+                    body=b'{"status": 200, "data": []}',
+                    headers={"content-type": "application/json", "access-control-allow-origin": "*"},
+                    status=200
+                )
+                return
+
+        # 3. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
         if request.method != "GET":
             await route.continue_()
             return
 
         clean_url = url_lower.split("?")[0].split("#")[0]
 
-        # 3. 字体资源智能处理：
+        # 4. 字体资源智能处理：
         # 特别注意：Arkose Labs (FunCaptcha) 会通过 Canvas measureText 与 DOM 元素尺寸精确校验 style-manager 字体！
         # 若暴力 Mock 为空字节 b'' 会导致字体度量偏移，直接被 Arkose 判定为爬虫并强制弹出人机拼图！
         # 正确做法：Arkose 字体走本地强磁盘缓存（首次下载 1.21MB，后续全部从本地磁盘 0 流量秒级响应，保真真实字体度量）；
@@ -1230,13 +1464,13 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 )
                 return
 
-        # 4. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
+        # 5. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
         # （绝不缓存、不拦截、不 Mock，确保 TOTP 提取与人机验证 100% 成功）
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
             await route.continue_()
             return
 
-        # 5. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
+        # 6. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
         if "extensionmanifest/" in url_lower:
             cached_manifest = LocalHttpCache.get_canonical_manifest(url)
             if cached_manifest:
@@ -1247,7 +1481,27 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        # 6. 公共无状态静态资源强缓存 (JS/CSS/图标/静态JSON)：本地秒级响应，0 网络流量
+            # 若静态索引未命中，通过 0 字节内容下载的 HEAD 探测反查清单类型，秒级回退至规范化强缓存
+            try:
+                head_resp = await route.fetch(method="HEAD")
+                cl = head_resp.headers.get("content-length")
+                if cl and cl.isdigit():
+                    m_type = LocalHttpCache.identify_manifest_by_size(int(cl))
+                    if m_type:
+                        hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
+                        LocalHttpCache.learn_hash_mapping(hash_name, m_type)
+                        cached_manifest = LocalHttpCache.get_canonical_manifest(url)
+                        if cached_manifest:
+                            body, headers, status = cached_manifest
+                            if stats:
+                                stats.record_cache_hit(len(body))
+                            fulfilled_request_ids.add(id(request))
+                            await route.fulfill(body=body, headers=headers, status=status)
+                            return
+            except Exception:
+                pass
+
+        # 7. 公共无状态静态资源强缓存 (JS/CSS/图标/静态JSON)：本地秒级响应，0 网络流量
         # （涵盖 portal.azure.com 静态脚本, signup.azure.com 静态脚本, aadcdn.msauth.net 等）
         if LocalHttpCache.is_cacheable(url, "GET"):
             cached = LocalHttpCache.get(url)
@@ -1259,14 +1513,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        # 7. 拦截大体积音视频及安装包
+        # 8. 拦截大体积音视频及安装包
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
             await route.abort()
             return
 
-        # 8. 拦截非英语多国语言包
+        # 9. 拦截非英语多国语言包
         if NON_EN_LOCALE_PATTERN.search(clean_url):
             if stats:
                 stats.record_blocked(est_size=100000)
@@ -1274,7 +1528,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.fulfill(body=b"{}", headers={"content-type": "application/json"}, status=200)
             return
 
-        # 9. Azure Portal 非 Education 扩展模块剪枝（Mock 空 AMD 模块，节约 4-5MB JS 下载）
+        # 10. Azure Portal 非 Education 扩展模块剪枝（Mock 空 AMD 模块，节约 4-5MB JS 下载）
         if "/extension/" in clean_url and any(ext in clean_url for ext in UNNEEDED_PORTAL_EXTENSIONS):
             if stats:
                 stats.record_blocked(est_size=500000)
@@ -1286,7 +1540,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             )
             return
 
-        # 10. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
+        # 11. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
         # 注意：绝不 Mock Arkose / Cloudflare / SheerID 的人机验证挑战图片！
         is_captcha_img = any(k in url_lower for k in ("arkose", "funcaptcha", "turnstile", "sheerid", "cloudflare", "cf-"))
         if not is_captcha_img and (r_type in ("image", "imageset") or clean_url.endswith(IMAGE_EXTS)):
@@ -1307,7 +1561,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 )
             return
 
-        # 11. 拦截第三方追踪与后台非业务遥测/非核心 API
+        # 12. 拦截第三方追踪与后台非业务遥测/非核心 API（兜底 GET 请求）
         try:
             parsed = urlparse(url)
             hostname = (parsed.hostname or "").lower()
@@ -1328,7 +1582,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.abort()
             return
 
-        # 12. 对属于可缓存范围但尚未命中的静态请求（包括 ExtensionManifest、Portal 静态脚本）：
+        # 13. 对属于可缓存范围但尚未命中的静态请求（包括 ExtensionManifest、Portal 静态脚本）：
         # 使用 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存！
         if LocalHttpCache.is_cacheable(url, "GET") or "extensionmanifest/" in url_lower:
             try:
@@ -1352,7 +1606,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.continue_()
                 return
 
-        # 13. 其他所有核心请求原生放行
+        # 14. 其他所有核心请求原生放行
         await route.continue_()
 
     await ctx.route("**/*", _route_handler)
