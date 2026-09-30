@@ -1147,139 +1147,12 @@ class TrafficStats:
 _DUMMY_SVG_IMAGE = b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>'
 _DUMMY_PNG_IMAGE = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
 _DUMMY_EMPTY_FONT = b''
-_DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return {}; });'
-
-# Azure Portal ExtensionManifest 客户端 Hook 脚本：在前端发起清单拉取时自动附带 m_type 参数，消除 Hash 漂移
-_PORTAL_MANIFEST_HOOK_JS = """
-(function() {
-    var _hashToType = {};
-    function learnFromConfig(cfg) {
-        try {
-            var env = cfg && (cfg.environment || (cfg.portalServerConfig && cfg.portalServerConfig.environment));
-            var hashes = env && env.extensionsManifestHash;
-            if (hashes && typeof hashes === 'object') {
-                for (var type in hashes) {
-                    var list = hashes[type];
-                    if (Array.isArray(list)) {
-                        for (var i = 0; i < list.length; i++) {
-                            var item = list[i];
-                            if (Array.isArray(item)) {
-                                for (var j = 0; j < item.length; j++) {
-                                    if (typeof item[j] === 'string') _hashToType[item[j]] = type;
-                                }
-                            } else if (typeof item === 'string') {
-                                _hashToType[item] = type;
-                            }
-                        }
-                    }
-                }
-            }
-        } catch(e) {}
-    }
-
-    // 1. Hook MsPortalImpl.redirect 捕获启动配置并学习全部 Hash
-    var _impl = window.MsPortalImpl;
-    function hookImpl(impl) {
-        if (!impl || impl._hooked) return impl;
-        impl._hooked = true;
-        var origRedirect = impl.redirect;
-        if (typeof origRedirect === 'function') {
-            impl.redirect = function(param) {
-                if (param) learnFromConfig(param);
-                return origRedirect.apply(this, arguments);
-            };
-        }
-        return impl;
-    }
-    if (_impl) hookImpl(_impl);
-    try {
-        Object.defineProperty(window, 'MsPortalImpl', {
-            configurable: true, enumerable: true,
-            get: function() { return _impl; },
-            set: function(v) { _impl = hookImpl(v); }
-        });
-    } catch(e) {}
-
-    // 2. Hook MsPortalEarly
-    function hookEarly(early) {
-        if (!early || early._manifest_tagged) return early;
-        early._manifest_tagged = true;
-        var orig = early.getCachedManifestUri;
-        if (typeof orig === 'function') {
-            early.getCachedManifestUri = function(type) {
-                var res = orig.apply(this, arguments);
-                if (typeof res === 'string') {
-                    return res + (res.indexOf('?') >= 0 ? '&' : '?') + 'm_type=' + encodeURIComponent(type);
-                }
-                if (res && typeof res.then === 'function') {
-                    return res.then(function(uri) {
-                        if (typeof uri === 'string') {
-                            return uri + (uri.indexOf('?') >= 0 ? '&' : '?') + 'm_type=' + encodeURIComponent(type);
-                        }
-                        return uri;
-                    });
-                }
-                return res;
-            };
-        }
-        return early;
-    }
-    var _early = window.MsPortalEarly;
-    if (_early) {
-        hookEarly(_early);
-    }
-    try {
-        Object.defineProperty(window, 'MsPortalEarly', {
-            configurable: true,
-            enumerable: true,
-            get: function() { return _early; },
-            set: function(v) {
-                _early = hookEarly(v);
-            }
-        });
-    } catch(e) {}
-
-    // 3. 全局 Hook XHR 与 Fetch，自动在 ExtensionManifest 请求路径上打上 m_type 标签
-    function tagManifestUrl(url) {
-        if (typeof url === 'string' && url.indexOf('ExtensionManifest/') >= 0 && url.indexOf('m_type=') < 0) {
-            var parts = url.split('/');
-            var last = parts[parts.length - 1].split('?')[0].split('#')[0];
-            var hash = last.replace(/\\.json$/i, '');
-            var m_type = _hashToType[hash] || _hashToType[last];
-            if (m_type) {
-                return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'm_type=' + encodeURIComponent(m_type);
-            }
-        }
-        return url;
-    }
-
-    var origXhrOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url) {
-        arguments[1] = tagManifestUrl(url);
-        return origXhrOpen.apply(this, arguments);
-    };
-
-    var origFetch = window.fetch;
-    if (typeof origFetch === 'function') {
-        window.fetch = function(input, init) {
-            if (typeof input === 'string') {
-                input = tagManifestUrl(input);
-            } else if (input && typeof input.url === 'string') {
-                var tagged = tagManifestUrl(input.url);
-                if (tagged !== input.url) {
-                    input = new Request(tagged, input);
-                }
-            }
-            return origFetch.apply(this, arguments);
-        };
-    }
-})();
-"""
+_DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return new Proxy({}, { get: function(t, p) { return typeof p === "symbol" ? undefined : function() { return {}; }; } }); });'
 
 
 async def setup_save_data_route(ctx, stats: TrafficStats = None):
     """超深度省流路由系统：
-    1. 前端注入 MsPortalEarly 清单类型 Hook，并走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）；
+    1. ExtensionManifest 走本地规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）；
     2. 本地强缓存公共无状态静态 JS/CSS/字体/图标/静态JSON（portal.azure.com/*.js, aadcdn.msauth.net 等 0 字节复用）；
     3. 1-Byte 极简图片/SVG/字体 Mock 响应（彻底杜绝 4-6MB 冗余图像与字体网络下载，同时确保 onload 正常触发）；
     4. Azure Portal 非业务扩展模块（CostManagement, Advisor, Security, Monitoring 等）AMD 模块剪枝（节约 4-5MB 无用 JS）；
@@ -1289,12 +1162,6 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     """
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
-
-    # 注入 Azure Portal 前端清单 Hook，动态透传 manifest 类型
-    try:
-        await ctx.add_init_script(_PORTAL_MANIFEST_HOOK_JS)
-    except Exception:
-        pass
 
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
@@ -1334,7 +1201,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         "/api/cloudshell", "/api/advisor", "/api/costmanagement",
         "/api/search/suggestions", "/api/announcements", "/api/whatsnew",
         "/api/quickstart", "/api/guidedtour", "/api/notifications/broadcast",
-        "/api/userfeedback", "/api/usersettings", "/api/telemetry", "/api/diagnostics", "/api/logger",
+        "/api/userfeedback", "/api/telemetry", "/api/diagnostics", "/api/logger",
         "microsoft.resourcegraph", "microsoft.advisor", "microsoft.costmanagement",
         "microsoft.policyinsights", "microsoft.security"
     )
@@ -1361,21 +1228,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url = request.url
         url_lower = url.lower()
 
-        # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转安全）
-        # 特别优化：当加载 Azure Portal 主页面时，实时嗅探 HTML 响应体中的 extensionsManifestHash，瞬间学习全量 CDN Hash 映射
+        # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转与 CSP 安全）
         if r_type == "document" or request.is_navigation_request():
-            if "portal.azure.com" in url_lower:
-                try:
-                    doc_resp = await route.fetch()
-                    doc_body = await doc_resp.body()
-                    LocalHttpCache.learn_hashes_from_html(doc_body)
-                    if stats:
-                        stats.record_transfer(len(doc_body) + 400, url, r_type, doc_resp.status)
-                    fulfilled_request_ids.add(id(request))
-                    await route.fulfill(response=doc_resp, body=doc_body)
-                    return
-                except Exception:
-                    pass
             await route.continue_()
             return
 
@@ -1399,9 +1253,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 if stats:
                     stats.record_blocked(est_size=30000)
                 fulfilled_request_ids.add(id(request))
+                origin = request.headers.get("origin") or "*"
                 await route.fulfill(
                     body=b'{"status": 200, "data": []}',
-                    headers={"content-type": "application/json", "access-control-allow-origin": "*"},
+                    headers={
+                        "content-type": "application/json",
+                        "access-control-allow-origin": origin,
+                        "access-control-allow-credentials": "true",
+                    },
                     status=200
                 )
                 return
@@ -1541,8 +1400,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             return
 
         # 11. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
-        # 注意：绝不 Mock Arkose / Cloudflare / SheerID 的人机验证挑战图片！
-        is_captcha_img = any(k in url_lower for k in ("arkose", "funcaptcha", "turnstile", "sheerid", "cloudflare", "cf-"))
+        # 注意：绝不 Mock Arkose / Cloudflare / SheerID 的人机验证挑战图片，以及微软登录品牌背景图！
+        is_captcha_img = any(k in url_lower for k in ("arkose", "funcaptcha", "turnstile", "sheerid", "cloudflare", "cf-", "msauth.net", "msftauth.net"))
         if not is_captcha_img and (r_type in ("image", "imageset") or clean_url.endswith(IMAGE_EXTS)):
             if stats:
                 stats.record_blocked(est_size=40000)
@@ -1577,7 +1436,16 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 stats.record_blocked(est_size=30000)
             if "/api/" in path or path.endswith((".json", "/telemetry")):
                 fulfilled_request_ids.add(id(request))
-                await route.fulfill(body=b'{"status": 200, "data": []}', headers={"content-type": "application/json"}, status=200)
+                origin = request.headers.get("origin") or "*"
+                await route.fulfill(
+                    body=b'{"status": 200, "data": []}',
+                    headers={
+                        "content-type": "application/json",
+                        "access-control-allow-origin": origin,
+                        "access-control-allow-credentials": "true",
+                    },
+                    status=200
+                )
             else:
                 await route.abort()
             return

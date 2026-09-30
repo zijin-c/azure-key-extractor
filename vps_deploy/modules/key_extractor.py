@@ -76,20 +76,27 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
         try:
             ready = await page.evaluate("""
                 () => {
-                    const is_login = window.location.href.includes('login.microsoftonline') ||
-                                     window.location.href.includes('login.live.com') ||
-                                     window.location.href.includes('mysignins');
+                    const u = window.location.href.toLowerCase();
+                    const is_login = u.includes('login.microsoftonline') ||
+                                     u.includes('login.live.com') ||
+                                     u.includes('mysignins');
                     if (is_login) return false;
+                    const txt = (document.body ? document.body.innerText : '') || '';
                     return !!(
-                        document.querySelector('[placeholder*="Search"]') ||
-                        document.querySelector('[aria-label*="Search"]') ||
+                        document.querySelector('[placeholder*="Search" i]') ||
+                        document.querySelector('[aria-label*="Search" i]') ||
+                        document.querySelector('[placeholder*="搜索"]') ||
+                        document.querySelector('[aria-label*="搜索"]') ||
                         document.querySelector('.fxs-topbar') ||
                         document.querySelector('[class*="topbar"]') ||
                         document.querySelector('input[type="search"]') ||
                         document.querySelector('[class*="education"]') ||
                         document.querySelector('[class*="software"]') ||
-                        (document.body.innerText || '').includes('Education') ||
-                        (document.body.innerText || '').includes('Software')
+                        txt.includes('Education') ||
+                        txt.includes('Software') ||
+                        txt.includes('教育') ||
+                        txt.includes('软件') ||
+                        txt.includes('Microsoft Azure')
                     );
                 }
             """)
@@ -99,17 +106,17 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
         except Exception:
             pass
 
-        # 超过 2 分钟没响应，强制重新导航（只重试一次）
+        # 超过 45 秒未就绪，强制重新导航/刷新（只重试一次）
         elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed > 120 and not retry_done:
+        if elapsed > 45 and not retry_done:
             retry_done = True
-            _emit(cb, "  ⚠️  Portal 加载超过 2 分钟，强制重新导航...")
+            _emit(cb, "  ⚠️  Portal 加载超过 45 秒未就绪，强制重新导航/刷新...")
             try:
-                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=90000)
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=60000)
                 _emit(cb, "  🔄 已重新导航到 Education Software 页面")
             except Exception as e:
                 _emit(cb, f"  ⚠️  重新导航异常: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
             # 重新导航后可能触发 MFA 登录流程，用已有 secret 处理
             _emit(cb, "  🔍 检查是否需要重新 MFA...")
@@ -629,6 +636,12 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     """
     from modules.azure_login import _handle_mfa_setup, _azure_destination_ready
 
+    cur_u = (page.url or "").lower()
+    is_login_page = any(k in cur_u for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com"))
+    if not is_login_page and not await _is_mfa_login_prompt(page):
+        if "portal.azure.com" in cur_u or "education.azure.com" in cur_u:
+            return totp_secret
+
     # 如果已经在 portal 且脱离登录/2FA流程
     if await _azure_destination_ready(page, page.url or ""):
         return totp_secret
@@ -722,10 +735,18 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback) -> bool:
     sels = [
         "input[name='otc']",
         "input#idTxtBx_SAOTCC_OTC",
+        "input#idTxtBx_OTC",
+        "input[name='VerificationCode']",
+        "input#VerificationCode",
         "input[autocomplete='one-time-code']",
+        "input#otc",
         "input[placeholder*='code' i]",
+        "input[placeholder*='代码' i]",
+        "input[placeholder*='验证码' i]",
+        "input[aria-label*='code' i]",
+        "input[aria-label*='代码' i]",
+        "input[aria-label*='验证码' i]",
         "input[type='tel']",
-        "input[type='text']:not([type='hidden'])",
     ]
     for sel in sels:
         try:
@@ -1005,11 +1026,14 @@ async def extract_all_keys(
                 else:
                     raise
 
-    # 处理 portal 可能出现的 2FA / MFA 流程
-    new_totp = await _handle_portal_login(sw_page, totp_secret, ms_email, cb)
-    updated_totp = new_totp or totp_secret
-    if new_totp:
-        _emit(cb, f"  🔑 MFA Secret 已更新: {new_totp}")
+    # 仅当明确处于微软登录/2FA重定向页面时，才前置触发 MFA 处理
+    cur_u = (sw_page.url or "").lower()
+    updated_totp = totp_secret
+    if any(k in cur_u for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com")) or await _is_mfa_login_prompt(sw_page):
+        new_totp = await _handle_portal_login(sw_page, totp_secret, ms_email, cb)
+        if new_totp:
+            updated_totp = new_totp
+            _emit(cb, f"  🔑 MFA Secret 已更新: {new_totp}")
 
     try:
         # 等待 portal SPA 加载完成，期间持续响应 2FA 验证
