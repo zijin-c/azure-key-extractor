@@ -1151,74 +1151,20 @@ _DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return new Proxy({}, { get: 
 
 
 async def setup_save_data_route(ctx, stats: TrafficStats = None):
-    """超深度省流路由系统：
+    """纯净极速省流路由系统：
     1. ExtensionManifest 走本地规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）；
     2. 本地强缓存公共无状态静态 JS/CSS/字体/图标/静态JSON（portal.azure.com/*.js, aadcdn.msauth.net 等 0 字节复用）；
-    3. 1-Byte 极简图片/SVG/字体 Mock 响应（彻底杜绝 4-6MB 冗余图像与字体网络下载，同时确保 onload 正常触发）；
-    4. Azure Portal 非业务扩展模块（CostManagement, Advisor, Security, Monitoring 等）AMD 模块剪枝（节约 4-5MB 无用 JS）；
-    5. 拦截非英语语言包 (zh-cn, es, fr, de 等)，节约 2MB+ 冗余包；
-    6. 拦截第三方追踪与后台遥测；
-    7. 100% 绝对原生放行 Arkose/FunCaptcha 挑战、SheerID 学术认证、Turnstile/Cloudflare、hCaptcha、Microsoft 动态认证及 2FA initializemobileapp 密钥提取与 ARM 提 Key 核心链路！
+    3. 拦截大体积无用媒体/安装包 (.mp4, .zip, .iso, .exe 等)；
+    4. 彻底移除所有域名黑名单、路径黑名单、语言包拦截与模块剪枝，100% 杜绝任何误杀或页面阻塞；
+    5. 100% 绝对原生放行所有认证、导航、ARM 接口与 Portal 核心 SPA 资源！
     """
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
 
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
-        ".pdf", ".zip", ".iso", ".exe", ".msi", ".rar", ".7z", ".tar", ".gz",
+        ".zip", ".iso", ".exe", ".msi", ".rar", ".7z", ".tar", ".gz",
         ".dmg", ".pkg", ".bin", ".apk", ".m4s", ".ts", ".flv", ".m3u8"
-    )
-
-    IMAGE_EXTS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".bmp", ".tiff"
-    )
-
-    FONT_EXTS = (
-        ".woff2", ".woff", ".ttf", ".eot", ".otf"
-    )
-
-    BLOCKED_DOMAINS = (
-        "google-analytics.com", "googletagmanager.com", "doubleclick.net", "facebook.net",
-        "clarity.ms", "scorecardresearch.com", "cdn.speedcurve.com", "m.adnxs.com",
-        "adsymptotic.com", "optimizely.com", "app.adjust.com", "braze.com",
-        "branch.io", "quantummetric.com", "qualtrics.com", "app.launchdarkly.com",
-        "segment.io", "segment.com", "amplitude.com", "mixpanel.com",
-        "datadog.com", "browser-intake-datadoghq.com",
-        "marketplace.azure.com", "learn.microsoft.com", "docs.microsoft.com",
-        "browser.pipe.aria.microsoft.com", "pipe.aria.microsoft.com", "mobile.pipe.aria.microsoft.com",
-        "events.data.microsoft.com", "self.events.data.microsoft.com", "vortex.data.microsoft.com",
-        "web.vortex.data.microsoft.com", "watson.telemetry.microsoft.com", "telemetry.microsoft.com",
-        "dc.services.visualstudio.com", "in.applicationinsights.azure.com", "dc.applicationinsights.azure.com",
-        "dc.applicationinsights.microsoft.com", "global.monitor.azure.com", "monitor.azure.com",
-        "js.monitor.azure.com", "activity.windows.com", "onesettings-public.azureedge.net",
-        "config.edge.skype.com", "edge.microsoft.com", "nav.smartscreen.microsoft.com",
-        "smartscreen-prod.microsoft.com", "c.msn.com", "feedback.azure.com",
-    )
-
-    BLOCKED_PATHS = (
-        "/useravatar", "/avatar", "/profilepicture", "/marketing", "/feedback",
-        "/survey", "/telemetry", "/diagnostics", "/instrumentation",
-        "/api/cloudshell", "/api/advisor", "/api/costmanagement",
-        "/api/search/suggestions", "/api/announcements", "/api/whatsnew",
-        "/api/quickstart", "/api/guidedtour", "/api/notifications/broadcast",
-        "/api/userfeedback", "/api/telemetry", "/api/diagnostics", "/api/logger",
-        "microsoft.resourcegraph", "microsoft.advisor", "microsoft.costmanagement",
-        "microsoft.policyinsights", "microsoft.security"
-    )
-
-    UNNEEDED_PORTAL_EXTENSIONS = (
-        "microsoft_azure_costmanagement", "microsoft_azure_advisor",
-        "microsoft_azure_support", "microsoft_azure_monitoring",
-        "microsoft_azure_security", "microsoft_azure_marketplace",
-        "microsoft_azure_compute", "microsoft_azure_storage",
-        "microsoft_azure_network", "microsoft_azure_virtualmachines",
-        "microsoft_azure_loganalytics", "microsoft_azure_policy",
-        "microsoft_azure_compliance", "microsoft_azure_securitycenter"
-    )
-
-    NON_EN_LOCALE_PATTERN = re.compile(
-        r"/(zh-cn|es-es|fr-fr|de-de|ja-jp|ko-kr|pt-br|it-it|ru-ru|pl-pl|tr-tr|cs-cz|hu-hu|nl-nl|sv-se|da-dk|fi-fi|nb-no|zh-tw|zh-hk)\.(json|js)",
-        re.IGNORECASE
     )
 
     fulfilled_request_ids = set()
@@ -1227,109 +1173,24 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         r_type = request.resource_type
         url = request.url
         url_lower = url.lower()
+        clean_url = url_lower.split("?")[0].split("#")[0]
 
         # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转与 CSP 安全）
         if r_type == "document" or request.is_navigation_request():
             await route.continue_()
             return
 
-        # 2. 遥测/追踪与后台非业务数据埋点优先拦截（涵盖 POST 与 GET，杜绝 OneCollector / Telemetry API 漏网）：
-        # 注意：严格排除所有动态安全接口与核心认证/2FA
-        if not any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            try:
-                parsed = urlparse(url)
-                hostname = (parsed.hostname or "").lower()
-                path = (parsed.path or "").lower()
-            except Exception:
-                hostname = ""
-                path = ""
-
-            is_blocked_domain = any(hostname == d or hostname.endswith("." + d) for d in BLOCKED_DOMAINS)
-            is_blocked_path = any(path.startswith(p) or p in path for p in BLOCKED_PATHS)
-            is_telemetry = is_blocked_domain or is_blocked_path or any(
-                k in url_lower for k in ("onecollector", "/telemetry", "/logger", "/diagnostics")
-            )
-            if is_telemetry:
-                if stats:
-                    stats.record_blocked(est_size=30000)
-                fulfilled_request_ids.add(id(request))
-                origin = request.headers.get("origin") or "*"
-                await route.fulfill(
-                    body=b'{"status": 200, "data": []}',
-                    headers={
-                        "content-type": "application/json",
-                        "access-control-allow-origin": origin,
-                        "access-control-allow-credentials": "true",
-                    },
-                    status=200
-                )
-                return
-
-        # 3. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
+        # 2. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
         if request.method != "GET":
             await route.continue_()
             return
 
-        clean_url = url_lower.split("?")[0].split("#")[0]
-
-        # 4. 字体资源智能处理：
-        # 特别注意：Arkose Labs (FunCaptcha) 会通过 Canvas measureText 与 DOM 元素尺寸精确校验 style-manager 字体！
-        # 若暴力 Mock 为空字节 b'' 会导致字体度量偏移，直接被 Arkose 判定为爬虫并强制弹出人机拼图！
-        # 正确做法：Arkose 字体走本地强磁盘缓存（首次下载 1.21MB，后续全部从本地磁盘 0 流量秒级响应，保真真实字体度量）；
-        # 普通网页非风控字体（如门户 Segoe/图标字体等）直接以 200 OK 极简空字体 Mock 响应，彻底省流。
-        if r_type == "font" or clean_url.endswith(FONT_EXTS) or "/fonts/" in clean_url or "format=woff" in url_lower:
-            is_arkose_font = any(k in url_lower for k in ("arkose", "funcaptcha"))
-            if is_arkose_font:
-                cached = LocalHttpCache.get(url)
-                if cached:
-                    body, headers, status = cached
-                    if stats:
-                        stats.record_cache_hit(len(body))
-                    fulfilled_request_ids.add(id(request))
-                    await route.fulfill(body=body, headers=headers, status=status)
-                    return
-                # 缓存未命中时真实拉取一次并存入本地磁盘缓存
-                try:
-                    fetch_resp = await route.fetch()
-                    if fetch_resp.status == 200:
-                        resp_body = await fetch_resp.body()
-                        if resp_body and len(resp_body) > 10:
-                            resp_headers = dict(fetch_resp.headers)
-                            LocalHttpCache.put(url, resp_body, resp_headers, fetch_resp.status)
-                        if stats:
-                            stats.record_transfer(len(resp_body) + 400, url, r_type, fetch_resp.status)
-                        fulfilled_request_ids.add(id(request))
-                        await route.fulfill(response=fetch_resp, body=resp_body)
-                        return
-                    else:
-                        await route.fulfill(response=fetch_resp)
-                        return
-                except Exception:
-                    await route.continue_()
-                    return
-            else:
-                # 非风控普通字体：极速 Mock，彻底节省流量
-                if stats:
-                    stats.record_blocked(est_size=50000)
-                fulfilled_request_ids.add(id(request))
-                await route.fulfill(
-                    body=_DUMMY_EMPTY_FONT,
-                    headers={
-                        "content-type": "font/woff2",
-                        "access-control-allow-origin": "*",
-                        "cache-control": "public, max-age=31536000"
-                    },
-                    status=200
-                )
-                return
-
-        # 5. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
-        # （绝不缓存、不拦截、不 Mock，确保 TOTP 提取与人机验证 100% 成功）
+        # 3. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
             await route.continue_()
             return
 
-        # 6. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
+        # 4. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
         if "extensionmanifest/" in url_lower:
             cached_manifest = LocalHttpCache.get_canonical_manifest(url)
             if cached_manifest:
@@ -1360,8 +1221,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             except Exception:
                 pass
 
-        # 7. 公共无状态静态资源强缓存 (JS/CSS/图标/静态JSON)：本地秒级响应，0 网络流量
-        # （涵盖 portal.azure.com 静态脚本, signup.azure.com 静态脚本, aadcdn.msauth.net 等）
+        # 5. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON)：本地秒级响应，0 网络流量
         if LocalHttpCache.is_cacheable(url, "GET"):
             cached = LocalHttpCache.get(url)
             if cached:
@@ -1372,85 +1232,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        # 8. 拦截大体积音视频及安装包
+        # 6. 拦截大体积音视频及安装包
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
             await route.abort()
             return
 
-        # 9. 拦截非英语多国语言包
-        if NON_EN_LOCALE_PATTERN.search(clean_url):
-            if stats:
-                stats.record_blocked(est_size=100000)
-            fulfilled_request_ids.add(id(request))
-            await route.fulfill(body=b"{}", headers={"content-type": "application/json"}, status=200)
-            return
-
-        # 10. Azure Portal 非 Education 扩展模块剪枝（Mock 空 AMD 模块，节约 4-5MB JS 下载）
-        if "/extension/" in clean_url and any(ext in clean_url for ext in UNNEEDED_PORTAL_EXTENSIONS):
-            if stats:
-                stats.record_blocked(est_size=500000)
-            fulfilled_request_ids.add(id(request))
-            await route.fulfill(
-                body=_DUMMY_EMPTY_AMD_MODULE,
-                headers={"content-type": "application/javascript", "access-control-allow-origin": "*"},
-                status=200
-            )
-            return
-
-        # 11. 非风控图片与图标快速 Mock（响应 1x1 极简图片，保证 DOM 事件不报错）
-        # 注意：绝不 Mock Arkose / Cloudflare / SheerID 的人机验证挑战图片，以及微软登录品牌背景图！
-        is_captcha_img = any(k in url_lower for k in ("arkose", "funcaptcha", "turnstile", "sheerid", "cloudflare", "cf-", "msauth.net", "msftauth.net"))
-        if not is_captcha_img and (r_type in ("image", "imageset") or clean_url.endswith(IMAGE_EXTS)):
-            if stats:
-                stats.record_blocked(est_size=40000)
-            fulfilled_request_ids.add(id(request))
-            if clean_url.endswith(".svg") or "svg" in clean_url:
-                await route.fulfill(
-                    body=_DUMMY_SVG_IMAGE,
-                    headers={"content-type": "image/svg+xml", "access-control-allow-origin": "*"},
-                    status=200
-                )
-            else:
-                await route.fulfill(
-                    body=_DUMMY_PNG_IMAGE,
-                    headers={"content-type": "image/png", "access-control-allow-origin": "*"},
-                    status=200
-                )
-            return
-
-        # 12. 拦截第三方追踪与后台非业务遥测/非核心 API（兜底 GET 请求）
-        try:
-            parsed = urlparse(url)
-            hostname = (parsed.hostname or "").lower()
-            path = (parsed.path or "").lower()
-        except Exception:
-            hostname = ""
-            path = ""
-
-        is_blocked_domain = any(hostname == d or hostname.endswith("." + d) for d in BLOCKED_DOMAINS)
-        is_blocked_path = any(path.startswith(p) or p in path for p in BLOCKED_PATHS)
-        if is_blocked_domain or is_blocked_path:
-            if stats:
-                stats.record_blocked(est_size=30000)
-            if "/api/" in path or path.endswith((".json", "/telemetry")):
-                fulfilled_request_ids.add(id(request))
-                origin = request.headers.get("origin") or "*"
-                await route.fulfill(
-                    body=b'{"status": 200, "data": []}',
-                    headers={
-                        "content-type": "application/json",
-                        "access-control-allow-origin": origin,
-                        "access-control-allow-credentials": "true",
-                    },
-                    status=200
-                )
-            else:
-                await route.abort()
-            return
-
-        # 13. 对属于可缓存范围但尚未命中的静态请求（包括 ExtensionManifest、Portal 静态脚本）：
+        # 7. 对属于可缓存范围但尚未命中的静态请求（包括 ExtensionManifest、Portal 静态脚本）：
         # 使用 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存！
         if LocalHttpCache.is_cacheable(url, "GET") or "extensionmanifest/" in url_lower:
             try:
@@ -1474,7 +1263,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.continue_()
                 return
 
-        # 14. 其他所有核心请求原生放行
+        # 8. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
         await route.continue_()
 
     await ctx.route("**/*", _route_handler)
