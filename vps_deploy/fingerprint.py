@@ -1088,6 +1088,7 @@ class TrafficStats:
         self.blocked_count = 0
         self.proxy_bridge = proxy_bridge
         self.network_requests = []
+        self.mfa_diag = []  # 仅诊断：记录 2FA initializemobileapp 请求的次数/大小/结构（不影响任何请求）
 
     def set_proxy_bridge(self, bridge):
         self.proxy_bridge = bridge
@@ -1304,8 +1305,35 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
             if stats:
                 stats.record_transfer(req_bytes + resp_bytes, response.url, req.resource_type, response.status)
+
+            # 仅诊断（不修改/不拦截任何请求）：记录 2FA initializemobileapp 的调用次数、大小与响应结构
+            if stats is not None and "initializemobileapp" in (response.url or "").lower():
+                asyncio.ensure_future(_diag_mfa_response(response, req, resp_bytes))
         except Exception:
             pass
+
+    async def _diag_mfa_response(response, req, resp_bytes):
+        entry = {"size": resp_bytes, "status": response.status, "enc": "", "post": "", "fields": ""}
+        try:
+            entry["enc"] = response.headers.get("content-encoding", "none")
+            pd = req.post_data or ""
+            entry["post"] = pd[:200]
+            body = await response.body()  # 读取浏览器内存中的已下载数据，不产生额外流量
+            entry["raw_len"] = len(body)
+            try:
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+                parts = []
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        ln = len(v) if isinstance(v, (str, list, dict)) else len(str(v))
+                        parts.append((ln, f"{k}({type(v).__name__}:{ln})"))
+                    parts.sort(reverse=True)
+                    entry["fields"] = ", ".join(p[1] for p in parts[:8])
+            except Exception:
+                entry["fields"] = "non-json"
+        except Exception as e:
+            entry["fields"] = f"diag-error: {e}"[:100]
+        stats.mfa_diag.append(entry)
 
     ctx.on("response", _on_response_measure)
 

@@ -720,6 +720,13 @@ async def process_account(
                             _emit(cb, f"    • {sz_kb/1024:.2f} MB [{r_type}] {url[:85]}")
                         else:
                             _emit(cb, f"    • {sz_kb:.1f} KB [{r_type}] {url[:85]}")
+            mfa_diag = getattr(stats, "mfa_diag", None)
+            if mfa_diag:
+                _emit(cb, f"  🔬 [2FA 诊断] initializemobileapp 共调用 {len(mfa_diag)} 次:")
+                for i, d in enumerate(mfa_diag, 1):
+                    _emit(cb, f"    #{i} 传输≈{d.get('size', 0)/1024:.1f}KB 解压后={d.get('raw_len', 0)/1024:.1f}KB 压缩={d.get('enc')} 状态={d.get('status')}")
+                    _emit(cb, f"       请求体: {d.get('post', '')}")
+                    _emit(cb, f"       响应字段: {d.get('fields', '')}")
         
         # 安全优雅关闭（使用 shield 保护不受取消中断）+ 强制杀死所有底层浏览器/驱动子进程
         await safe_close_playwright(
