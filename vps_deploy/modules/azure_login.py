@@ -234,30 +234,107 @@ async def _first_visible_locator(page: Page, selector: str):
 
 
 async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) -> bool:
-    """填入 TOTP 验证码到输入框（支持多选择器、逐字模拟真实键盘敲击与 Enter/Click 提交）。"""
+    """填入 TOTP 验证码到输入框（支持多选择器、跨 iframe、JS 兜底与快速超时保护）。"""
     sels = [
         "input[name='otc']",
         "input#idTxtBx_SAOTCC_OTC",
+        "input#idTxtBx_OTC",
+        "input[name='VerificationCode']",
+        "input#VerificationCode",
         "input[autocomplete='one-time-code']",
+        "input#otc",
         "input[placeholder*='code' i]",
         "input[placeholder*='代码' i]",
+        "input[placeholder*='验证码' i]",
         "input[aria-label*='code' i]",
+        "input[aria-label*='代码' i]",
+        "input[aria-label*='验证码' i]",
         "input[type='tel']",
-        "input[type='text']:not([type='hidden'])",
     ]
-    for sel in sels:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=400):
-                ok = await human_type(page, loc, code, min_delay=0.04, max_delay=0.09)
-                if ok:
-                    _emit(cb, "  ✅ TOTP 已填入")
-                    await asyncio.sleep(random.uniform(0.25, 0.50))
+    frames_to_try = [page] + list(page.frames)
+
+    # 策略 1: 定位器精准查找与拟人/直接写入
+    for f in frames_to_try:
+        for sel in sels:
+            try:
+                loc = f.locator(sel).first
+                if await loc.is_visible(timeout=250):
+                    # 优先拟人化按键
+                    ok = await human_type(f, loc, code, min_delay=0.04, max_delay=0.09)
+                    if not ok:
+                        # 兜底：直接 click 与 fill
+                        try:
+                            await loc.click(timeout=1000, force=True)
+                            await loc.fill(code, timeout=1000)
+                        except Exception:
+                            pass
+                    val = ""
                     try:
-                        await loc.press("Enter")
+                        val = await loc.input_value(timeout=500)
                     except Exception:
                         pass
-                    return True
+                    if val and code in val:
+                        _emit(cb, "  ✅ TOTP 已填入")
+                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                        try:
+                            await loc.press("Enter", timeout=1000)
+                        except Exception:
+                            pass
+                        return True
+            except Exception:
+                continue
+
+    # 策略 2: JS 跨 Frame 深度穿透填入
+    for f in frames_to_try:
+        try:
+            ok = await f.evaluate("""
+                (code) => {
+                    const otcSels = [
+                        "input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC",
+                        "input[name='VerificationCode']", "input#VerificationCode",
+                        "input[autocomplete='one-time-code']", "input#otc",
+                        "input[placeholder*='code' i]", "input[placeholder*='代码' i]",
+                        "input[placeholder*='验证码' i]", "input[aria-label*='code' i]",
+                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]",
+                        "input[type='tel']"
+                    ];
+                    let target = null;
+                    for (const s of otcSels) {
+                        const el = document.querySelector(s);
+                        if (el && !el.disabled && !el.readOnly) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) { target = el; break; }
+                        }
+                    }
+                    if (!target) {
+                        const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                        if ((txt.includes('enter code') || txt.includes('enter the code') ||
+                             txt.includes('输入代码') || txt.includes('验证码')) &&
+                            !txt.includes('scan the qr') && !txt.includes('start by getting the app')) {
+                            const inputs = [...document.querySelectorAll('input')].filter(i => {
+                                const r = i.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0 && !i.disabled && !i.readOnly &&
+                                       !['hidden', 'submit', 'button', 'checkbox', 'radio', 'password'].includes(i.type);
+                            });
+                            for (const inp of inputs) {
+                                const ml = inp.getAttribute('maxlength');
+                                if (!ml || parseInt(ml) <= 10) { target = inp; break; }
+                            }
+                        }
+                    }
+                    if (target) {
+                        target.focus();
+                        target.value = code;
+                        target.dispatchEvent(new Event('input', {bubbles: true}));
+                        target.dispatchEvent(new Event('change', {bubbles: true}));
+                        return true;
+                    }
+                    return false;
+                }
+            """, code)
+            if ok:
+                _emit(cb, "  ✅ TOTP 已填入 (JS)")
+                return True
         except Exception:
             continue
 
@@ -392,9 +469,30 @@ async def _azure_destination_ready(page: Page, url: str) -> bool:
     if any(k in url_lower for k in ("login.microsoftonline", "login.live.com", "login.windows.net", "mysignins.microsoft.com", "account.activedirectory")):
         return False
 
-    # 2. Portal 主控制台
+    # 2. Portal 主控制台（必须确保已渲染主体，而不是即将重定向到 2FA 的空白骨架）
     if "portal.azure.com" in url_lower:
-        return True
+        try:
+            portal_ready = await page.evaluate("""
+                () => {
+                    const u = window.location.href.toLowerCase();
+                    if (u.includes('login.microsoftonline') || u.includes('login.live') || u.includes('mysignins')) return false;
+                    return !!(
+                        document.querySelector('.fxs-topbar') ||
+                        document.querySelector('[class*="topbar"]') ||
+                        document.querySelector('[placeholder*="Search"]') ||
+                        document.querySelector('[aria-label*="Search"]') ||
+                        document.querySelector('input[type="search"]') ||
+                        (document.body && (document.body.innerText.includes('Education') ||
+                                           document.body.innerText.includes('Software') ||
+                                           document.body.innerText.includes('Azure')))
+                    );
+                }
+            """)
+            if portal_ready:
+                return True
+        except Exception:
+            pass
+        return False
 
     # 3. Azure Education 平台
     if "azureforeducation" in url_lower or "education.azure.com" in url_lower:
@@ -437,13 +535,13 @@ def _is_valid_totp_secret(candidate: str | None) -> bool:
     if not candidate:
         return False
     clean = re.sub(r"[\s-]+", "", candidate.upper())
-    clean = re.sub(r"^SECRET\s*KEY\s*:?\s*", "", clean)
-    clean = re.sub(r"(?:COPYKEY|COPY|COPYNAME)$", "", clean)
+    clean = re.sub(r"^(?:SECRETKEY|KEY|CODE|SECRET|密钥|代码)[:：]?\s*", "", clean)
+    clean = re.sub(r"(?:COPYKEY|COPY|COPYNAME|COPIED|复制密钥|复制)$", "", clean)
     if len(clean) < 16 or len(clean) > 64:
         return False
     if not re.fullmatch(r"[A-Z2-7]+", clean):
         return False
-    if any(bw in clean for bw in _TOTP_SECRET_BLACKLIST_WORDS):
+    if clean in _TOTP_SECRET_BLACKLIST_WORDS:
         return False
     try:
         padding = "=" * ((8 - len(clean) % 8) % 8)
@@ -457,155 +555,137 @@ def _is_valid_totp_secret(candidate: str | None) -> bool:
 
 
 async def _extract_secret_key_from_page(page: Page) -> str:
-    """从页面深度提取 Base32 Secret Key (优先精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
-    try:
-        candidate = await page.evaluate(r"""
-            () => {
-                const BLACKLIST = [
-                    'SKIP', 'MAIN', 'CONTENT', 'AUTHENTICATOR', 'AUTHENTICAT', 'MICROSOFT',
-                    'ACCOUNT', 'SETUP', 'CANTSCAN', 'QRCODE', 'COPY', 'ENTER',
-                    'CODE', 'MANUALLY', 'ENGLISH', 'PRIVACY', 'TERMS', 'HELP',
-                    'ENABLE', 'JAVASCRIPT', 'RUNTHISAPP', 'BROWSER', 'SIGNIN',
-                    'PASSWORD', 'SECURITY', 'NOTIFICATION', 'VERIFICATION',
-                    'IDENTITY', 'CONDITIONS', 'FEEDBACK', 'LANGUAGE', 'MORE',
-                    'OPTIONS', 'CONTINUE', 'CANCEL', 'SUBMIT', 'FINISH', 'DONE',
-                    'BACK', 'NEXT', 'PROTECTION', 'REGISTER', 'PORTAL',
-                    'UNIVERSITY', 'STUDENT', 'EDUCATION', 'AZURE', 'COMMUNITY',
-                    'SUPPORT', 'LEGAL', 'CONTACT', 'OFFICE', 'WINDOWS', 'DEFAULT',
-                    'BUTTON', 'TITLE', 'LABEL', 'INPUT', 'ACTION', 'NOSCRIPT',
-                    'YOUNEEDTOENABLE', 'FOLLOWING', 'SCANNER', 'SELECT', 'ACCOUNTNAME',
-                    'SECRETKEY', 'COPYNAME', 'COPYKEY', 'ENTERCODE', 'OPENTHEQR'
-                ];
-                const clean = (s) => (s || '').trim().replace(/[\s-]+/g, '').toUpperCase();
-                const isBase32 = (s) => {
-                    if (!s || s.length < 16 || s.length > 64) return false;
-                    if (!/^[A-Z2-7]+$/.test(s)) return false;
-                    for (const w of BLACKLIST) {
-                        if (s.includes(w)) return false;
+    """从页面及所有子 Frame 深度提取 Base32 Secret Key (多策略支持: 复制属性、Label 定位、Chunk 分片、只读输入框与全文正则)。"""
+    frames = [page] + list(page.frames)
+    for frame in frames:
+        try:
+            candidate = await frame.evaluate(r"""
+                () => {
+                    const BLACKLIST = [
+                        'AUTHENTICATOR', 'AUTHENTICAT', 'MICROSOFT', 'CANTSCAN', 'QRCODE',
+                        'MANUALLY', 'ENGLISH', 'PRIVACY', 'RUNTHISAPP', 'NOTIFICATION',
+                        'VERIFICATION', 'CONDITIONS', 'FEEDBACK', 'LANGUAGE', 'PROTECTION',
+                        'UNIVERSITY', 'EDUCATION', 'COMMUNITY', 'YOUNEEDTOENABLE',
+                        'ACCOUNTNAME', 'SECRETKEY', 'ENTERCODE', 'OPENTHEQR'
+                    ];
+                    const clean = (s) => (s || '').trim().replace(/[\s-]+/g, '').toUpperCase();
+                    const isBase32 = (s) => {
+                        if (!s) return false;
+                        let c = clean(s);
+                        c = c.replace(/^(SECRETKEY|KEY|CODE|SECRET|密钥|代码)[:：]?/i, '');
+                        c = c.replace(/(COPYKEY|COPY|COPYNAME|COPIED|复制密钥|复制)$/i, '');
+                        if (c.length < 16 || c.length > 64) return false;
+                        if (!/^[A-Z2-7]+$/.test(c)) return false;
+                        for (const w of BLACKLIST) {
+                            if (c.includes(w)) return false;
+                        }
+                        return true;
+                    };
+                    const extractBase32 = (s) => {
+                        if (!s) return '';
+                        let c = clean(s);
+                        c = c.replace(/^(SECRETKEY|KEY|CODE|SECRET|密钥|代码)[:：]?/i, '');
+                        c = c.replace(/(COPYKEY|COPY|COPYNAME|COPIED|复制密钥|复制)$/i, '');
+                        if (isBase32(c)) return c;
+                        const m = c.match(/([A-Z2-7]{16,64})/);
+                        if (m && isBase32(m[1])) return m[1];
+                        return '';
+                    };
+
+                    const getCleanText = (el) => {
+                        if (!el) return '';
+                        try {
+                            const clone = el.cloneNode(true);
+                            const junk = clone.querySelectorAll('button, [role="button"], svg, i, .ms-Icon, [aria-label*="copy" i], [aria-label*="复制" i]');
+                            junk.forEach(j => j.remove());
+                            return (clone.innerText || clone.textContent || '').trim();
+                        } catch(e) {
+                            return (el.innerText || el.textContent || '').trim();
+                        }
+                    };
+
+                    // 策略1: 检查复制按钮及元素的 data 属性与 value
+                    const copyBtns = [...document.querySelectorAll('button, a, [role="button"], [data-clipboard-text], [data-value], [value]')];
+                    for (const b of copyBtns) {
+                        for (const attr of ['data-clipboard-text', 'data-value', 'value', 'data-code', 'data-secret']) {
+                            const v = b.getAttribute(attr);
+                            const res = extractBase32(v);
+                            if (res) return res;
+                        }
                     }
-                    return true;
-                };
 
-                const allEls = [...document.querySelectorAll('*')];
+                    // 策略2: 精确定位 Label（中英文）
+                    const labelKeywords = ['secret key', 'secret', 'security key', '密钥', '机密密钥', '安全密钥'];
+                    const allEls = [...document.querySelectorAll('*')];
+                    for (const el of allEls) {
+                        if (el.children.length > 4) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        const hasKeyword = labelKeywords.some(k => txt.includes(k));
+                        if (hasKeyword) {
+                            // 检查自身
+                            let selfRes = extractBase32(getCleanText(el));
+                            if (selfRes) return selfRes;
 
-                // 策略1: 定位「Secret key:」文字节点，从其相邻兄弟元素或父容器中提取密钥值
-                for (const el of allEls) {
-                    if (el.children.length > 3) continue;
-                    const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                    if (txt === 'secret key:' || txt === 'secret key' || txt.startsWith('secret key:')) {
-                        // 1.1 检查后续兄弟节点
-                        let sib = el.nextElementSibling;
-                        while (sib) {
-                            const sTxt = clean(sib.innerText || sib.textContent || sib.value || '');
-                            if (isBase32(sTxt)) return sTxt;
-                            const innerEls = sib.querySelectorAll('*');
-                            for (const inner of innerEls) {
-                                if (inner.children.length === 0) {
-                                    const cTxt = clean(inner.innerText || inner.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
+                            // 检查兄弟节点
+                            let sib = el.nextElementSibling;
+                            while (sib) {
+                                let res = extractBase32(getCleanText(sib) || sib.value || '');
+                                if (res) return res;
+                                const children = [...sib.querySelectorAll('*')];
+                                for (const ch of children) {
+                                    res = extractBase32(getCleanText(ch) || ch.value || '');
+                                    if (res) return res;
                                 }
+                                sib = sib.nextElementSibling;
                             }
-                            sib = sib.nextElementSibling;
-                        }
-
-                        // 1.2 检查父级容器中排除 "Secret key" 后的文本
-                        let parent = el.parentElement;
-                        for (let depth = 0; depth < 4 && parent; depth++) {
-                            const pText = parent.innerText || parent.textContent || '';
-                            const m = pText.match(/secret\s*key\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
-                            if (m) {
-                                const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
-                                if (isBase32(candidate)) return candidate;
-                            }
-                            for (const child of parent.querySelectorAll('*')) {
-                                if (child.children.length === 0) {
-                                    const cTxt = clean(child.innerText || child.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
-                                }
-                            }
-                            parent = parent.parentElement;
-                        }
-                    }
-                }
-
-                // 策略2: 定位「Copy key」/「复制密钥」按钮，取其前序或关联容器元素
-                for (const el of allEls) {
-                    const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
-                    if (txt === 'copy key' || txt === '复制密钥' || txt.includes('copy key')) {
-                        let prev = el.previousElementSibling;
-                        while (prev) {
-                            const pTxt = clean(prev.innerText || prev.textContent || prev.value || '');
-                            if (isBase32(pTxt)) return pTxt;
-                            prev = prev.previousElementSibling;
-                        }
-                        let parent = el.parentElement;
-                        if (parent) {
-                            for (const child of parent.querySelectorAll('*')) {
-                                if (child.children.length === 0) {
-                                    const cTxt = clean(child.innerText || child.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
-                                }
+                            // 检查父级容器
+                            let p = el.parentElement;
+                            for (let d = 0; d < 4 && p; d++) {
+                                let res = extractBase32(getCleanText(p));
+                                if (res) return res;
+                                p = p.parentElement;
                             }
                         }
                     }
-                }
 
-                // 策略3: 优先从专有属性与元素查找
-                const specificEls = document.querySelectorAll(
-                    "[id*='secret' i], [data-bind*='secret' i], [data-testid*='secret' i], code, pre, .secret-key, input[readonly], [aria-label*='secret' i]"
-                );
-                for (const el of specificEls) {
-                    if (el.closest('noscript, script, style, header, footer, nav')) continue;
-                    const val = clean(el.value || el.innerText || el.textContent || el.getAttribute('data-value') || el.getAttribute('aria-label') || '');
-                    if (isBase32(val)) return val;
-                }
+                    // 策略3: 专有标签与属性
+                    const codeEls = [...document.querySelectorAll('code, pre, input, textarea, .secret, [class*="secret" i], [id*="secret" i]')];
+                    for (const el of codeEls) {
+                        let res = extractBase32(el.value || getCleanText(el));
+                        if (res) return res;
+                    }
 
-                // 策略4: 全文严格正则匹配 "Secret key: XXXXX"
-                const bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '');
-                const m = bodyText.match(/Secret\s*key\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
-                if (m) {
-                    const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
-                    if (isBase32(candidate)) return candidate;
-                }
-
-                // 策略5: 单独独立的叶子文本节点（内容完全就是 16~32 位的纯 Base32，绝不从句子中切词）
-                const walker = document.createTreeWalker(
-                    document.body || document.documentElement,
-                    NodeFilter.SHOW_TEXT,
-                    {
-                        acceptNode: (node) => {
-                            const p = node.parentElement;
-                            if (!p) return NodeFilter.FILTER_REJECT;
-                            const tag = p.tagName.toLowerCase();
-                            if (tag === 'script' || tag === 'noscript' || tag === 'style' || tag === 'header' || tag === 'footer' || tag === 'nav') {
-                                return NodeFilter.FILTER_REJECT;
-                            }
-                            const r = p.getBoundingClientRect();
-                            if (r.width === 0 || r.height === 0) return NodeFilter.FILTER_REJECT;
-                            const s = window.getComputedStyle(p);
-                            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
-                                return NodeFilter.FILTER_REJECT;
-                            }
-                            return NodeFilter.FILTER_ACCEPT;
+                    // 策略4: 组合 Chunk 节点 (4个或多个span拼成完整密钥)
+                    const groupContainers = [...document.querySelectorAll('div, p, span')];
+                    for (const g of groupContainers) {
+                        if (g.children.length >= 2 && g.children.length <= 16) {
+                            const t = getCleanText(g);
+                            const res = extractBase32(t);
+                            if (res) return res;
                         }
                     }
-                );
-                let node;
-                while (node = walker.nextNode()) {
-                    const raw = (node.textContent || '').trim();
-                    const c = clean(raw);
-                    if (/^[A-Z2-7]{16,32}$/.test(c) && isBase32(c)) {
-                        return c;
-                    }
-                }
 
-                return '';
-            }
-        """)
-        if candidate and _is_valid_totp_secret(candidate):
-            return candidate.replace(" ", "").replace("-", "").upper()
-    except Exception:
-        pass
+                    // 策略5: 全文正则匹配
+                    const bodyText = getCleanText(document.body || document.documentElement);
+                    const matches = bodyText.matchAll(/(?:secret\s*key|密钥|code|key)\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/gi);
+                    for (const m of matches) {
+                        const res = extractBase32(m[1]);
+                        if (res) return res;
+                    }
+
+                    const standaloneMatches = bodyText.matchAll(/\b([A-Z2-7]{4}[ -]?[A-Z2-7]{4}[ -]?[A-Z2-7]{4}[ -]?[A-Z2-7]{4}(?:[ -]?[A-Z2-7]{4})*)\b/gi);
+                    for (const m of standaloneMatches) {
+                        const res = extractBase32(m[1]);
+                        if (res) return res;
+                    }
+
+                    return '';
+                }
+            """)
+            if candidate and _is_valid_totp_secret(candidate):
+                return candidate.replace(" ", "").replace("-", "").upper()
+        except Exception:
+            pass
     return ""
 
 
@@ -625,6 +705,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
     secret = existing_secret or ""
     last_state = ""
     same_state_count = 0
+    consecutive_totp_fails = 0
 
     for step in range(80):  # 最多轮询 ~40 秒
         await asyncio.sleep(0.5)
@@ -679,16 +760,34 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             has_code_input = await page.evaluate("""
                 () => {
                     const sels = [
-                        "input[name='otc']", "input#idTxtBx_SAOTCC_OTC",
-                        "input[autocomplete='one-time-code']", "input[placeholder*='code' i]",
-                        "input[placeholder*='代码' i]", "input[aria-label*='code' i]",
-                        "input[type='tel']", "input[type='text']"
+                        "input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC",
+                        "input[name='VerificationCode']", "input#VerificationCode",
+                        "input[autocomplete='one-time-code']", "input#otc",
+                        "input[placeholder*='code' i]", "input[placeholder*='代码' i]",
+                        "input[placeholder*='验证码' i]", "input[aria-label*='code' i]",
+                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]"
                     ];
                     for (const s of sels) {
                         const el = document.querySelector(s);
                         if (el) {
                             const r = el.getBoundingClientRect();
                             if (r.width > 0 && r.height > 0 && !el.disabled && !el.readOnly) return true;
+                        }
+                    }
+                    // 仅当页面明确包含 enter code / verification 等提示且无 scan / setup app 时，查找短文本框
+                    const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
+                    const isCodePrompt = (bodyText.includes('enter code') || bodyText.includes('enter the code') ||
+                                         bodyText.includes('输入代码') || bodyText.includes('验证码')) &&
+                                         !bodyText.includes('scan the qr') && !bodyText.includes('start by getting the app');
+                    if (isCodePrompt) {
+                        const inputs = [...document.querySelectorAll('input')].filter(i => {
+                            const r = i.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0 && !i.disabled && !i.readOnly &&
+                                   !['hidden', 'submit', 'button', 'checkbox', 'radio', 'password'].includes(i.type);
+                        });
+                        for (const inp of inputs) {
+                            const ml = inp.getAttribute('maxlength');
+                            if (!ml || parseInt(ml) <= 10) return true;
                         }
                     }
                     return false;
@@ -701,35 +800,37 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         # 1. 优先检查 KMSI (Stay signed in)
         if "stay signed in" in t or "保持登录" in t or "kmsi" in cur_url:
             state = "kmsi"
-        # 2. 成功通过页（Notification approved / Great job / Authenticator app added / Success / App registered）—— 必须优先于 enter_code！
+        # 2. 成功通过页（Notification approved / Great job / Authenticator app added / Success / App registered）
         elif any(k in t for k in (
             "notification approved", "great job", "successfully registered", "registered",
             "authenticator app added", "authenticator app was successfully",
             "you're all set", "success", "已成功注册", "成功", "完成"
-        )) and ("enter the following" not in t and "scan" not in t):
+        )) and ("enter the following" not in t and "scan" not in t and "enter code" not in t and "enter the code" not in t):
             state = "done"
-        # 3. 填入 TOTP 码页 (Enter the code)
-        elif (has_code_input and bool(secret)) or ("enter the code" in t and "scan" not in t and bool(secret)):
-            state = "enter_code"
-        # 4. 显示 Secret Key 页
-        elif has_visible_secret or ("enter the following" in t and not secret) or ("secret key" in t and not secret):
-            state = "show_secret"
-        # 5. 扫描二维码页
-        elif "scan the qr code" in t or "scan image" in t or "can't scan" in t:
-            state = "scan_qr"
-        # 6. 配置账号页
-        elif ("set up your account in app" in t or "set up your account" in t) and "enter the code" not in t:
-            state = "setup_account"
-        # 7. 安装验证器页
-        elif "install microsoft authenticator" in t or "start by getting the app" in t:
-            state = "install_auth"
-        # 8. 保持账号安全页
-        elif "let's keep your account secure" in t or "keep your account secure" in t or "more information required" in t:
+        # 3. 保持账号安全页（Let's keep your account secure / More information required）
+        elif ("let's keep your account secure" in t or "keep your account secure" in t or
+              "more information required" in t or "需要详细信息" in t or "保护帐户安全" in t or "保护账户安全" in t):
             state = "keep_secure"
-        elif has_code_input or "enter the code" in t:
+        # 4. 安装验证器页（Start by getting the app / Install Microsoft Authenticator）
+        elif "install microsoft authenticator" in t or "start by getting the app" in t or "获取应用" in t:
+            state = "install_auth"
+        # 5. 配置账号页（Set up your account in app）
+        elif ("set up your account in app" in t or "set up your account" in t or "在应用中设置" in t) and "enter the code" not in t and "enter code" not in t:
+            state = "setup_account"
+        # 6. 扫描二维码页（若尚未提取到 secret 且当前页面包含扫描/二维码相关特征，必须先执行「Can't scan」展开密钥流程）
+        elif (not secret) and ("scan the qr code" in t or "scan image" in t or "can't scan" in t or "扫描二维码" in t):
+            state = "scan_qr"
+        # 7. 显示 Secret Key 页（包含密钥特征文本，或已成功提取到密钥需推进点击 Next）
+        elif (has_visible_secret and "scan the qr code" not in t and "scan image" not in t) or ("enter the following" in t and "scan" not in t) or ("secret key" in t and "scan" not in t) or ("密钥" in t and "scan" not in t) or bool(secret):
+            state = "show_secret"
+        # 8. 扫描二维码页兜底（即使有 secret 但仍在 scan 页面）
+        elif "scan the qr code" in t or "scan image" in t or "can't scan" in t or "扫描二维码" in t:
+            state = "scan_qr"
+        # 9. 填入 TOTP 码页 (Enter the code / 2FA 动态码校验)
+        elif has_code_input or (any(k in t for k in ("enter the code", "enter code", "verification code", "输入代码", "验证码")) and "scan" not in t and "start by getting the app" not in t):
             state = "enter_code"
 
-        # 9. 状态未识别但包含 Next/下一步 按钮时，作为 keep_secure 推进按钮兜底
+        # 10. 状态未识别但包含 Next/下一步 按钮时，作为 keep_secure 推进按钮兜底
         if state == "unknown":
             try:
                 has_next_btn = await page.evaluate("""
@@ -834,6 +935,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
         if state == "scan_qr":
             _emit(cb, "  📷 「Scan the QR code」→ 点「Can't scan the QR code?」...")
+            clicked_scan = False
             for sel in [
                 "a:has-text('Can\\'t scan image?')",
                 "a:has-text('Can\\'t scan image')",
@@ -844,7 +946,11 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 "a:has-text('Can\\'t scan')",
                 "button:has-text('Can\\'t scan')",
                 "a:has-text('Enter code manually')",
+                "button:has-text('Enter code manually')",
+                "a:has-text('无法扫描二维码')",
+                "button:has-text('无法扫描二维码')",
                 "text='Can\\'t scan the QR code?'",
+                "text='Can\\'t scan image?'",
                 "text='无法扫描二维码'",
             ]:
                 try:
@@ -853,9 +959,30 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         await loc.scroll_into_view_if_needed()
                         await loc.click(timeout=1500, force=True)
                         _emit(cb, f"  ✅ 已点击: {sel}")
+                        clicked_scan = True
                         break
                 except Exception:
                     pass
+
+            if not clicked_scan:
+                for frame in list(page.frames):
+                    for sel in [
+                        "a:has-text('Can\\'t scan image?')",
+                        "a:has-text('Can\\'t scan the QR code?')",
+                        "button:has-text('Can\\'t scan the QR code')",
+                        "a:has-text('无法扫描二维码')",
+                    ]:
+                        try:
+                            loc = frame.locator(sel).first
+                            if await loc.is_visible(timeout=100):
+                                await loc.click(timeout=1000, force=True)
+                                _emit(cb, f"  ✅ (frame) 已点击: {sel}")
+                                clicked_scan = True
+                                break
+                        except Exception:
+                            pass
+                    if clicked_scan:
+                        break
 
             # 点击「Can't scan」后，等待并直接提取 Secret Key（最多等待 3 秒）
             _emit(cb, "  ⏳ 等待 Secret key 渲染并提取...")
@@ -869,7 +996,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
             # 成功提取 Secret 后，点击 Next 推进到 Enter the code 页
             if secret:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.3)
                 await _click_first_visible(page, [
                     "button#idSubmit_SAOTCC_Continue",
                     "input#idSubmit_SAOTCC_Continue",
@@ -879,21 +1006,72 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     "button:has-text('下一步')",
                     "input[value='下一步']"
                 ], timeout=2000)
+            elif not clicked_scan and same_state_count > 2:
+                # 连续多轮未能点击且未提取到密钥，尝试推进或切换选项
+                _emit(cb, "  ⚠️ 二维码页未找到「Can't scan」链接，尝试探测页面交互...")
+                for alt_sel in [
+                    "a:has-text('I want to use a different authenticator app')",
+                    "button:has-text('I want to use a different authenticator app')",
+                    "a:has-text('Set up a different authentication app')",
+                    "button:has-text('Next')", "input[value='Next']",
+                ]:
+                    try:
+                        loc = page.locator(alt_sel).first
+                        if await loc.is_visible(timeout=100):
+                            await loc.click(timeout=1000, force=True)
+                            _emit(cb, f"  🔀 尝试推进二维码页面: {alt_sel}")
+                            break
+                    except Exception:
+                        pass
             continue
 
         if state == "show_secret":
-            if not secret:
-                _emit(cb, "  🔑 提取 Secret key...")
-                for _w in range(10):
-                    cand = await _extract_secret_key_from_page(page)
-                    if cand and _is_valid_totp_secret(cand):
-                        secret = cand.replace(" ", "").upper()
+            _emit(cb, "  🔑 提取 Secret key...")
+            for _w in range(10):
+                cand = await _extract_secret_key_from_page(page)
+                if cand and _is_valid_totp_secret(cand):
+                    new_sec = cand.replace(" ", "").upper()
+                    if new_sec != secret:
+                        secret = new_sec
+                        _emit(cb, f"  ✅ 提取并更新 MFA Secret: {secret}")
+                    else:
                         _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
-                        break
-                    await asyncio.sleep(0.2)
+                    break
+                await asyncio.sleep(0.2)
+
+            # [关键容灾自愈] 若未能提取到 Secret，尝试检测并点击页面上的「Can't scan」链接展开密钥
+            if not secret:
+                for scan_sel in [
+                    "a:has-text('Can\\'t scan image?')",
+                    "a:has-text('Can\\'t scan image')",
+                    "button:has-text('Can\\'t scan image')",
+                    "a:has-text('Can\\'t scan the QR code?')",
+                    "a:has-text('Can\\'t scan the QR code')",
+                    "button:has-text('Can\\'t scan the QR code')",
+                    "a:has-text('Can\\'t scan')",
+                    "button:has-text('Can\\'t scan')",
+                    "a:has-text('Enter code manually')",
+                    "button:has-text('Enter code manually')",
+                    "a:has-text('无法扫描二维码')",
+                    "button:has-text('无法扫描二维码')",
+                ]:
+                    try:
+                        loc = page.locator(scan_sel).first
+                        if await loc.is_visible(timeout=100):
+                            await loc.scroll_into_view_if_needed()
+                            await loc.click(timeout=1500, force=True)
+                            _emit(cb, f"  🔄 [自动挽救] 点击未能展开的密钥链接: {scan_sel}")
+                            await asyncio.sleep(0.5)
+                            cand = await _extract_secret_key_from_page(page)
+                            if cand and _is_valid_totp_secret(cand):
+                                secret = cand.replace(" ", "").upper()
+                                _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
+                            break
+                    except Exception:
+                        pass
 
             if secret:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.3)
                 await _click_first_visible(page, [
                     "button#idSubmit_SAOTCC_Continue",
                     "input#idSubmit_SAOTCC_Continue",
@@ -905,6 +1083,18 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 ], timeout=2000)
             else:
                 _emit(cb, "  ⏳ Secret 尚未完全渲染，等待...")
+                # 连续未能提取 Secret 时尝试点击 Next 推进或检查是否已进入下个阶段
+                if same_state_count >= 3:
+                    _emit(cb, f"  ⚠️ 连续 {same_state_count} 次未能提取 Secret，尝试推进页面或切换...")
+                    await _click_first_visible(page, [
+                        "button#idSubmit_SAOTCC_Continue",
+                        "input#idSubmit_SAOTCC_Continue",
+                        "button#idSIButton9",
+                        "button:has-text('Next')",
+                        "input[value='Next']",
+                        "button:has-text('下一步')",
+                        "input[value='下一步']",
+                    ], timeout=1500)
             continue
 
         if state == "enter_code":
@@ -913,6 +1103,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 cand = await _extract_secret_key_from_page(page)
                 if cand and _is_valid_totp_secret(cand):
                     secret = cand.replace(" ", "").upper()
+                    _emit(cb, f"  ✅ 找回 MFA Secret: {secret}")
 
                 # 如果依然未获取到 secret，点击页面上的「←」后退按钮或「Back」返回提取 Secret
                 if not secret:
@@ -942,6 +1133,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 _emit(cb, f"  🔢 填入 TOTP 码: {totp_code}...")
                 filled = await _fill_totp_code(page, totp_code, cb)
                 if filled:
+                    consecutive_totp_fails = 0
                     await asyncio.sleep(0.3)
                     await _click_first_visible(page, [
                         "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
@@ -958,6 +1150,44 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 return secret
                         except Exception:
                             pass
+                else:
+                    consecutive_totp_fails += 1
+                    # 尝试点击「切换其他验证方式」或「使用验证码」
+                    for sw_sel in [
+                        "a:has-text('Enter a code from an authenticator app')",
+                        "button:has-text('Enter a code from an authenticator app')",
+                        "a:has-text('Use a verification code')",
+                        "button:has-text('Use a verification code')",
+                        "a:has-text('使用验证码')",
+                        "a:has-text('Sign in another way')",
+                        "a:has-text('其他登录方式')",
+                        "a:has-text('I want to use a different authenticator app')",
+                        "button:has-text('I want to use a different authenticator app')",
+                        "a:has-text('Set up a different authentication app')",
+                        "a:has-text('Can\\'t scan image?')",
+                        "a:has-text('Can\\'t scan the QR code?')",
+                    ]:
+                        try:
+                            sw_loc = page.locator(sw_sel).first
+                            if await sw_loc.is_visible(timeout=100):
+                                await sw_loc.click(timeout=1500, force=True)
+                                _emit(cb, f"  🔀 尝试切换验证选项: {sw_sel}")
+                                await asyncio.sleep(0.8)
+                                break
+                        except Exception:
+                            pass
+
+                    if consecutive_totp_fails >= 3:
+                        _emit(cb, f"  ⚠️ 连续 {consecutive_totp_fails} 次填码未就绪，尝试推进页面...")
+                        await _click_first_visible(page, [
+                            "button:has-text('Next')", "input[value='Next']",
+                            "button:has-text('下一步')", "input[value='下一步']",
+                            "button#idSIButton9", "input#idSIButton9",
+                            "button#idSubmit_SAOTCC_Continue"
+                        ], timeout=1500)
+                        if consecutive_totp_fails >= 6:
+                            _emit(cb, "  ⚠️ 连续多次无法填入 TOTP，可能页面处于其他未决状态，继续探测...")
+                            consecutive_totp_fails = 0
             continue
 
         if state == "done":
