@@ -555,7 +555,10 @@ def _is_valid_totp_secret(candidate: str | None) -> bool:
 
 
 async def _extract_secret_key_from_page(page: Page) -> str:
-    """从页面深度提取 Base32 Secret Key (优先精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
+    """从页面深度提取 Base32 Secret Key (优先使用网络层捕获，若无则精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
+    captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+    if captured and _is_valid_totp_secret(captured):
+        return captured
     try:
         candidate = await page.evaluate(r"""
             () => {
@@ -735,6 +738,13 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         if await _azure_destination_ready(page, cur_url):
             _emit(cb, "  ✅ 已进入 Azure 业务页面，MFA 注册完成")
             return secret
+
+        # 优先从上下文或网络捕获器同步最新捕获的 secret
+        if not secret:
+            captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+            if captured and _is_valid_totp_secret(captured):
+                secret = captured.replace(" ", "").upper()
+                _emit(cb, f"  ⚡ 网络层秒级捕获 MFA Secret: {secret}")
 
         # 读取页面标题与 DOM 文本 (包含所有 headings, labels, buttons, 角色块与主体文本)
         try:
@@ -976,14 +986,17 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     pass
 
             # 点击「Can't scan」后，等待并直接提取 Secret Key（最多等待 3 秒）
-            _emit(cb, "  ⏳ 等待 Secret key 渲染并提取...")
-            for _w in range(15):
-                await asyncio.sleep(0.2)
-                cand = await _extract_secret_key_from_page(page)
-                if cand and _is_valid_totp_secret(cand):
-                    secret = cand.replace(" ", "").upper()
-                    _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
-                    break
+            if not secret:
+                _emit(cb, "  ⏳ 等待 Secret key 渲染并提取...")
+                for _w in range(15):
+                    await asyncio.sleep(0.2)
+                    cand = await _extract_secret_key_from_page(page)
+                    if cand and _is_valid_totp_secret(cand):
+                        secret = cand.replace(" ", "").upper()
+                        _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
+                        break
+            else:
+                _emit(cb, f"  ✅ MFA Secret 已就绪: {secret}")
 
             # 成功提取 Secret 后，点击 Next 推进到 Enter the code 页
             if secret:
@@ -1000,18 +1013,21 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             continue
 
         if state == "show_secret":
-            _emit(cb, "  🔑 提取 Secret key...")
-            for _w in range(12):
-                cand = await _extract_secret_key_from_page(page)
-                if cand and _is_valid_totp_secret(cand):
-                    new_sec = cand.replace(" ", "").upper()
-                    if new_sec != secret:
-                        secret = new_sec
-                        _emit(cb, f"  ✅ 提取并更新 MFA Secret: {secret}")
-                    else:
-                        _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
-                    break
-                await asyncio.sleep(0.2)
+            if not secret:
+                _emit(cb, "  🔑 提取 Secret key...")
+                for _w in range(12):
+                    cand = await _extract_secret_key_from_page(page)
+                    if cand and _is_valid_totp_secret(cand):
+                        new_sec = cand.replace(" ", "").upper()
+                        if new_sec != secret:
+                            secret = new_sec
+                            _emit(cb, f"  ✅ 提取并更新 MFA Secret: {secret}")
+                        else:
+                            _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
+                        break
+                    await asyncio.sleep(0.2)
+            else:
+                _emit(cb, f"  ✅ MFA Secret 已就绪: {secret}")
 
             if secret:
                 secret_fail_rounds = 0
@@ -1054,7 +1070,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
         if state == "enter_code":
             if not secret:
-                _emit(cb, "  ⚠️ 尚未提取到 secret，尝试从当前页面或后退找回...")
+                _emit(cb, "  ⚠️ 尚未提取到 secret，尝试从网络捕获或当前页面找回...")
                 cand = await _extract_secret_key_from_page(page)
                 if cand and _is_valid_totp_secret(cand):
                     secret = cand.replace(" ", "").upper()

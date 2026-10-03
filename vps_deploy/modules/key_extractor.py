@@ -829,7 +829,10 @@ def _is_valid_totp_secret(candidate: str | None) -> bool:
 
 
 async def _extract_secret_key_robust(page: Page, cb: ProgressCallback) -> str:
-    """从「Enter the following into Authenticator」页提取 Secret key (优先精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
+    """从「Enter the following into Authenticator」页提取 Secret key (优先使用网络层捕获，若无则精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
+    captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+    if captured and _is_valid_totp_secret(captured):
+        return captured
     for try_i in range(15):
         await asyncio.sleep(1)
         try:

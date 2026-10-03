@@ -973,7 +973,7 @@ class LocalHttpCache:
         url_lower = url.lower()
         clean = url_lower.split("?")[0].split("#")[0]
         # Arkose CDN 静态字体与静态样式资产允许强缓存（保证真实字体度量避免触发风控）
-        if "/style-manager/fonts/" in clean or ("/fc/assets/" in clean and clean.endswith(cls.CACHEABLE_EXTENSIONS)):
+        if "/style-manager/fonts/" in clean or "/assets/style-manager/" in clean or ("/fc/assets/" in clean and (clean.endswith(cls.CACHEABLE_EXTENSIONS) or "/fonts/" in clean)):
             return True
         if any(p in url_lower for p in cls.DYNAMIC_SECURITY_PATTERNS):
             return False
@@ -1186,12 +1186,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.continue_()
             return
 
-        # 3. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
-        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            await route.continue_()
-            return
-
-        # 4. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
+        # 3. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
         if "extensionmanifest/" in url_lower:
             cached_manifest = LocalHttpCache.get_canonical_manifest(url)
             if cached_manifest:
@@ -1222,7 +1217,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             except Exception:
                 pass
 
-        # 5. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON)：本地秒级响应，0 网络流量
+        # 4. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON/Arkose静态字体)：本地秒级响应，0 网络流量
         if LocalHttpCache.is_cacheable(url, "GET"):
             cached = LocalHttpCache.get(url)
             if cached:
@@ -1233,16 +1228,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(body=body, headers=headers, status=status)
                 return
 
-        # 6. 拦截大体积音视频及安装包
-        if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
-            if stats:
-                stats.record_blocked(est_size=100000)
-            await route.abort()
-            return
-
-        # 7. 对属于可缓存范围但尚未命中的静态请求（包括 ExtensionManifest、Portal 静态脚本）：
-        # 使用 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存！
-        if LocalHttpCache.is_cacheable(url, "GET") or "extensionmanifest/" in url_lower:
+            # 首次未命中强缓存的静态资源：通过 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存
             try:
                 fetch_resp = await route.fetch()
                 if fetch_resp.status == 200:
@@ -1264,7 +1250,19 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.continue_()
                 return
 
-        # 8. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
+        # 5. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
+        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
+            await route.continue_()
+            return
+
+        # 6. 拦截大体积音视频及安装包
+        if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
+            if stats:
+                stats.record_blocked(est_size=100000)
+            await route.abort()
+            return
+
+        # 7. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
         await route.continue_()
 
     await ctx.route("**/*", _route_handler)
@@ -1306,8 +1304,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             if stats:
                 stats.record_transfer(req_bytes + resp_bytes, response.url, req.resource_type, response.status)
 
-            # 仅诊断（不修改/不拦截任何请求）：记录 2FA initializemobileapp 的调用次数、大小与响应结构
-            if stats is not None and "initializemobileapp" in (response.url or "").lower():
+            # 记录 2FA initializemobileapp 的调用与秒级捕获 TOTP 密钥
+            if "initializemobileapp" in (response.url or "").lower():
                 asyncio.ensure_future(_diag_mfa_response(response, req, resp_bytes))
         except Exception:
             pass
@@ -1322,8 +1320,20 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             entry["raw_len"] = len(body)
             try:
                 data = json.loads(body.decode("utf-8", errors="ignore"))
-                parts = []
                 if isinstance(data, dict):
+                    # 关键突破：直接从 API 响应中提取 16 位 TOTP SecretKey 并挂载到上下文
+                    sec = data.get("SecretKey")
+                    if sec and isinstance(sec, str):
+                        clean_sec = re.sub(r"[\s-]+", "", sec.upper())
+                        if len(clean_sec) >= 16:
+                            ctx._captured_totp_secret = clean_sec
+                            for p in getattr(ctx, "pages", []):
+                                try:
+                                    p._captured_totp_secret = clean_sec
+                                except Exception:
+                                    pass
+                            log.info(f"[2FA] 网络层秒级捕获 SecretKey: {clean_sec}")
+                    parts = []
                     for k, v in data.items():
                         ln = len(v) if isinstance(v, (str, list, dict)) else len(str(v))
                         parts.append((ln, f"{k}({type(v).__name__}:{ln})"))
@@ -1333,7 +1343,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 entry["fields"] = "non-json"
         except Exception as e:
             entry["fields"] = f"diag-error: {e}"[:100]
-        stats.mfa_diag.append(entry)
+        if stats is not None:
+            stats.mfa_diag.append(entry)
 
     ctx.on("response", _on_response_measure)
 
@@ -1535,6 +1546,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         }
 
     ctx = await browser.new_context(**context_kwargs)
+    ctx._captured_totp_secret = ""
     await ctx.add_init_script(build_init_script(fp))
 
     stats = TrafficStats()
@@ -1542,5 +1554,26 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         await setup_save_data_route(ctx, stats)
     else:
         ctx.on("response", stats.add_response)
+
+    async def _fallback_mfa_capture(response):
+        if "initializemobileapp" in (response.url or "").lower():
+            try:
+                body = await response.body()
+                data = json.loads(body.decode("utf-8", errors="ignore"))
+                if isinstance(data, dict):
+                    sec = data.get("SecretKey")
+                    if sec and isinstance(sec, str):
+                        clean_sec = re.sub(r"[\s-]+", "", sec.upper())
+                        if len(clean_sec) >= 16:
+                            ctx._captured_totp_secret = clean_sec
+                            for p in getattr(ctx, "pages", []):
+                                try:
+                                    p._captured_totp_secret = clean_sec
+                                except Exception:
+                                    pass
+            except Exception:
+                pass
+
+    ctx.on("response", _fallback_mfa_capture)
 
     return browser, ctx, fp, stats
