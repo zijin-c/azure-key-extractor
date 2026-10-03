@@ -975,6 +975,9 @@ class LocalHttpCache:
         # Arkose CDN 静态字体与静态样式资产允许强缓存（保证真实字体度量避免触发风控）
         if "/style-manager/fonts/" in clean or "/assets/style-manager/" in clean or ("/fc/assets/" in clean and (clean.endswith(cls.CACHEABLE_EXTENSIONS) or "/fonts/" in clean)):
             return True
+        # Microsoft CDN 静态登录背景与插画图片（无后缀的哈希图片资产）允许强缓存
+        if any(h in clean for h in ("msauthimages.net", "msftauthimages.net", "aadcdn.msauth.net", "aadcdn.msftauth.net")):
+            return True
         if any(p in url_lower for p in cls.DYNAMIC_SECURITY_PATTERNS):
             return False
         if clean.endswith(cls.CACHEABLE_EXTENSIONS):
@@ -1183,6 +1186,18 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         # 2. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
         if request.method != "GET":
+            # 严格拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2，体积高达 2.3MB 且对自动化提取毫无用处)
+            if "initializemobileapp" in url_lower and request.method == "POST":
+                try:
+                    pd = request.post_data or ""
+                    if '"securityinfotype":2' in pd.lower() or '"securityinfotype": 2' in pd.lower():
+                        log.info("[2FA] 拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2)，节省 2.3MB 流量")
+                        if stats:
+                            stats.record_blocked(est_size=2300000)
+                        await route.abort()
+                        return
+                except Exception:
+                    pass
             await route.continue_()
             return
 

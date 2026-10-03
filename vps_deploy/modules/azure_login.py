@@ -899,47 +899,118 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         if state == "install_auth":
             _emit(cb, "  📱 「Install Microsoft Authenticator」→ 切换第三方验证器...")
             clicked_alt = False
-            for sel in [
-                "a:has-text('I want to use a different authenticator app')",
-                "button:has-text('I want to use a different authenticator app')",
-                "a:has-text('Set up a different authentication app')",
-                "button:has-text('Set up a different authentication app')",
-                "a:has-text('I want to set up a different method')",
-                "a:has-text('Other options')",
-                "text='I want to use a different authenticator app'",
-                "text='Set up a different authentication app'",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.is_visible(timeout=100):
-                        await loc.scroll_into_view_if_needed()
-                        await loc.click(force=True)
-                        clicked_alt = True
-                        break
-                except Exception:
-                    pass
-            if not clicked_alt and same_state_count > 2:
+            # 1. 优先通过原生 JS 全 DOM 扫描并模拟点击第三方验证器切换链接（极速、穿透 Shadow/Iframe/延迟）
+            try:
+                clicked_alt = await page.evaluate(r"""
+                    () => {
+                        const els = [...document.querySelectorAll('a, button, span, [role="link"], [role="button"]')];
+                        for (const el of els) {
+                            const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if (txt.includes('different authenticator') || 
+                                txt.includes('different authentication') || 
+                                txt.includes('different method') ||
+                                txt.includes('使用其他') || txt.includes('其他验证') || txt.includes('其他方法')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+            except Exception:
+                clicked_alt = False
+
+            # 2. 若 JS 扫描未命中，通过 Playwright 定位器深度匹配并点击
+            if not clicked_alt:
+                for sel in [
+                    "a:has-text('I want to use a different authenticator app')",
+                    "button:has-text('I want to use a different authenticator app')",
+                    "a:has-text('Set up a different authentication app')",
+                    "button:has-text('Set up a different authentication app')",
+                    "a:has-text('I want to set up a different method')",
+                    "a:has-text('Other options')",
+                    "text='I want to use a different authenticator app'",
+                    "text='Set up a different authentication app'",
+                ]:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.is_visible(timeout=200):
+                            await loc.scroll_into_view_if_needed()
+                            await loc.click(force=True)
+                            clicked_alt = True
+                            break
+                    except Exception:
+                        pass
+
+            if clicked_alt:
+                _emit(cb, "  ✅ 已点击切换第三方验证器，等待界面刷新...")
+                await asyncio.sleep(0.5)
+                continue
+
+            # 3. 检查页面是否已成功切换到第三方验证器步骤（页面文本已包含不同验证器提示，且切换链接已消失）
+            is_switched = ("set up a different authentication app" in t or 
+                           "different authenticator app" in t or 
+                           "设置其他身份验证应用" in t or "其他身份验证应用" in t)
+            if is_switched:
+                _emit(cb, "  ✅ 已处于第三方验证器配置界面，点击 Next 推进...")
+                await _click_first_visible(page, [
+                    "button#idSubmit_SAOTCC_Continue",
+                    "input#idSubmit_SAOTCC_Continue",
+                    "button#idSIButton9",
+                    "button:has-text('Next')", "input[value='Next']",
+                    "button:has-text('下一步')", "input[value='下一步']"
+                ], timeout=2000)
+            elif same_state_count > 4:
+                # 只有在连续 5 轮（2.5秒）无法找到切换链接时，才作为最后的兜底推进
+                _emit(cb, "  ⚠️ 未找到切换链接，尝试推进...")
                 await _click_first_visible(page, ["button:has-text('Next')", "input[value='Next']"], timeout=2000)
             continue
 
         if state == "setup_account":
-            _emit(cb, "  📲 「Set up your account in app」→ 点 Next 推进...")
+            _emit(cb, "  📲 「Set up your account in app」→ 检查并推进...")
             # 优先检查是否还有切换其他验证器的选项
-            for alt_sel in [
-                "a:has-text('I want to use a different authenticator app')",
-                "button:has-text('I want to use a different authenticator app')",
-                "a:has-text('Set up a different authentication app')",
-                "a:has-text('Other options')",
-                "text='I want to use a different authenticator app'",
-            ]:
-                try:
-                    loc = page.locator(alt_sel).first
-                    if await loc.is_visible(timeout=80):
-                        await loc.click(force=True)
-                        await asyncio.sleep(0.2)
-                        break
-                except Exception:
-                    pass
+            clicked_alt = False
+            try:
+                clicked_alt = await page.evaluate(r"""
+                    () => {
+                        const els = [...document.querySelectorAll('a, button, span, [role="link"], [role="button"]')];
+                        for (const el of els) {
+                            const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                            if (txt.includes('different authenticator') || 
+                                txt.includes('different authentication') || 
+                                txt.includes('different method') ||
+                                txt.includes('使用其他') || txt.includes('其他验证')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """)
+            except Exception:
+                clicked_alt = False
+
+            if not clicked_alt:
+                for alt_sel in [
+                    "a:has-text('I want to use a different authenticator app')",
+                    "button:has-text('I want to use a different authenticator app')",
+                    "a:has-text('Set up a different authentication app')",
+                    "a:has-text('Other options')",
+                    "text='I want to use a different authenticator app'",
+                ]:
+                    try:
+                        loc = page.locator(alt_sel).first
+                        if await loc.is_visible(timeout=80):
+                            await loc.click(force=True)
+                            clicked_alt = True
+                            break
+                    except Exception:
+                        pass
+
+            if clicked_alt:
+                _emit(cb, "  ✅ 「Set up your account」中成功切换到第三方验证器，等待状态刷新...")
+                await asyncio.sleep(0.5)
+                continue
 
             # 点击 Next 推进到下一步（二维码页）
             await _click_first_visible(page, [
