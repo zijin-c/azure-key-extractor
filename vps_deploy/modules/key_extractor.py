@@ -23,6 +23,7 @@ from playwright.async_api import Page, BrowserContext, TimeoutError as PWTimeout
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
+from utils.totp_cache import save_totp_cache, get_cached_totp
 
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
@@ -76,6 +77,8 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
             new_totp = await _handle_portal_login(page, current_totp, ms_email, cb)
             if new_totp:
                 current_totp = new_totp
+                if ms_email:
+                    save_totp_cache(ms_email, current_totp)
             await asyncio.sleep(1)
             continue
 
@@ -130,6 +133,8 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
             new_totp = await _handle_portal_login(page, current_totp, ms_email, cb)
             if new_totp:
                 current_totp = new_totp
+                if ms_email:
+                    save_totp_cache(ms_email, current_totp)
             continue
 
         await asyncio.sleep(1)
@@ -653,7 +658,10 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     if await _azure_destination_ready(page, page.url or ""):
         return totp_secret
 
-    return await _handle_mfa_setup(page, cb, existing_secret=totp_secret)
+    res = await _handle_mfa_setup(page, cb, existing_secret=totp_secret, ms_email=ms_email)
+    if res and ms_email:
+        save_totp_cache(ms_email, res)
+    return res
 
 
 async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000) -> bool:
@@ -1009,6 +1017,7 @@ async def extract_all_keys(
     复用当前 page 页面避免重复冷加载。
     """
     keys = {}
+    totp_secret = totp_secret or (get_cached_totp(ms_email) if ms_email else "")
     _EDU_SW_URL = (
         "https://portal.azure.com/#view/Microsoft_Azure_Education"
         "/EducationMenuBlade/~/software"
@@ -1043,6 +1052,8 @@ async def extract_all_keys(
         new_totp = await _handle_portal_login(sw_page, totp_secret, ms_email, cb)
         if new_totp:
             updated_totp = new_totp
+            if ms_email:
+                save_totp_cache(ms_email, updated_totp)
             _emit(cb, f"  🔑 MFA Secret 已更新: {new_totp}")
 
     try:
@@ -1051,6 +1062,8 @@ async def extract_all_keys(
             sw_page, cb, timeout=config.PORTAL_WAIT,
             totp_secret=updated_totp, ms_email=ms_email, proxy_ctrl=proxy_ctrl
         )
+        if updated_totp and ms_email:
+            save_totp_cache(ms_email, updated_totp)
         await asyncio.sleep(0.5)
 
         # ── 处理 Terms Acceptance ────────────────────────────
@@ -1213,6 +1226,8 @@ async def extract_all_keys(
     if not any(v for v in keys.values()):
         raise PortalLoadError("本轮 0 个 key（页面加载/搜索异常，疑似网络卡顿），需换代理重试", totp=updated_totp)
 
+    if updated_totp and ms_email:
+        save_totp_cache(ms_email, updated_totp)
     return keys, updated_totp
 
 

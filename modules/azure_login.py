@@ -39,23 +39,31 @@ from utils.human_action import (
     human_type,
 )
 
+from utils.totp_cache import save_totp_cache, get_cached_totp
+
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
 
 
 class LoginNetworkError(RuntimeError):
     """登录流程初始网络导航或页面加载失败。"""
-    pass
+    def __init__(self, msg: str, totp: str = ""):
+        super().__init__(msg)
+        self.totp = totp or ""
 
 
 class EmailInputTimeoutError(RuntimeError):
     """由于网络延迟或页面未加载导致邮箱输入框未出现或输入超时。"""
-    pass
+    def __init__(self, msg: str, totp: str = ""):
+        super().__init__(msg)
+        self.totp = totp or ""
 
 
 class AzureCaptchaError(RuntimeError):
     """触发 Azure / Arkose / SheerID 人机拼图验证码。"""
-    pass
+    def __init__(self, msg: str, totp: str = ""):
+        super().__init__(msg)
+        self.totp = totp or ""
 
 
 # ── 选择器 ────────────────────────────────────────────────────
@@ -162,8 +170,6 @@ async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000)
     except Exception:
         pass
 
-    return False
-
     # 3. 原生 JS 极速 DOM 点击兜底（毫秒级执行，彻底杜绝 Playwright 动作就绪检测卡死）
     try:
         clicked = await page.evaluate("""
@@ -181,10 +187,10 @@ async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000)
                         }
                     } catch(e) {}
                 }
-                const btns = [...document.querySelectorAll('button, input[type=submit], a')];
+                const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
                 for (const b of btns) {
-                    const t = (b.innerText || b.value || '').trim().toLowerCase();
-                    if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续') {
+                    const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+                    if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续' || t === 'done' || t === 'finish' || t === '完成') {
                         const r = b.getBoundingClientRect();
                         if (r.width > 0 && r.height > 0 && !b.disabled) {
                             b.focus();
@@ -555,162 +561,183 @@ def _is_valid_totp_secret(candidate: str | None) -> bool:
 
 
 async def _extract_secret_key_from_page(page: Page) -> str:
-    """从页面深度提取 Base32 Secret Key (优先使用网络层捕获，若无则精确定位 Secret Key 标签/容器，严格排除任何长文本与黑名单单词)。"""
+    """从页面深度提取 Base32 Secret Key (优先使用网络层捕获，遍历多框架与多语言标签，严格排除任何长文本与黑名单单词)。"""
     captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
     if captured and _is_valid_totp_secret(captured):
-        return captured
-    try:
-        candidate = await page.evaluate(r"""
-            () => {
-                const BLACKLIST = [
-                    'SKIP', 'MAIN', 'CONTENT', 'AUTHENTICATOR', 'AUTHENTICAT', 'MICROSOFT',
-                    'ACCOUNT', 'SETUP', 'CANTSCAN', 'QRCODE', 'COPY', 'ENTER',
-                    'CODE', 'MANUALLY', 'ENGLISH', 'PRIVACY', 'TERMS', 'HELP',
-                    'ENABLE', 'JAVASCRIPT', 'RUNTHISAPP', 'BROWSER', 'SIGNIN',
-                    'PASSWORD', 'SECURITY', 'NOTIFICATION', 'VERIFICATION',
-                    'IDENTITY', 'CONDITIONS', 'FEEDBACK', 'LANGUAGE', 'MORE',
-                    'OPTIONS', 'CONTINUE', 'CANCEL', 'SUBMIT', 'FINISH', 'DONE',
-                    'BACK', 'NEXT', 'PROTECTION', 'REGISTER', 'PORTAL',
-                    'UNIVERSITY', 'STUDENT', 'EDUCATION', 'AZURE', 'COMMUNITY',
-                    'SUPPORT', 'LEGAL', 'CONTACT', 'OFFICE', 'WINDOWS', 'DEFAULT',
-                    'BUTTON', 'TITLE', 'LABEL', 'INPUT', 'ACTION', 'NOSCRIPT',
-                    'YOUNEEDTOENABLE', 'FOLLOWING', 'SCANNER', 'SELECT', 'ACCOUNTNAME',
-                    'SECRETKEY', 'COPYNAME', 'COPYKEY', 'ENTERCODE', 'OPENTHEQR'
-                ];
-                const clean = (s) => (s || '').trim().replace(/[\s-]+/g, '').toUpperCase();
-                const isBase32 = (s) => {
-                    if (!s || s.length < 16 || s.length > 64) return false;
-                    if (!/^[A-Z2-7]+$/.test(s)) return false;
-                    for (const w of BLACKLIST) {
-                        if (s.includes(w)) return false;
+        return captured.replace(" ", "").replace("-", "").upper()
+
+    targets = [page] + list(page.frames)
+    for tgt in targets:
+        try:
+            candidate = await tgt.evaluate(r"""
+                () => {
+                    const BLACKLIST = [
+                        'SKIP', 'MAIN', 'CONTENT', 'AUTHENTICATOR', 'AUTHENTICAT', 'MICROSOFT',
+                        'ACCOUNT', 'SETUP', 'CANTSCAN', 'QRCODE', 'COPY', 'ENTER',
+                        'CODE', 'MANUALLY', 'ENGLISH', 'PRIVACY', 'TERMS', 'HELP',
+                        'ENABLE', 'JAVASCRIPT', 'RUNTHISAPP', 'BROWSER', 'SIGNIN',
+                        'PASSWORD', 'SECURITY', 'NOTIFICATION', 'VERIFICATION',
+                        'IDENTITY', 'CONDITIONS', 'FEEDBACK', 'LANGUAGE', 'MORE',
+                        'OPTIONS', 'CONTINUE', 'CANCEL', 'SUBMIT', 'FINISH', 'DONE',
+                        'BACK', 'NEXT', 'PROTECTION', 'REGISTER', 'PORTAL',
+                        'UNIVERSITY', 'STUDENT', 'EDUCATION', 'AZURE', 'COMMUNITY',
+                        'SUPPORT', 'LEGAL', 'CONTACT', 'OFFICE', 'WINDOWS', 'DEFAULT',
+                        'BUTTON', 'TITLE', 'LABEL', 'INPUT', 'ACTION', 'NOSCRIPT',
+                        'YOUNEEDTOENABLE', 'FOLLOWING', 'SCANNER', 'SELECT', 'ACCOUNTNAME',
+                        'SECRETKEY', 'COPYNAME', 'COPYKEY', 'ENTERCODE', 'OPENTHEQR'
+                    ];
+                    const clean = (s) => (s || '').trim().replace(/[\s-]+/g, '').toUpperCase();
+                    const isBase32 = (s) => {
+                        if (!s || s.length < 16 || s.length > 64) return false;
+                        if (!/^[A-Z2-7]+$/.test(s)) return false;
+                        for (const w of BLACKLIST) {
+                            if (s.includes(w)) return false;
+                        }
+                        return true;
+                    };
+
+                    const isSecretLabel = (t) => {
+                        return t === 'secret key:' || t === 'secret key' || t.startsWith('secret key:') ||
+                               t === '机密密钥:' || t === '机密密钥' || t.startsWith('机密密钥') ||
+                               t === '密钥:' || t === '密钥' || t.startsWith('密钥:') ||
+                               t.includes('clé secrète') || t.includes('clave secreta') ||
+                               t.includes('geheimer schlüssel') || t.includes('秘密キー');
+                    };
+
+                    const isCopyBtn = (t) => {
+                        return t === 'copy key' || t === '复制密钥' || t.includes('copy key') ||
+                               t.includes('复制密钥') || t.includes('copier la clé') || t.includes('copiar clave');
+                    };
+
+                    const allEls = [...document.querySelectorAll('*')];
+
+                    // 策略1: 定位「Secret key / 机密密钥」文字节点，从其相邻兄弟元素或父容器中提取密钥值
+                    for (const el of allEls) {
+                        if (el.children.length > 3) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (isSecretLabel(txt)) {
+                            // 1.1 检查后续兄弟节点
+                            let sib = el.nextElementSibling;
+                            while (sib) {
+                                const sTxt = clean(sib.innerText || sib.textContent || sib.value || '');
+                                if (isBase32(sTxt)) return sTxt;
+                                const innerEls = sib.querySelectorAll('*');
+                                for (const inner of innerEls) {
+                                    if (inner.children.length === 0) {
+                                        const cTxt = clean(inner.innerText || inner.textContent || '');
+                                        if (isBase32(cTxt)) return cTxt;
+                                    }
+                                }
+                                sib = sib.nextElementSibling;
+                            }
+
+                            // 1.2 检查父级容器中排除 "Secret key" 后的文本
+                            let parent = el.parentElement;
+                            for (let depth = 0; depth < 4 && parent; depth++) {
+                                const pText = parent.innerText || parent.textContent || '';
+                                const m = pText.match(/(?:secret\s*key|机密密钥|密钥|clé\s*secrète|clave\s*secreta|秘密キー)\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
+                                if (m) {
+                                    const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
+                                    if (isBase32(candidate)) return candidate;
+                                }
+                                for (const child of parent.querySelectorAll('*')) {
+                                    if (child.children.length === 0) {
+                                        const cTxt = clean(child.innerText || child.textContent || '');
+                                        if (isBase32(cTxt)) return cTxt;
+                                    }
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
                     }
-                    return true;
-                };
 
-                const allEls = [...document.querySelectorAll('*')];
-
-                // 策略1: 定位「Secret key:」文字节点，从其相邻兄弟元素或父容器中提取密钥值
-                for (const el of allEls) {
-                    if (el.children.length > 3) continue;
-                    const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                    if (txt === 'secret key:' || txt === 'secret key' || txt.startsWith('secret key:')) {
-                        // 1.1 检查后续兄弟节点
-                        let sib = el.nextElementSibling;
-                        while (sib) {
-                            const sTxt = clean(sib.innerText || sib.textContent || sib.value || '');
-                            if (isBase32(sTxt)) return sTxt;
-                            const innerEls = sib.querySelectorAll('*');
-                            for (const inner of innerEls) {
-                                if (inner.children.length === 0) {
-                                    const cTxt = clean(inner.innerText || inner.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
+                    // 策略2: 定位「Copy key」/「复制密钥」按钮，取其前序或关联容器元素
+                    for (const el of allEls) {
+                        const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                        if (isCopyBtn(txt)) {
+                            let prev = el.previousElementSibling;
+                            while (prev) {
+                                const pTxt = clean(prev.innerText || prev.textContent || prev.value || '');
+                                if (isBase32(pTxt)) return pTxt;
+                                prev = prev.previousElementSibling;
+                            }
+                            let parent = el.parentElement;
+                            if (parent) {
+                                for (const child of parent.querySelectorAll('*')) {
+                                    if (child.children.length === 0) {
+                                        const cTxt = clean(child.innerText || child.textContent || '');
+                                        if (isBase32(cTxt)) return cTxt;
+                                    }
                                 }
                             }
-                            sib = sib.nextElementSibling;
                         }
+                    }
 
-                        // 1.2 检查父级容器中排除 "Secret key" 后的文本
-                        let parent = el.parentElement;
-                        for (let depth = 0; depth < 4 && parent; depth++) {
-                            const pText = parent.innerText || parent.textContent || '';
-                            const m = pText.match(/secret\s*key\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
-                            if (m) {
-                                const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
-                                if (isBase32(candidate)) return candidate;
-                            }
-                            for (const child of parent.querySelectorAll('*')) {
-                                if (child.children.length === 0) {
-                                    const cTxt = clean(child.innerText || child.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
+                    // 策略3: 优先从专有属性与元素查找
+                    const specificEls = document.querySelectorAll(
+                        "[id*='secret' i], [data-bind*='secret' i], [data-testid*='secret' i], code, pre, .secret-key, input[readonly], [aria-label*='secret' i], [aria-label*='密钥' i]"
+                    );
+                    for (const el of specificEls) {
+                        if (el.closest('noscript, script, style, header, footer, nav')) continue;
+                        const val = clean(el.value || el.innerText || el.textContent || el.getAttribute('data-value') || el.getAttribute('aria-label') || '');
+                        if (isBase32(val)) return val;
+                    }
+
+                    // 策略4: 全文严格正则匹配 "Secret key: XXXXX" / "机密密钥: XXXXX"
+                    const bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '');
+                    const m = bodyText.match(/(?:Secret\s*key|机密密钥|密钥|Clé\s*secrète|Clave\s*secreta|秘密キー)\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
+                    if (m) {
+                        const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
+                        if (isBase32(candidate)) return candidate;
+                    }
+
+                    // 策略5: 单独独立的叶子文本节点（内容完全就是 16~32 位的纯 Base32，绝不从句子中切词）
+                    const walker = document.createTreeWalker(
+                        document.body || document.documentElement,
+                        NodeFilter.SHOW_TEXT,
+                        {
+                            acceptNode: (node) => {
+                                const p = node.parentElement;
+                                if (!p) return NodeFilter.FILTER_REJECT;
+                                const tag = p.tagName.toLowerCase();
+                                if (tag === 'script' || tag === 'noscript' || tag === 'style' || tag === 'header' || tag === 'footer' || tag === 'nav') {
+                                    return NodeFilter.FILTER_REJECT;
                                 }
-                            }
-                            parent = parent.parentElement;
-                        }
-                    }
-                }
-
-                // 策略2: 定位「Copy key」/「复制密钥」按钮，取其前序或关联容器元素
-                for (const el of allEls) {
-                    const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().toLowerCase();
-                    if (txt === 'copy key' || txt === '复制密钥' || txt.includes('copy key')) {
-                        let prev = el.previousElementSibling;
-                        while (prev) {
-                            const pTxt = clean(prev.innerText || prev.textContent || prev.value || '');
-                            if (isBase32(pTxt)) return pTxt;
-                            prev = prev.previousElementSibling;
-                        }
-                        let parent = el.parentElement;
-                        if (parent) {
-                            for (const child of parent.querySelectorAll('*')) {
-                                if (child.children.length === 0) {
-                                    const cTxt = clean(child.innerText || child.textContent || '');
-                                    if (isBase32(cTxt)) return cTxt;
+                                const r = p.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0) return NodeFilter.FILTER_REJECT;
+                                const s = window.getComputedStyle(p);
+                                if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
+                                    return NodeFilter.FILTER_REJECT;
                                 }
+                                return NodeFilter.FILTER_ACCEPT;
                             }
                         }
-                    }
-                }
-
-                // 策略3: 优先从专有属性与元素查找
-                const specificEls = document.querySelectorAll(
-                    "[id*='secret' i], [data-bind*='secret' i], [data-testid*='secret' i], code, pre, .secret-key, input[readonly], [aria-label*='secret' i]"
-                );
-                for (const el of specificEls) {
-                    if (el.closest('noscript, script, style, header, footer, nav')) continue;
-                    const val = clean(el.value || el.innerText || el.textContent || el.getAttribute('data-value') || el.getAttribute('aria-label') || '');
-                    if (isBase32(val)) return val;
-                }
-
-                // 策略4: 全文严格正则匹配 "Secret key: XXXXX"
-                const bodyText = (document.body ? (document.body.innerText || document.body.textContent || '') : '');
-                const m = bodyText.match(/Secret\s*key\s*[:：]?\s*([a-zA-Z2-7\s-]{16,64})/i);
-                if (m) {
-                    const candidate = clean(m[1].replace(/copy.*$/i, '').replace(/复制.*$/i, ''));
-                    if (isBase32(candidate)) return candidate;
-                }
-
-                // 策略5: 单独独立的叶子文本节点（内容完全就是 16~32 位的纯 Base32，绝不从句子中切词）
-                const walker = document.createTreeWalker(
-                    document.body || document.documentElement,
-                    NodeFilter.SHOW_TEXT,
-                    {
-                        acceptNode: (node) => {
-                            const p = node.parentElement;
-                            if (!p) return NodeFilter.FILTER_REJECT;
-                            const tag = p.tagName.toLowerCase();
-                            if (tag === 'script' || tag === 'noscript' || tag === 'style' || tag === 'header' || tag === 'footer' || tag === 'nav') {
-                                return NodeFilter.FILTER_REJECT;
-                            }
-                            const r = p.getBoundingClientRect();
-                            if (r.width === 0 || r.height === 0) return NodeFilter.FILTER_REJECT;
-                            const s = window.getComputedStyle(p);
-                            if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
-                                return NodeFilter.FILTER_REJECT;
-                            }
-                            return NodeFilter.FILTER_ACCEPT;
+                    );
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const raw = (node.textContent || '').trim();
+                        const c = clean(raw);
+                        if (/^[A-Z2-7]{16,32}$/.test(c) && isBase32(c)) {
+                            return c;
                         }
                     }
-                );
-                let node;
-                while (node = walker.nextNode()) {
-                    const raw = (node.textContent || '').trim();
-                    const c = clean(raw);
-                    if (/^[A-Z2-7]{16,32}$/.test(c) && isBase32(c)) {
-                        return c;
-                    }
-                }
 
-                return '';
-            }
-        """)
-        if candidate and _is_valid_totp_secret(candidate):
-            return candidate.replace(" ", "").replace("-", "").upper()
-    except Exception:
-        pass
+                    return '';
+                }
+            """)
+            if candidate and _is_valid_totp_secret(candidate):
+                cand = candidate.replace(" ", "").replace("-", "").upper()
+                ctx = getattr(page, "context", None)
+                if ctx:
+                    ctx._captured_totp_secret = cand
+                return cand
+        except Exception:
+            pass
     return ""
 
 
-async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: str = "") -> str:
+async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: str = "",
+                            ms_email: str = "", on_secret_captured: Optional[Callable[[str], None]] = None) -> str:
     """
     处理 MFA 注册流程：采用多状态响应式状态机，实时根据当前屏幕 DOM 状态执行对应操作：
       - 'keep_secure' -> 点 Next / 下一步
@@ -723,12 +750,39 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
       - 'kmsi'        -> 点 No / Cancel
     """
     _emit(cb, "  🔐 开始 MFA 注册流程 (响应式状态机)...")
-    secret = existing_secret or ""
+    secret = existing_secret or getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "") or (get_cached_totp(ms_email) if ms_email else "")
     last_state = ""
     same_state_count = 0
     consecutive_totp_fails = 0
     secret_fail_rounds = 0   # show_secret 连续提取失败轮数
     secret_reload_count = 0  # 因 Secret 提取失败触发的刷新次数
+
+    def _sync_secret(val: str) -> str:
+        nonlocal secret
+        if val and _is_valid_totp_secret(val):
+            clean_v = val.replace(" ", "").replace("-", "").upper()
+            if clean_v != secret:
+                secret = clean_v
+                ctx = getattr(page, "context", None)
+                if ctx:
+                    ctx._captured_totp_secret = clean_v
+                    for p in getattr(ctx, "pages", []):
+                        try:
+                            p._captured_totp_secret = clean_v
+                        except Exception:
+                            pass
+                if ms_email:
+                    save_totp_cache(ms_email, clean_v)
+                if callable(on_secret_captured):
+                    try:
+                        on_secret_captured(clean_v)
+                    except Exception:
+                        pass
+                _emit(cb, f"  💾 已立即保存 2FA 密钥: {clean_v}")
+        return secret
+
+    if secret:
+        _sync_secret(secret)
 
     for step in range(80):  # 最多轮询 ~40 秒
         await asyncio.sleep(0.5)
@@ -741,10 +795,10 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
         # 优先从上下文或网络捕获器同步最新捕获的 secret
         if not secret:
-            captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+            captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "") or (get_cached_totp(ms_email) if ms_email else "")
             if captured and _is_valid_totp_secret(captured):
-                secret = captured.replace(" ", "").upper()
-                _emit(cb, f"  ⚡ 网络层秒级捕获 MFA Secret: {secret}")
+                _sync_secret(captured)
+                _emit(cb, f"  ⚡ 网络层/缓存秒级捕获 MFA Secret: {secret}")
 
         # 读取页面标题与 DOM 文本 (包含所有 headings, labels, buttons, 角色块与主体文本)
         try:
@@ -1085,18 +1139,22 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
         if state == "show_secret":
             if not secret:
-                _emit(cb, "  🔑 提取 Secret key...")
-                for _w in range(12):
-                    cand = await _extract_secret_key_from_page(page)
-                    if cand and _is_valid_totp_secret(cand):
-                        new_sec = cand.replace(" ", "").upper()
-                        if new_sec != secret:
-                            secret = new_sec
-                            _emit(cb, f"  ✅ 提取并更新 MFA Secret: {secret}")
-                        else:
-                            _emit(cb, f"  ✅ 提取到 MFA Secret: {secret}")
-                        break
-                    await asyncio.sleep(0.2)
+                # 优先检查网络层捕获
+                captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+                if captured and _is_valid_totp_secret(captured):
+                    _sync_secret(captured)
+                else:
+                    _emit(cb, "  🔑 提取 Secret key...")
+                    for _w in range(12):
+                        captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "")
+                        if captured and _is_valid_totp_secret(captured):
+                            _sync_secret(captured)
+                            break
+                        cand = await _extract_secret_key_from_page(page)
+                        if cand and _is_valid_totp_secret(cand):
+                            _sync_secret(cand)
+                            break
+                        await asyncio.sleep(0.25)
             else:
                 _emit(cb, f"  ✅ MFA Secret 已就绪: {secret}")
 
@@ -1114,38 +1172,37 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 ], timeout=2000)
             else:
                 secret_fail_rounds += 1
-                _emit(cb, f"  ⏳ Secret 尚未完全渲染，等待...（{secret_fail_rounds}/6）")
-                if secret_fail_rounds == 3:
-                    # 连续 3 轮失败：可能「Can't scan」未真正展开，再点一次
-                    if await _click_first_visible(page, [
-                        "button:has-text('Can\\'t scan the QR code')",
-                        "a:has-text('Can\\'t scan the QR code')",
-                        "button:has-text('Can\\'t scan image')",
-                        "a:has-text('Can\\'t scan image')",
-                        "a:has-text('Can\\'t scan')",
-                        "button:has-text('Can\\'t scan')",
-                        "a:has-text('Enter code manually')",
-                    ], timeout=300):
-                        _emit(cb, "  🔄 重新点击「Can't scan」展开 Secret...")
-                elif secret_fail_rounds >= 6:
-                    secret_fail_rounds = 0
-                    if secret_reload_count < 3:
-                        secret_reload_count += 1
-                        _emit(cb, f"  🔄 连续 6 次未提取到 Secret，刷新页面重试（第 {secret_reload_count}/3 次）...")
-                        try:
-                            await page.reload(wait_until="domcontentloaded", timeout=30000)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(2)
+                _emit(cb, f"  ⏳ Secret 尚未完全渲染，等待...（{secret_fail_rounds}/8）")
+                # 重新点击「Can't scan」展开 Secret，避免刷新页面打断 MFA 会话
+                if await _click_first_visible(page, [
+                    "button:has-text('Can\\'t scan the QR code')",
+                    "a:has-text('Can\\'t scan the QR code')",
+                    "button:has-text('Can\\'t scan image')",
+                    "a:has-text('Can\\'t scan image')",
+                    "a:has-text('Can\\'t scan')",
+                    "button:has-text('Can\\'t scan')",
+                    "a:has-text('Enter code manually')",
+                    "text='无法扫描二维码'",
+                    "a:has-text('无法扫描二维码')",
+                ], timeout=300):
+                    _emit(cb, "  🔄 重新点击「Can't scan」展开 Secret...")
             continue
 
         if state == "enter_code":
             if not secret:
-                _emit(cb, "  ⚠️ 尚未提取到 secret，尝试从网络捕获或当前页面找回...")
-                cand = await _extract_secret_key_from_page(page)
-                if cand and _is_valid_totp_secret(cand):
-                    secret = cand.replace(" ", "").upper()
-                    _emit(cb, f"  ✅ 找回 MFA Secret: {secret}")
+                _emit(cb, "  ⚠️ 尚未提取到 secret，尝试从网络捕获或本地缓存找回...")
+                captured = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "")
+                if captured and _is_valid_totp_secret(captured):
+                    _sync_secret(captured)
+                elif ms_email:
+                    cached = get_cached_totp(ms_email)
+                    if cached and _is_valid_totp_secret(cached):
+                        _sync_secret(cached)
+                        _emit(cb, f"  💾 从本地持久化缓存找回 2FA Secret: {secret}")
+                if not secret:
+                    cand = await _extract_secret_key_from_page(page)
+                    if cand and _is_valid_totp_secret(cand):
+                        _sync_secret(cand)
 
                 # 如果依然未获取到 secret，点击页面上的「←」后退按钮或「Back」返回提取 Secret
                 if not secret:
@@ -1194,7 +1251,6 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                             pass
                 else:
                     consecutive_totp_fails += 1
-                    # 尝试点击「切换其他验证方式」或「使用验证码」
                     for sw_sel in [
                         "a:has-text('Enter a code from an authenticator app')",
                         "button:has-text('Enter a code from an authenticator app')",
@@ -1234,16 +1290,31 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
 
         if state == "done":
             _emit(cb, "  🏁 MFA 注册成功，点击 Next/Done/完成...")
+            _sync_secret(secret)
             await _click_first_visible(page, [
                 "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
                 "button#idSIButton9", "input#idSIButton9",
-                "button:has-text('Next')", "input[value='Next']",
                 "button:has-text('Done')", "input[value='Done']",
                 "button:has-text('Finish')", "button:has-text('Continue')",
-                "button:has-text('完成')", "button:has-text('下一步')"
-            ], timeout=3000)
-            await asyncio.sleep(1)
-            for _w in range(12):
+                "button:has-text('完成')", "button:has-text('下一步')",
+                "button:has-text('Next')", "input[value='Next']",
+                "[role='button']:has-text('Done')", "[role='button']:has-text('完成')",
+            ], timeout=2500)
+            try:
+                await page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
+                    for (const b of btns) {
+                        const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+                        if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步' || t === 'continue' || t === '继续') {
+                            b.click();
+                            break;
+                        }
+                    }
+                }""")
+            except Exception:
+                pass
+            await asyncio.sleep(0.8)
+            for _w in range(10):
                 if await _azure_destination_ready(page, page.url or ""):
                     _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
                     return secret
@@ -1256,10 +1327,17 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 if "kmsi" in cur_url or "stay signed in" in cur_title or "保持登录" in cur_title:
                     break
                 await asyncio.sleep(0.3)
+
+            # 关键突破：连续 2 轮确认处于 Done 成功状态，MFA 绑定已在微软云端生效！
+            # 立即返回 secret 并退出状态机，直接让外层逻辑导航到 Portal / 业务目标页，彻底杜绝死循环！
+            if same_state_count >= 2:
+                _emit(cb, "  ✅ MFA 注册已确认成功，直接进入后续业务流程")
+                return secret
             continue
 
         if state == "kmsi":
             _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
+            _sync_secret(secret)
             try:
                 cb_loc = page.locator("input#KmsiCheckboxField, input[name='DontShowAgain'], input[type='checkbox']").first
                 if await cb_loc.is_visible(timeout=300):
@@ -1279,6 +1357,8 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 if await _azure_destination_ready(page, page.url or ""):
                     _emit(cb, "  ✅ 已进入 Azure 业务页面")
                     return secret
+            if same_state_count >= 2:
+                return secret
             continue
 
     return secret
@@ -1406,6 +1486,9 @@ async def do_azure_login(
     返回 totp_secret（若触发了 MFA 注册）或原始 secret。
     """
     _emit(cb, f"  🔑 开始微软账号登录: {ms_email}")
+    totp_secret = existing_totp_secret or (get_cached_totp(ms_email) if ms_email else "")
+    if totp_secret and not existing_totp_secret:
+        _emit(cb, f"  💾 从本地持久化缓存载入历史 2FA 密钥: {totp_secret[:4]}***")
 
     # ── 第一步：打开目标入口 URL ─────────────
     default_login_target = getattr(config, "AZURE_SIGNUP_LOGIN_URL", config.AZURE_SIGNUP_URL)
@@ -1420,7 +1503,7 @@ async def do_azure_login(
                 _emit(cb, f"  ⚠️  导航失败（第{attempt+1}次）: {str(e)[:60]}，重试...")
                 await asyncio.sleep(2)
             else:
-                raise LoginNetworkError(f"导航目标入口失败: {e}")
+                raise LoginNetworkError(f"导航目标入口失败: {e}", totp=totp_secret)
 
     # 导航后等待登录页出现（轮询，等待页面重定向至微软登录页）
     for _w in range(30):
@@ -1513,7 +1596,7 @@ async def do_azure_login(
                 await asyncio.sleep(0.5)
             else:
                 if is_timeout or "Timeout" in str(e):
-                    raise EmailInputTimeoutError(f"无法输入邮箱（页面未加载或输入超时）: {e}")
+                    raise EmailInputTimeoutError(f"无法输入邮箱（页面未加载或输入超时）: {e}", totp=totp_secret)
                 else:
                     raise RuntimeError(f"无法输入邮箱: {e}")
 
@@ -1563,7 +1646,10 @@ async def do_azure_login(
         raise RuntimeError(f"无法输入密码: {e}")
 
     # ── 处理登录后各种中间页 ──────────────────────────────────
-    totp_secret = existing_totp_secret or ""
+    if not totp_secret:
+        totp_secret = getattr(getattr(page, "context", None), "_captured_totp_secret", "") or getattr(page, "_captured_totp_secret", "") or (get_cached_totp(ms_email) if ms_email else "")
+        if totp_secret and ms_email:
+            save_totp_cache(ms_email, totp_secret)
     _POPUP_KEYS = ("proofs", "recover", "kmsi", "protection",
                    "login.live", "login.microsoftonline", "ppsecure",
                    "mysignins.microsoft.com")
@@ -1594,7 +1680,9 @@ async def do_azure_login(
         # 1. 人机验证 (CAPTCHA / Robot Puzzle) 穿透式高精度识别
         is_captcha, cap_msg = await check_captcha_present(page)
         if is_captcha:
-            raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
+            if ms_email and totp_secret:
+                save_totp_cache(ms_email, totp_secret)
+            raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})", totp=totp_secret)
 
         if ("password is incorrect" in body_lower or "incorrect password" in body_lower or
                 "account or password is incorrect" in body_lower or "your account has been locked" in body_lower or
@@ -1655,7 +1743,38 @@ async def do_azure_login(
 
         # 0. 已有 TOTP 密钥的 2FA 动态验证码校验
         if totp_secret:
-            totp_switch_sels = [
+            # 0.1 若处于数字匹配或推送确认页，点击「以其他方式登录」/「我目前无法使用应用」
+            alt_login_sels = [
+                "a#idA_SAASTO_ProofUp",
+                "a#idA_PWD_SwitchToCredPicker",
+                "a:has-text('Sign in another way')",
+                "button:has-text('Sign in another way')",
+                "a:has-text('以其他方式登录')",
+                "button:has-text('以其他方式登录')",
+                "a:has-text('其他登录方式')",
+                "a:has-text('其他验证方式')",
+                "a:has-text('I can\\'t use my Microsoft Authenticator app right now')",
+                "button:has-text('I can\\'t use my Microsoft Authenticator app right now')",
+                "a:has-text('我目前无法使用我的 Microsoft Authenticator 应用')",
+            ]
+            for sw_sel in alt_login_sels:
+                try:
+                    sw = page.locator(sw_sel).first
+                    if await sw.is_visible(timeout=150):
+                        _emit(cb, "  🔀 点击「以其他方式登录 / Sign in another way」...")
+                        await sw.click(force=True)
+                        await asyncio.sleep(0.8)
+                        break
+                except Exception:
+                    pass
+
+            # 0.2 在验证选项列表中选择「使用验证码」
+            pick_code_sels = [
+                "[data-value='PhoneAppOTP']",
+                "div:has-text('Use a verification code')",
+                "span:has-text('Use a verification code')",
+                "div:has-text('使用验证码')",
+                "span:has-text('使用验证码')",
                 "a:has-text('Enter a code from an authenticator app')",
                 "button:has-text('Enter a code from an authenticator app')",
                 "a:has-text('Already have a code?')",
@@ -1663,11 +1782,11 @@ async def do_azure_login(
                 "a:has-text('use a verification code')",
                 "a:has-text('使用验证码')",
             ]
-            for sw_sel in totp_switch_sels:
+            for sw_sel in pick_code_sels:
                 try:
                     sw = page.locator(sw_sel).first
-                    if await sw.is_visible(timeout=300):
-                        _emit(cb, "  🔀 点击「Enter a code / 使用验证码」切换 2FA 验证方式...")
+                    if await sw.is_visible(timeout=200):
+                        _emit(cb, "  🔀 选择「使用验证码 / Use a verification code」...")
                         await sw.click(force=True)
                         await asyncio.sleep(0.8)
                         break
@@ -1701,7 +1820,7 @@ async def do_azure_login(
                 "keep your account secure" in body_lower or
                 "more information required" in body_lower or
                 "保护帐户安全" in body or "保护账户安全" in body or "需要详细信息" in body or "保持账户安全" in body):
-            _emit(cb, "  🔑 出现「Let's keep your account secure」界面，点「下一步/Next」开始 2FA 绑定...")
+            _emit(cb, "  🔑 出现「Let's keep your account secure」界面，点「下一步/Next」推进 2FA 流程...")
             next_clicked = await _click_first_visible(page, [
                 "input#idSubmit_ProofUp_Redirect",
                 "input#idSIButton9",
@@ -1718,9 +1837,13 @@ async def do_azure_login(
                 except Exception:
                     pass
             try:
-                totp_secret = await _handle_mfa_setup(page, cb)
+                new_sec = await _handle_mfa_setup(page, cb, existing_secret=totp_secret, ms_email=ms_email)
+                if new_sec:
+                    totp_secret = new_sec
+                    if ms_email:
+                        save_totp_cache(ms_email, totp_secret)
             except Exception as e:
-                _emit(cb, f"  ⚠️  MFA 注册异常: {e}")
+                _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
 
         # ② 「Pick an account」选择器 → 点已登录的账号（Signed in）
@@ -1737,22 +1860,17 @@ async def do_azure_login(
                         pass
             continue
 
-        # ③ Install Microsoft Authenticator（直接进入 MFA 页，说明账号没有已登录session）
+        # ③ Install Microsoft Authenticator（直接进入 MFA 流程页）
         if "install microsoft authenticator" in body_lower or "mysignins.microsoft.com" in url_lower:
-            if totp_secret:
-                # 已完成 MFA 注册，直接跳转至目标页面（如学生认证登录入口）
-                _emit(cb, f"  🌐 MFA 注册已完成，主动导航至目标入口: {target_url[:70]}...")
-                try:
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-                continue
-            _emit(cb, "  🔐 直接进入 MFA 注册页...")
+            _emit(cb, "  🔐 检测到 MFA 流程页面，执行响应式状态机推进...")
             try:
-                totp_secret = await _handle_mfa_setup(page, cb)
+                new_sec = await _handle_mfa_setup(page, cb, existing_secret=totp_secret, ms_email=ms_email)
+                if new_sec:
+                    totp_secret = new_sec
+                    if ms_email:
+                        save_totp_cache(ms_email, totp_secret)
             except Exception as e:
-                _emit(cb, f"  ⚠️  MFA 注册异常: {e}")
+                _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
 
         # ④ Stay signed in / KMSI / 保持登录
@@ -1824,8 +1942,12 @@ async def do_azure_login(
                 _emit(cb, f"  ⚠️ 自动刷新异常: {e}")
 
     if not login_completed:
-        raise LoginNetworkError(f"微软账号登录未完成（疑似网络/代理卡顿），当前页面: {page.url[:180]}")
+        if ms_email and totp_secret:
+            save_totp_cache(ms_email, totp_secret)
+        raise LoginNetworkError(f"微软账号登录未完成（疑似网络/代理卡顿），当前页面: {page.url[:180]}", totp=totp_secret)
 
+    if ms_email and totp_secret:
+        save_totp_cache(ms_email, totp_secret)
     _emit(cb, f"  ✅ 微软账号登录完成，TOTP secret: {'已获取/已有' if totp_secret else '无需注册'}")
     return totp_secret
 

@@ -1347,6 +1347,12 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                                     p._captured_totp_secret = clean_sec
                                 except Exception:
                                     pass
+                            cb_func = getattr(ctx, "_on_totp_captured", None)
+                            if callable(cb_func):
+                                try:
+                                    cb_func(clean_sec)
+                                except Exception:
+                                    pass
                             log.info(f"[2FA] 网络层秒级捕获 SecretKey: {clean_sec}")
                     parts = []
                     for k, v in data.items():
@@ -1584,6 +1590,12 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
                             for p in getattr(ctx, "pages", []):
                                 try:
                                     p._captured_totp_secret = clean_sec
+                                except Exception:
+                                    pass
+                            cb_func = getattr(ctx, "_on_totp_captured", None)
+                            if callable(cb_func):
+                                try:
+                                    cb_func(clean_sec)
                                 except Exception:
                                     pass
             except Exception:

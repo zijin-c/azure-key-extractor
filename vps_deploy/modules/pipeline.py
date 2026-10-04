@@ -37,6 +37,7 @@ from utils.fingerprint import new_fingerprint_context
 from utils.xray_proxy import XrayProxyChain
 from utils.captcha_detector import check_captcha_present
 from utils.process_manager import BrowserProcessManager, get_playwright_driver_pid, safe_close_playwright
+from utils.totp_cache import save_totp_cache, get_cached_totp
 
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
@@ -425,6 +426,22 @@ async def process_account(
         if stats and proxy_obj and hasattr(stats, "set_proxy_bridge"):
             stats.set_proxy_bridge(proxy_obj)
         BrowserProcessManager.record_descendants(driver_pid)
+
+        # 启动账号时确保从缓存载入历史 2FA 密钥并挂载实时捕获回调
+        if not getattr(account, "totp_secret", ""):
+            cached_totp = get_cached_totp(account.email)
+            if cached_totp:
+                account.totp_secret = cached_totp
+                _emit(cb, f"  💾 从本地持久化缓存载入 2FA 密钥: {cached_totp[:4]}***")
+
+        def _on_secret_captured(secret_val: str):
+            if secret_val:
+                account.totp_secret = secret_val
+                save_totp_cache(account.email, secret_val)
+                _emit(cb, f"  💾 实时捕获并保存 2FA 密钥: {secret_val}")
+
+        ctx._on_totp_captured = _on_secret_captured
+
         c_ver = fp.get('chrome_ver', fp.get('major_ver', '152'))
         vp_info = fp.get('viewport', {'width': 1920, 'height': 1080})
         tz_info = fp.get('timezone', 'UTC')
@@ -458,9 +475,9 @@ async def process_account(
             )
             _emit(cb, "  🔑 登录就绪，直接提取 6 个目标产品的 Key...")
             keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl)
-            if totp_secret and not account.totp_secret:
+            if totp_secret:
                 account.totp_secret = totp_secret
-                _emit(cb, f"  💾 成功捕获并保存 2FA 密钥: {totp_secret}")
+                save_totp_cache(account.email, totp_secret)
             got_keys = {k: v for k, v in keys.items() if v}
             failed_keys = [k for k, v in keys.items() if not v]
             _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key")
@@ -484,9 +501,9 @@ async def process_account(
             existing_totp_secret=account.totp_secret,
             proxy_ctrl=proxy_ctrl,
         )
-        if totp_secret and not account.totp_secret:
+        if totp_secret:
             account.totp_secret = totp_secret
-            _emit(cb, f"  💾 成功捕获并保存 2FA 密钥: {totp_secret}")
+            save_totp_cache(account.email, totp_secret)
 
         # ── 步骤2: 确保主动定向到学生认证入口 ──────────────
         # 必须带上 returnUrl 到 studentverification，使微软账号上下文与学生认证严格绑定
@@ -652,9 +669,9 @@ async def process_account(
         # 直接调用 extract_all_keys，新开标签页直接导航到 software 页面
         _emit(cb, "  🌐 开始提取 key（新开标签页）...")
         keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl)
-        if totp_secret and not account.totp_secret:
+        if totp_secret:
             account.totp_secret = totp_secret
-            _emit(cb, f"  💾 成功捕获并保存 2FA 密钥: {totp_secret}")
+            save_totp_cache(account.email, totp_secret)
 
         # 统计结果
         got_keys = {k: v for k, v in keys.items() if v}
@@ -680,15 +697,14 @@ async def process_account(
         )
 
     except (EmailInputTimeoutError, LoginNetworkError, SheerIDVerificationError, AzureCaptchaError, PortalLoadError) as e:
-        saved_totp = getattr(e, 'totp', '') or (totp_secret if ('totp_secret' in locals() and totp_secret) else getattr(account, 'totp_secret', ''))
-        if saved_totp and not account.totp_secret:
+        saved_totp = getattr(e, 'totp', '') or (totp_secret if ('totp_secret' in locals() and totp_secret) else getattr(account, 'totp_secret', '')) or get_cached_totp(account.email)
+        if saved_totp:
             account.totp_secret = saved_totp
+            save_totp_cache(account.email, saved_totp)
             _emit(cb, f"  💾 已保存当前账号 2FA 密钥: {saved_totp}")
         if raise_network_retry:
             raise
         _emit(cb, f"  ❌ 处理异常: {e}")
-        if saved_totp:
-            _emit(cb, f"  💾 已保存当前账号 2FA 密钥: {saved_totp}")
         result = KeyResult(
             account=account,
             success=False,
@@ -697,10 +713,10 @@ async def process_account(
         )
     except Exception as e:
         _emit(cb, f"  ❌ 处理异常: {e}")
-        saved_totp = totp_secret if ('totp_secret' in locals() and totp_secret) else getattr(account, 'totp_secret', '')
-        if saved_totp and not account.totp_secret:
-            account.totp_secret = saved_totp
+        saved_totp = (totp_secret if ('totp_secret' in locals() and totp_secret) else getattr(account, 'totp_secret', '')) or get_cached_totp(account.email)
         if saved_totp:
+            account.totp_secret = saved_totp
+            save_totp_cache(account.email, saved_totp)
             _emit(cb, f"  💾 已保存当前账号 2FA 密钥: {saved_totp}")
         result = KeyResult(
             account=account,
@@ -838,7 +854,10 @@ async def run_pipeline(
                     )
                     break
                 except (SheerIDVerificationError, AzureCaptchaError) as e:
-                    saved_totp = getattr(account, 'totp_secret', '')
+                    saved_totp = getattr(account, 'totp_secret', '') or getattr(e, 'totp', '') or get_cached_totp(account.email)
+                    if saved_totp:
+                        account.totp_secret = saved_totp
+                        save_totp_cache(account.email, saved_totp)
                     totp_msg = f"，已留存 2FA 密钥 ({saved_totp[:6]}...)" if saved_totp else ""
                     if verify_retry < max_login_retries:
                         verify_retry += 1
@@ -855,7 +874,10 @@ async def run_pipeline(
                     _persist_result(result)
                     break
                 except (EmailInputTimeoutError, LoginNetworkError, PortalLoadError) as e:
-                    saved_totp = getattr(account, 'totp_secret', '')
+                    saved_totp = getattr(account, 'totp_secret', '') or getattr(e, 'totp', '') or get_cached_totp(account.email)
+                    if saved_totp:
+                        account.totp_secret = saved_totp
+                        save_totp_cache(account.email, saved_totp)
                     totp_msg = f"，已留存 2FA 密钥 ({saved_totp[:6]}...)" if saved_totp else ""
                     err_msg = str(e)
                     is_tunnel_err = any(k in err_msg for k in ["ERR_TUNNEL_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE", "ERR_PROXY", "502 Bad Gateway"])
