@@ -589,19 +589,26 @@ async def process_account(
                 last_change_time = asyncio.get_event_loop().time()
             else:
                 stagnant = asyncio.get_event_loop().time() - last_change_time
-                max_stagnant = 120 if is_confirming else (30 if "studentverification" in current_url else 45)
-                if stagnant >= max_stagnant and refresh_count < 3:
+                max_stagnant = 60 if is_confirming else 25
+                if stagnant >= max_stagnant and refresh_count < 2:
                     refresh_count += 1
                     last_change_time = asyncio.get_event_loop().time()
                     switched_p = None
                     if proxy_ctrl:
-                        switched_p = await proxy_ctrl.switch_next()
+                        try:
+                            switched_p = await proxy_ctrl.switch_next()
+                        except Exception:
+                            pass
                     p_msg = f"，已热切换至代理: {switched_p}" if switched_p else ""
-                    _emit(cb, f"  ⚠️ [网络延迟适配] 界面 {int(stagnant)} 秒无响应{p_msg}，重新加载学生认证页面 ({refresh_count}/3)...")
+                    _emit(cb, f"  ⚠️ [网络延迟适配] 界面 {int(stagnant)} 秒无响应{p_msg}，重新加载学生认证页面 ({refresh_count}/2)...")
                     try:
-                        await page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=45000)
+                        await page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=25000)
                     except Exception as e:
                         _emit(cb, f"  ⚠️ 重新导航异常: {e}")
+                elif stagnant >= max_stagnant and refresh_count >= 2:
+                    if account.email and account.totp_secret:
+                        save_totp_cache(account.email, account.totp_secret)
+                    raise LoginNetworkError("学生认证界面停滞超过 25 秒无响应（疑似网络/代理卡顿），换代理重试", totp=account.totp_secret)
 
             # 已注册就绪标志 (必须已脱离 studentverification 注册入口，或直接在 Portal 中)
             if "portal.azure.com" in current_url or (

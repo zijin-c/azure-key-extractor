@@ -160,9 +160,9 @@ PRODUCTS_TO_EXTRACT = [
 CONCURRENCY = int(os.getenv("CONCURRENCY", "1"))
 
 # ── 超时 ─────────────────────────────────────────────────────
-PAGE_LOAD_TIMEOUT  = int(os.getenv("PAGE_LOAD_TIMEOUT", "90000"))
-ELEMENT_TIMEOUT    = int(os.getenv("ELEMENT_TIMEOUT", "30000"))
-PORTAL_WAIT        = int(os.getenv("PORTAL_WAIT", "120"))   # 等待 portal 加载最大秒数
+PAGE_LOAD_TIMEOUT  = int(os.getenv("PAGE_LOAD_TIMEOUT", "45000"))   # 页面初始加载超时（优化至 45 秒，拒绝长死等）
+ELEMENT_TIMEOUT    = int(os.getenv("ELEMENT_TIMEOUT", "25000"))     # 元素查找超时（优化至 25 秒）
+PORTAL_WAIT        = int(os.getenv("PORTAL_WAIT", "50"))            # 等待 portal 加载最大秒数（优化至 50 秒，25s刷新重试一次）
 
 # ── 批次运行与自动重启 ─────────────────────────────────────────
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "0"))  # 批次大小（默认 0 表示不分批一次性连续跑完；若 >0 则按批次划分）

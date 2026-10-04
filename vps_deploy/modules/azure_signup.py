@@ -332,7 +332,7 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
 
         # ── 等待 Verify 按钮激活变蓝（Turnstile 通过） ────
         button_ready = False
-        for _pb in range(90):
+        for _pb in range(40):
             is_captcha, cap_msg = await check_captcha_present(page)
             if is_captcha:
                 raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
@@ -450,11 +450,11 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             await asyncio.sleep(1)
 
         if not button_ready:
-            _emit(cb, "  ⚠️ Verify 按钮在 90 秒内未激活变蓝")
+            _emit(cb, "  ⚠️ Verify 按钮在 40 秒内未激活变蓝")
             if attempt < max_attempts:
                 _emit(cb, f"  ⚠️ 正在自动刷新页面重试 (第 {attempt+1}/{max_attempts} 次)...")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                    await page.reload(wait_until="domcontentloaded", timeout=25000)
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -554,7 +554,7 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             if attempt < max_attempts:
                 _emit(cb, f"  ⚠️ SheerID 提交后超时未确认成功，正在自动刷新页面重试 (第 {attempt+1}/{max_attempts} 次)...")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                    await page.reload(wait_until="domcontentloaded", timeout=25000)
                 except Exception:
                     pass
                 await asyncio.sleep(2)

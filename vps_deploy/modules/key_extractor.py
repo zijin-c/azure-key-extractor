@@ -52,11 +52,11 @@ class PortalLoadError(RuntimeError):
         self.totp = totp or ""
 
 
-async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 120,
+async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 50,
                                    totp_secret: str = "", ms_email: str = "", proxy_ctrl: Optional[Any] = None) -> tuple[bool, str]:
     """等待 Azure Portal 完全加载（出现导航栏或搜索框）。
     在等待过程中实时感知 2FA / 登录重定向并自动输入 TOTP 验证码。
-    如果超过 2 分钟没响应，强制重新导航到 Education Software 页面。
+    如果超过 25 秒没响应，强制重新导航到 Education Software 页面。
     """
     _EDU_SW_URL = (
         "https://portal.azure.com/#view/Microsoft_Azure_Education"
@@ -116,17 +116,17 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
         except Exception:
             pass
 
-        # 超过 45 秒未就绪，强制重新导航/刷新（只重试一次）
+        # 超过 25 秒未就绪，强制重新导航/刷新（只重试一次）
         elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed > 45 and not retry_done:
+        if elapsed > 25 and not retry_done:
             retry_done = True
-            _emit(cb, "  ⚠️  Portal 加载超过 45 秒未就绪，强制重新导航/刷新...")
+            _emit(cb, "  ⚠️  Portal 加载超过 25 秒未就绪，强制重新导航/刷新...")
             try:
-                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=30000)
                 _emit(cb, "  🔄 已重新导航到 Education Software 页面")
             except Exception as e:
                 _emit(cb, f"  ⚠️  重新导航异常: {e}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.5)
 
             # 重新导航后可能触发 MFA 登录流程，用已有 secret 处理
             _emit(cb, "  🔍 检查是否需要重新 MFA...")
@@ -139,8 +139,7 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
         await asyncio.sleep(1)
 
-    _emit(cb, "  ⚠️  Portal 加载超时，尝试继续...")
-    return False, current_totp
+    raise PortalLoadError("Azure Portal 加载超过 25 秒仍未就绪（框架加载超时/代理卡顿），换代理重试", totp=current_totp)
 
 
 async def _is_mfa_login_prompt(page: Page) -> bool:
@@ -538,8 +537,8 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
     if not view_key_clicked:
         _emit(cb, "  ℹ️  未直接匹配到 View Key 按钮，保持面板打开并持续轮询提取...")
 
-    # ── 第三阶段：持续轮询提取 key（最多 50 次 * 0.5s = 25 秒）───
-    for attempt in range(50):
+    # ── 第三阶段：持续轮询提取 key（最多 26 次 * 0.5s = 13 秒）───
+    for attempt in range(26):
         await asyncio.sleep(0.5)
 
         # 扫描所有框架提取 key
@@ -1070,9 +1069,9 @@ async def extract_all_keys(
         await _handle_terms_flow(sw_page, cb)
 
         # ── 等待软件列表加载（必须确认出现产品数据行）─────────────────
-        _emit(cb, "  ⏳ 等待软件列表加载...")
+        _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")
         list_ready = False
-        for w in range(55):
+        for w in range(35):
             await asyncio.sleep(1)
             for frame in [sw_page] + list(sw_page.frames):
                 try:
@@ -1108,26 +1107,41 @@ async def extract_all_keys(
             if w == 25:
                 _emit(cb, "  🔄 软件列表 25 秒未加载，重新导航 Education Software 页面...")
                 try:
-                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=60000)
+                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
                 except Exception as e:
                     _emit(cb, f"  ⚠️ 重新导航异常: {str(e)[:80]}")
 
         if not list_ready:
-            raise PortalLoadError("软件列表始终未加载（Portal 网络/代理卡顿），需换代理重试", totp=updated_totp)
+            raise PortalLoadError("软件列表超过 25 秒未加载（Portal 网络/代理卡顿），需换代理重试", totp=updated_totp)
 
         await asyncio.sleep(0.5)
 
         # ── 对每个产品提取 key ───────────────────────────────
         failed_products = []
+        consecutive_search_fails = 0
 
         for product_name in config.PRODUCTS_TO_EXTRACT:
-            # 检查是否偏离 Education Software 页面（例如意外退回 #home）
-            cur_u = (sw_page.url or "").lower()
-            if "educationmenublade" not in cur_u or "#home" in cur_u:
-                _emit(cb, "  ⚠️ 检测到偏离 Education Software 页面，重新导航回到软件页...")
+            # 检查是否真正偏离了软件页：只有当页面上完全没有搜索框和软件列表时，才判定偏离并重导航
+            has_sw_dom = False
+            for frame in [sw_page] + list(sw_page.frames):
                 try:
-                    await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL, wait_until="domcontentloaded", timeout=60000)
-                    await asyncio.sleep(2)
+                    has_sw_dom = await frame.evaluate("""
+                        () => !!(document.querySelector('input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]') ||
+                                 document.querySelector('.ms-SearchBox') ||
+                                 document.querySelector('[role="grid"]') ||
+                                 document.querySelector('[role="row"]'))
+                    """)
+                    if has_sw_dom:
+                        break
+                except Exception:
+                    pass
+
+            cur_u = (sw_page.url or "").lower()
+            if not has_sw_dom and ("educationmenublade" not in cur_u or "#home" in cur_u):
+                _emit(cb, "  ⚠️ 检测到偏离 Education Software 页面且无软件元素，重新导航回到软件页...")
+                try:
+                    await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL, wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(1.5)
                 except Exception:
                     pass
 
@@ -1139,7 +1153,12 @@ async def extract_all_keys(
                 _emit(cb, f"  ⚠️  搜索失败，跳过: {product_name}")
                 keys[product_name] = ""
                 failed_products.append(product_name)
+                consecutive_search_fails += 1
+                if consecutive_search_fails >= 2:
+                    raise PortalLoadError("软件搜索框连续 2 次无响应（页面渲染异常/代理卡顿），换代理重试", totp=updated_totp)
                 continue
+            else:
+                consecutive_search_fails = 0
 
             await asyncio.sleep(0.5)
 
@@ -1243,48 +1262,59 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     has_banner = False
     detected_text = ""
 
-    for check_round in range(1, 3):  # 最多 2 轮（第 1 轮 45s，未找到则刷新后第 2 轮 45s）
-        if check_round == 1:
-            _emit(cb, "  🔍 检测 Terms 协议横幅（每秒轮询，最多 45 秒）...")
-        else:
-            _emit(cb, "  🔄 45 秒未检测到横幅，正在刷新页面重新检测 Terms 横幅（最多 45 秒）...")
+    _emit(cb, "  🔍 检测 Terms 协议横幅（最多 25 秒，支持就绪秒级直通）...")
+    for w in range(25):
+        await asyncio.sleep(1)
+        for frame in [sw_page] + list(sw_page.frames):
             try:
-                await sw_page.reload(wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(3)
-            except Exception as e:
-                _emit(cb, f"  ⚠️ 刷新页面异常: {e}")
+                r = await frame.evaluate(r"""
+                    () => {
+                        const txt = (document.body ? document.body.innerText : '') || '';
+                        if (txt.includes("couldn't confirm you have accepted") ||
+                            txt.includes("could not confirm you have accepted") ||
+                            txt.includes("accept the terms here") ||
+                            txt.includes("Please accept the terms") ||
+                            txt.includes("Terms Acceptance") ||
+                            txt.includes("接受条款") ||
+                            txt.includes("请在此处接受条款")) {
+                            return { found: true, text: txt.substring(0, 150) };
+                        }
+                        return { found: false };
+                    }
+                """)
+                if isinstance(r, dict) and r.get("found"):
+                    has_banner = True
+                    detected_text = r.get("text", "")
+                    break
+            except Exception:
+                pass
+        if has_banner:
+            break
 
-        for w in range(45):
-            await asyncio.sleep(1)
+        # 智能短路直通：若轮询超过 3 秒，且页面已渲染出产品列表或搜索输入框，且无 Terms 横幅
+        # 说明条款早已签署完毕，直接秒级跳过 Terms 流程，无需干等！
+        if w >= 3:
+            sw_ready = False
             for frame in [sw_page] + list(sw_page.frames):
                 try:
-                    r = await frame.evaluate("""
+                    sw_ready = await frame.evaluate("""
                         () => {
-                            const txt = (document.body ? document.body.innerText : '') || '';
-                            if (txt.includes("couldn't confirm you have accepted") ||
-                                txt.includes("could not confirm you have accepted") ||
-                                txt.includes("accept the terms here") ||
-                                txt.includes("Please accept the terms") ||
-                                txt.includes("Terms Acceptance") ||
-                                txt.includes("接受条款") ||
-                                txt.includes("请在此处接受条款")) {
-                                const m = txt.match(/[^\\n]*(couldn't confirm|could not confirm|accept the terms|Terms Acceptance|接受条款)[^\\n]*/i);
-                                return { found: true, text: m ? m[0].substring(0, 200) : '' };
-                            }
-                            return { found: false };
+                            const has_search = !!document.querySelector('input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]');
+                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"]')];
+                            const has_items = items.some(el => {
+                                const t = (el.innerText || el.textContent || '').toLowerCase();
+                                return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') || t.includes('access') || t.includes('project') || t.includes('visio');
+                            });
+                            return has_search || has_items;
                         }
                     """)
-                    if isinstance(r, dict) and r.get("found"):
-                        has_banner = True
-                        detected_text = r.get("text", "")
+                    if sw_ready:
                         break
                 except Exception:
                     pass
-            if has_banner:
-                break
-
-        if has_banner:
-            break
+            if sw_ready:
+                _emit(cb, "  ℹ️  软件列表/搜索框已就绪且无 Terms 横幅，直接进入软件提取")
+                return
 
     if not has_banner:
         _emit(cb, f"  ℹ️  无 Terms 横幅，直接进入软件提取")
