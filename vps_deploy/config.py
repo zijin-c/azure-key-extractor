@@ -169,4 +169,8 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "0"))  # 批次大小（默认 0 表示
 AUTO_RESTART_ON_BATCH = os.getenv("AUTO_RESTART_ON_BATCH", "false").lower() == "true"  # 批次完成自动强制重启（默认已关闭）
 AUTO_RESTART_ON_COMPLETE = os.getenv("AUTO_RESTART_ON_COMPLETE", "false").lower() == "true"  # 全部完成自动强制重启（默认关闭，避免产生多余僵尸后台 Python 进程）
 
+# ── 网络与代理重试 ─────────────────────────────────────────
+NETWORK_PROXY_RETRIES = int(os.getenv("NETWORK_PROXY_RETRIES", "3"))  # 页面加载卡顿/提Key失败时换代理重试的最大次数
+
+
 

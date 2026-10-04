@@ -44,6 +44,13 @@ def _emit(cb: ProgressCallback, msg: str):
         cb(msg)
 
 
+class PortalLoadError(RuntimeError):
+    """Azure Portal / Education Software 页面因网络/代理卡顿无法正常加载（可换代理重试）。"""
+    def __init__(self, msg: str, totp: str = ""):
+        super().__init__(msg)
+        self.totp = totp or ""
+
+
 async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 120,
                                    totp_secret: str = "", ms_email: str = "", proxy_ctrl: Optional[Any] = None) -> tuple[bool, str]:
     """等待 Azure Portal 完全加载（出现导航栏或搜索框）。
@@ -1027,7 +1034,7 @@ async def extract_all_keys(
                     _emit(cb, f"  ⚠️  导航失败（第{attempt+1}次）: {str(e)[:60]}，重试...")
                     await asyncio.sleep(3)
                 else:
-                    raise
+                    raise PortalLoadError(f"Education Software 页面导航失败（网络/代理卡顿）: {str(e)[:120]}", totp=totp_secret)
 
     # 仅当明确处于微软登录/2FA重定向页面时，才前置触发 MFA 处理
     cur_u = (sw_page.url or "").lower()
@@ -1052,7 +1059,7 @@ async def extract_all_keys(
         # ── 等待软件列表加载（必须确认出现产品数据行）─────────────────
         _emit(cb, "  ⏳ 等待软件列表加载...")
         list_ready = False
-        for w in range(40):
+        for w in range(55):
             await asyncio.sleep(1)
             for frame in [sw_page] + list(sw_page.frames):
                 try:
@@ -1083,6 +1090,17 @@ async def extract_all_keys(
                         await _handle_terms_flow(sw_page, cb)
                 except Exception:
                     pass
+
+            # 25 秒仍未就绪：重新导航软件页再给一次机会
+            if w == 25:
+                _emit(cb, "  🔄 软件列表 25 秒未加载，重新导航 Education Software 页面...")
+                try:
+                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    _emit(cb, f"  ⚠️ 重新导航异常: {str(e)[:80]}")
+
+        if not list_ready:
+            raise PortalLoadError("软件列表始终未加载（Portal 网络/代理卡顿），需换代理重试", totp=updated_totp)
 
         await asyncio.sleep(0.5)
 
@@ -1180,6 +1198,8 @@ async def extract_all_keys(
                 await _close_panel(sw_page)
                 await _clear_search(sw_page)
 
+    except PortalLoadError:
+        raise
     except Exception as e:
         _emit(cb, f"  ❌ 提取 key 过程异常: {e}")
         ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
@@ -1188,6 +1208,10 @@ async def extract_all_keys(
             await sw_page.screenshot(path=os.path.join(ss_dir, "key_extract_error.png"))
         except Exception:
             pass
+
+    # 一个 key 都没拿到：通常是 Portal 网络卡顿导致页面异常，交给上层换代理重试
+    if not any(v for v in keys.values()):
+        raise PortalLoadError("本轮 0 个 key（页面加载/搜索异常，疑似网络卡顿），需换代理重试", totp=updated_totp)
 
     return keys, updated_totp
 

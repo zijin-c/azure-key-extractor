@@ -1824,7 +1824,7 @@ async def do_azure_login(
                 _emit(cb, f"  ⚠️ 自动刷新异常: {e}")
 
     if not login_completed:
-        raise RuntimeError(f"微软账号登录未完成，当前页面: {page.url[:180]}")
+        raise LoginNetworkError(f"微软账号登录未完成（疑似网络/代理卡顿），当前页面: {page.url[:180]}")
 
     _emit(cb, f"  ✅ 微软账号登录完成，TOTP secret: {'已获取/已有' if totp_secret else '无需注册'}")
     return totp_secret
