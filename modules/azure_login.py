@@ -944,17 +944,21 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         if state == "install_auth":
             _emit(cb, "  📱 「Install Microsoft Authenticator」→ 切换第三方验证器...")
             clicked_alt = False
-            # 1. 优先通过原生 JS 全 DOM 扫描并模拟点击第三方验证器切换链接（极速、穿透 Shadow/Iframe/延迟）
+            # 1. 优先通过原生 JS 全 DOM 扫描并模拟点击第三方验证器切换链接（严格排除切换账号 / 取消链接）
             try:
                 clicked_alt = await page.evaluate(r"""
                     () => {
                         const els = [...document.querySelectorAll('a, button, span, [role="link"], [role="button"]')];
                         for (const el of els) {
                             const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                            if (txt.includes('different authenticator') || 
-                                txt.includes('different authentication') || 
-                                txt.includes('different method') ||
-                                txt.includes('使用其他') || txt.includes('其他验证') || txt.includes('其他方法')) {
+                            if (txt.includes('different account') || txt.includes('其他账户') || txt.includes('其他帐户') || txt.includes('另一个账户') || txt.includes('use another account')) {
+                                continue;
+                            }
+                            if ((txt.includes('different authenticator') || 
+                                 txt.includes('different authentication') || 
+                                 txt.includes('different method') ||
+                                 txt.includes('使用其他') || txt.includes('其他验证') || txt.includes('其他方法')) &&
+                                !txt.includes('account') && !txt.includes('账户') && !txt.includes('帐户')) {
                                 el.click();
                                 return true;
                             }
@@ -973,13 +977,13 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     "a:has-text('Set up a different authentication app')",
                     "button:has-text('Set up a different authentication app')",
                     "a:has-text('I want to set up a different method')",
-                    "a:has-text('Other options')",
-                    "text='I want to use a different authenticator app'",
-                    "text='Set up a different authentication app'",
+                    "a:has-text('我想使用其他身份验证应用')",
+                    "a:has-text('使用其他验证器应用')",
+                    "a:has-text('我想使用其他验证器')",
                 ]:
                     try:
                         loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=200):
+                        if await loc.is_visible(timeout=150):
                             await loc.scroll_into_view_if_needed()
                             await loc.click(force=True)
                             clicked_alt = True
@@ -1021,10 +1025,14 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         const els = [...document.querySelectorAll('a, button, span, [role="link"], [role="button"]')];
                         for (const el of els) {
                             const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
-                            if (txt.includes('different authenticator') || 
-                                txt.includes('different authentication') || 
-                                txt.includes('different method') ||
-                                txt.includes('使用其他') || txt.includes('其他验证')) {
+                            if (txt.includes('different account') || txt.includes('其他账户') || txt.includes('其他帐户') || txt.includes('另一个账户') || txt.includes('use another account')) {
+                                continue;
+                            }
+                            if ((txt.includes('different authenticator') || 
+                                 txt.includes('different authentication') || 
+                                 txt.includes('different method') ||
+                                 txt.includes('使用其他') || txt.includes('其他验证') || txt.includes('其他方法')) &&
+                                !txt.includes('account') && !txt.includes('账户') && !txt.includes('帐户')) {
                                 el.click();
                                 return true;
                             }
@@ -1040,8 +1048,8 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     "a:has-text('I want to use a different authenticator app')",
                     "button:has-text('I want to use a different authenticator app')",
                     "a:has-text('Set up a different authentication app')",
-                    "a:has-text('Other options')",
-                    "text='I want to use a different authenticator app'",
+                    "a:has-text('我想使用其他身份验证应用')",
+                    "a:has-text('使用其他验证器应用')",
                 ]:
                     try:
                         loc = page.locator(alt_sel).first
@@ -1268,7 +1276,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 _emit(cb, "  ⚠️ TOTP 验证码校验未通过，准备重新生成填入...")
                                 break
 
-                            # 2. 检测是否到达成功完成/Done 界面（直接点击 Done/完成 并退出）
+                            # 2. 检测是否到达成功完成/Done 界面（点击 Done/完成 并等待页面离开 mysignins）
                             has_done = await page.evaluate("""() => {
                                 const btns = [...document.querySelectorAll('button, input[type=button], input[type=submit], a, [role="button"]')];
                                 const doneBtn = btns.find(b => {
@@ -1291,9 +1299,36 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                     "button:has-text('Next')", "input[value='Next']",
                                     "button:has-text('下一步')"
                                 ], timeout=2000)
+                                try:
+                                    await page.evaluate("""() => {
+                                        const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
+                                        for (const b of btns) {
+                                            const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                                            if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步') {
+                                                b.click();
+                                                break;
+                                            }
+                                        }
+                                    }""")
+                                except Exception:
+                                    pass
                                 await asyncio.sleep(1.0)
-                                if "kmsi" in (page.url or "").lower():
-                                    await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
+                                for _w2 in range(20):
+                                    if await _azure_destination_ready(page, page.url or ""):
+                                        _emit(cb, "  ✅ 已进入 Azure 业务页面")
+                                        return secret
+                                    cur_u2 = (page.url or "").lower()
+                                    if "kmsi" in cur_u2:
+                                        _emit(cb, "  ✅ 到达「保持登录」界面，点击 Yes...")
+                                        await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
+                                        await asyncio.sleep(1.0)
+                                        if await _azure_destination_ready(page, page.url or ""):
+                                            _emit(cb, "  ✅ 已进入 Azure 业务页面")
+                                            return secret
+                                        break
+                                    if "mysignins.microsoft.com" not in cur_u2:
+                                        break
+                                    await asyncio.sleep(0.5)
                                 _emit(cb, "  ✅ MFA 绑定已完成，退出 MFA 流程")
                                 return secret
 
@@ -1305,7 +1340,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 _emit(cb, "  ✅ 登录完成，退出 MFA 流程")
                                 return secret
 
-                            # 4. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交并通过，正在跳转中）
+                            # 4. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交，正在等待 Done 画面或跳转）
                             has_input = await page.evaluate("""() => {
                                 const sels = ["input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC", "input[name='VerificationCode']", "input#VerificationCode", "input#otc"];
                                 for (const s of sels) {
@@ -1315,12 +1350,29 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 return false;
                             }""")
                             if not has_input and not is_code_error:
-                                _emit(cb, "  ✅ TOTP 提交成功（验证码框已消失），等待跳转...")
-                                await asyncio.sleep(1.5)
-                                if "kmsi" in (page.url or "").lower():
-                                    await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
-                                _emit(cb, "  ✅ 2FA 验证已通过，退出 MFA 流程")
-                                return secret
+                                # 尝试点击可能刚渲染出的 Done / 完成 / Next 按钮推进
+                                await _click_first_visible(page, [
+                                    "button:has-text('Done')", "input[value='Done']",
+                                    "[role='button']:has-text('Done')", "button:has-text('完成')",
+                                    "button:has-text('Finish')", "button:has-text('Next')",
+                                    "input[value='Next']", "button:has-text('下一步')"
+                                ], timeout=1000)
+                                try:
+                                    await page.evaluate("""() => {
+                                        const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
+                                        for (const b of btns) {
+                                            const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                                            if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步') {
+                                                b.click();
+                                                break;
+                                            }
+                                        }
+                                    }""")
+                                except Exception:
+                                    pass
+                                if "mysignins.microsoft.com" not in cur_u:
+                                    _emit(cb, "  ✅ 2FA 验证已通过并已脱离 MFA 页面")
+                                    return secret
                         except Exception:
                             pass
                 else:
@@ -1566,6 +1618,31 @@ async def do_azure_login(
     totp_secret = existing_totp_secret or (get_cached_totp(ms_email) if ms_email else "")
     if totp_secret and not existing_totp_secret:
         _emit(cb, f"  💾 从本地持久化缓存载入历史 2FA 密钥: {totp_secret[:4]}***")
+
+    # ── 注册 MFA 密钥全自动化网络拦截器 (0毫秒级秒级捕获) ─────────────
+    async def _on_mfa_response(resp):
+        try:
+            r_url = resp.url.lower()
+            if "initializemobileapp" in r_url or "authenticationmethods" in r_url:
+                try:
+                    import json
+                    r_text = await resp.text()
+                    r_data = json.loads(r_text)
+                    if isinstance(r_data, dict):
+                        sec = r_data.get("SecretKey") or r_data.get("secretKey") or r_data.get("Secret")
+                        if sec and _is_valid_totp_secret(sec):
+                            clean_s = sec.replace(" ", "").replace("-", "").upper()
+                            ctx._captured_totp_secret = clean_s
+                            page._captured_totp_secret = clean_s
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        page.on("response", _on_mfa_response)
+    except Exception:
+        pass
 
     # ── 第一步：打开目标入口 URL ─────────────
     default_login_target = getattr(config, "AZURE_SIGNUP_LOGIN_URL", config.AZURE_SIGNUP_URL)
@@ -1932,6 +2009,27 @@ async def do_azure_login(
                     totp_secret = new_sec
                     if ms_email:
                         save_totp_cache(ms_email, totp_secret)
+                for _w in range(16):
+                    if await _azure_destination_ready(page, page.url or ""):
+                        _emit(cb, "  ✅ 已确认进入 Azure 业务页面")
+                        login_completed = True
+                        break
+                    cur_u = (page.url or "").lower()
+                    if "kmsi" in cur_u:
+                        _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
+                        await _click_first_visible(page, [
+                            "input#idSIButton9", "button#idSIButton9",
+                            "input[type='submit'][value='Yes']", "button:has-text('Yes')",
+                        ], timeout=2000)
+                        await asyncio.sleep(1.0)
+                        if await _azure_destination_ready(page, page.url or ""):
+                            login_completed = True
+                            break
+                    if "mysignins.microsoft.com" not in cur_u:
+                        break
+                    await asyncio.sleep(0.5)
+                if login_completed:
+                    break
             except Exception as e:
                 _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
@@ -1959,6 +2057,27 @@ async def do_azure_login(
                     totp_secret = new_sec
                     if ms_email:
                         save_totp_cache(ms_email, totp_secret)
+                for _w in range(16):
+                    if await _azure_destination_ready(page, page.url or ""):
+                        _emit(cb, "  ✅ 已确认进入 Azure 业务页面")
+                        login_completed = True
+                        break
+                    cur_u = (page.url or "").lower()
+                    if "kmsi" in cur_u:
+                        _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
+                        await _click_first_visible(page, [
+                            "input#idSIButton9", "button#idSIButton9",
+                            "input[type='submit'][value='Yes']", "button:has-text('Yes')",
+                        ], timeout=2000)
+                        await asyncio.sleep(1.0)
+                        if await _azure_destination_ready(page, page.url or ""):
+                            login_completed = True
+                            break
+                    if "mysignins.microsoft.com" not in cur_u:
+                        break
+                    await asyncio.sleep(0.5)
+                if login_completed:
+                    break
             except Exception as e:
                 _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
