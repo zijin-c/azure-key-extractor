@@ -52,17 +52,17 @@ class PortalLoadError(RuntimeError):
         self.totp = totp or ""
 
 
-async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 25,
+async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 45,
                                    totp_secret: str = "", ms_email: str = "", proxy_ctrl: Optional[Any] = None) -> tuple[bool, str]:
     """等待 Azure Portal 完全加载（出现导航栏或搜索框）。
     在等待过程中实时感知 2FA / 登录重定向并自动输入 TOTP 验证码。
-    如果超过 12 秒没响应，强制重新导航到 Education Software 页面。
+    如果超过 30 秒没响应，强制重新导航到 Education Software 页面。
     """
     _EDU_SW_URL = (
         "https://portal.azure.com/#view/Microsoft_Azure_Education"
         "/EducationMenuBlade/~/software"
     )
-    _emit(cb, "  ⏳ 等待 Azure Portal 加载（最多 25 秒）...")
+    _emit(cb, f"  ⏳ 等待 Azure Portal 加载（最多 {timeout} 秒）...")
     start_time = asyncio.get_event_loop().time()
     deadline = start_time + timeout
     retry_done = False
@@ -116,13 +116,13 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
         except Exception:
             pass
 
-        # 超过 12 秒未就绪，强制重新导航/刷新（只重试一次）
+        # 超过 30 秒未就绪，强制重新导航/刷新（只重试一次）
         elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed > 12 and not retry_done:
+        if elapsed > 30 and not retry_done:
             retry_done = True
-            _emit(cb, "  ⚠️  Portal 加载超过 12 秒未就绪，尝试重新导航/刷新...")
+            _emit(cb, "  ⚠️  Portal 加载超过 30 秒未就绪，尝试重新导航/刷新...")
             try:
-                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
                 _emit(cb, "  🔄 已重新导航到 Education Software 页面")
             except Exception as e:
                 _emit(cb, f"  ⚠️  重新导航异常: {e}")
@@ -139,7 +139,7 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
         await asyncio.sleep(1)
 
-    _emit(cb, "  ⚠️  Portal 加载超过 25 秒仍未就绪，尝试继续提取...")
+    _emit(cb, f"  ⚠️  Portal 加载超过 {timeout} 秒仍未就绪，尝试继续提取...")
     return False, current_totp
 
 
@@ -1238,13 +1238,15 @@ async def extract_all_keys(
                     pass
 
             cur_u = (sw_page.url or "").lower()
-            if not has_sw_dom and ("educationmenublade" not in cur_u or "#home" in cur_u):
-                _emit(cb, "  ⚠️ 检测到偏离 Education Software 页面且无软件元素，重新导航回到软件页...")
-                try:
-                    await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL, wait_until="domcontentloaded", timeout=25000)
-                    await asyncio.sleep(1.5)
-                except Exception:
-                    pass
+            if not has_sw_dom:
+                _emit(cb, "  ⚠️ 未检测到软件列表 DOM，尝试激活 Software 菜单或重新导航...")
+                switched = await _ensure_software_blade_active(sw_page, cb)
+                if not switched:
+                    try:
+                        await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL, wait_until="domcontentloaded", timeout=25000)
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
 
             _emit(cb, f"\n  📦 处理产品: {product_name}")
             search_term = _PRODUCT_SEARCH_MAP.get(product_name, product_name.split()[0])

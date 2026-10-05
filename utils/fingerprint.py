@@ -697,7 +697,10 @@ class LocalHttpCache:
         "arkose", "arkoselabs", "funcaptcha", "powseq", "turnstile",
         "challenges.cloudflare.com", "cloudflare.com", "challenge-platform",
         "hcaptcha", "recaptcha", "geetest",
-        "sheerid", "services.sheerid.com", "cdn.sheerid.com",
+        # 仅放行 SheerID 动态核验/提交/组织搜索 API，静态 JS/CSS/字体放行强缓存
+        "services.sheerid.com/api/", "services.sheerid.com/rest/",
+        "services.sheerid.com/verify/", "services.sheerid.com/submission/",
+        "services.sheerid.com/orgsearch", "sheerid.com/api/",
         # 动态认证/登录授权交互接口（注意：精确指定动态接口路径，确保域名的静态JS/CSS正常享受本地强缓存与省流）
         "/common/oauth2/", "/oauth20_authorize", "/login.srf",
         "/kmsi", "/kmsi.srf", "/getcredentialtype", "/getsessionstate",
@@ -984,7 +987,8 @@ class LocalHttpCache:
             return True
         if any(path in clean for path in (
             "/content/dynamic/", "/content/portalrequireconfig/",
-            "/bundle/", "/shared/1.0/", "/ests/2.1/", "/fonts/", "/content/scripts/"
+            "/bundle/", "/shared/1.0/", "/ests/2.1/", "/fonts/", "/content/scripts/",
+            "cdn.sheerid.com", "services.sheerid.com/assets/"
         )):
             return True
         return False
@@ -1167,8 +1171,15 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
     TELEMETRY_PATTERNS = (
         "browser.events.data.microsoft.com",
+        "events.data.microsoft.com",
         "portal.azure.com/api/telemetry",
+        "portal.azure.com/azurehubs/api/telemetry",
+        "/azurehubs/api/telemetry",
+        "/api/telemetry",
         "portal.azure.com/api/clientlog",
+        "portal.azure.com/azurehubs/api/clientlog",
+        "/azurehubs/api/clientlog",
+        "/api/clientlog",
         "signup.azure.com/api/clientlog",
         "pipe.aria.microsoft.com",
         "vortex.data.microsoft.com",
@@ -1180,6 +1191,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         "mobile.events.data.microsoft.com",
         "onesettings-bn2.met.live.com",
         "web.vortex.data.microsoft.com",
+        "/api/diagnostics",
     )
 
     BLOCKED_IMAGE_EXTS = (
@@ -1214,15 +1226,17 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             if stats:
                 stats.record_blocked(est_size=60000)
             fulfilled_request_ids.add(id(request))
-            if "browser.events.data.microsoft.com" in url_lower:
+            if "events.data.microsoft.com" in url_lower:
                 resp_body = b'{"statusCode":200,"itemsReceived":1,"itemsAccepted":1,"errors":[]}'
             else:
                 resp_body = b'{"status":"success"}'
+            origin = request.headers.get("origin") or "*"
             await route.fulfill(
                 body=resp_body,
                 headers={
                     "content-type": "application/json",
-                    "access-control-allow-origin": "*",
+                    "access-control-allow-origin": origin,
+                    "access-control-allow-credentials": "true",
                     "access-control-allow-methods": "GET, POST, OPTIONS, PING",
                     "access-control-allow-headers": "*",
                 },
@@ -1543,6 +1557,10 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--enforce-webrtc-ip-permission-check",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-pings",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-sync",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -1570,7 +1588,6 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "ignore_default_args": [
             "--enable-automation",
             "--disable-popup-blocking",
-            "--disable-component-update",
             "--disable-default-apps",
             "--disable-extensions",
         ],

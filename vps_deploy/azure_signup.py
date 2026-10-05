@@ -332,7 +332,7 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
 
         # ── 等待 Verify 按钮激活变蓝（Turnstile 通过） ────
         button_ready = False
-        for _pb in range(90):
+        for _pb in range(40):
             is_captcha, cap_msg = await check_captcha_present(page)
             if is_captcha:
                 raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
@@ -450,11 +450,11 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             await asyncio.sleep(1)
 
         if not button_ready:
-            _emit(cb, "  ⚠️ Verify 按钮在 90 秒内未激活变蓝")
+            _emit(cb, "  ⚠️ Verify 按钮在 40 秒内未激活变蓝")
             if attempt < max_attempts:
                 _emit(cb, f"  ⚠️ 正在自动刷新页面重试 (第 {attempt+1}/{max_attempts} 次)...")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                    await page.reload(wait_until="domcontentloaded", timeout=25000)
                 except Exception:
                     pass
                 await asyncio.sleep(2)
@@ -526,20 +526,30 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             except Exception:
                 body_lower = ""
 
+            # 0. 明确拒绝/审核失败/要求上传文档/封控拦截
+            if any(k in body_lower for k in (
+                "unable to verify", "could not verify", "not eligible", "unfortunately",
+                "upload documentation", "upload a document", "please upload", "upload proof",
+                "document required", "maximum verification attempts", "we need more information",
+                "无法验证", "不符合资格", "请上传", "上传文档", "上传学生证明", "已达到最大验证尝试次数"
+            )):
+                _emit(cb, "  ❌ SheerID 学术审核明确被拒 / 需要人工上传证明文件")
+                raise SheerIDVerificationError("SheerID 审核未通过: 账号被拒或要求人工上传学生证件")
+
             # 1. 成功跳转到 Portal / 业务平台 / 注册 Offer 页面
             if "portal.azure.com" in url or "education.azure.com" in url or "signup?offer=" in url:
                 _emit(cb, f"  ✅ Academic Verification 确认完成（页面已跳转: {url[:60]}）")
                 verification_passed = True
+                await _complete_offer_signup_if_needed(page, cb)
                 return True
 
             # 2. 正在审核中/过渡状态，持续等待
-            if "confirming your account" in body_lower or "setting up" in body_lower:
+            if "confirming your account" in body_lower or "setting up" in body_lower or "verifying" in body_lower or "正在确认" in body_lower:
                 _emit(cb, f"  ⏳ 正在确认账户 (confirming your account, {i+1}/20)...")
                 continue
 
-            # 3. 成功通过标志（到达 Your profile / 个人资料 / 验证完成 / 邮件已发送）
+            # 3. 明确的成功通过标志（排除表单输入框，严格匹配成功提示）
             if any(k in body_lower for k in (
-                "your profile", "你的个人资料", "first name", "面向学生的 azure", "azure for students",
                 "verification complete", "verification email has been sent", "已发送验证电子邮件",
                 "you are verified", "you're verified", "you've been verified",
                 "academic verification approved", "academic status confirmed", "verification successful",
@@ -547,6 +557,7 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             )):
                 _emit(cb, "  ✅ Academic Verification 确认完成")
                 verification_passed = True
+                await _complete_offer_signup_if_needed(page, cb)
                 return True
 
         # 若本次尝试在 60 秒内均未确认成功，触发刷新重试
@@ -554,12 +565,78 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             if attempt < max_attempts:
                 _emit(cb, f"  ⚠️ SheerID 提交后超时未确认成功，正在自动刷新页面重试 (第 {attempt+1}/{max_attempts} 次)...")
                 try:
-                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                    await page.reload(wait_until="domcontentloaded", timeout=25000)
                 except Exception:
                     pass
                 await asyncio.sleep(2)
                 continue
             else:
                 raise SheerIDVerificationError("SheerID 学术核验单浏览器内刷新重试后仍未确认成功")
+
+    return True
+
+
+async def _complete_offer_signup_if_needed(page: Page, cb: ProgressCallback = None) -> bool:
+    """
+    如果在 Azure 学生 Offer 订阅注册页面 (signup.azure.com/signup?offer=...)，
+    自动勾选协议复选框并点击「Sign up / 注册 / 下一步」以真正开通 Azure for Students 订阅。
+    """
+    cur_url = (page.url or "").lower()
+    if "signup?offer=" not in cur_url and "/signup" not in cur_url:
+        return True
+
+    _emit(cb, "  📋 检测到 Azure 学生 Offer 订阅注册页面，正在自动完成协议签署与订阅开通...")
+    for w in range(15):
+        cur_url = (page.url or "").lower()
+        if "portal.azure.com" in cur_url or "education.azure.com" in cur_url:
+            _emit(cb, "  ✅ 已进入 Azure Portal，学生订阅已成功开通")
+            return True
+
+        targets = [page] + list(page.frames)
+        for tgt in targets:
+            try:
+                cbs = tgt.locator("input[type='checkbox'], [role='checkbox']")
+                cnt = min(await cbs.count(), 8)
+                for ci in range(cnt):
+                    cb_item = cbs.nth(ci)
+                    if await cb_item.is_visible(timeout=100):
+                        try:
+                            is_checked = await cb_item.is_checked()
+                        except Exception:
+                            is_checked = (await cb_item.get_attribute("aria-checked")) == "true"
+                        if not is_checked:
+                            await cb_item.click(force=True)
+                            await asyncio.sleep(0.15)
+            except Exception:
+                pass
+
+        btn_clicked = False
+        for tgt in targets:
+            for btn_sel in [
+                "button:has-text('Sign up')", "button:has-text('Sign Up')",
+                "button:has-text('注册')", "button:has-text('立即注册')",
+                "button:has-text('Agree and sign up')", "button:has-text('同意并注册')",
+                "button:has-text('Next')", "button:has-text('下一步')",
+                "button:has-text('Submit')", "button:has-text('提交')",
+                "input[type='submit'][value*='Sign']",
+                "input[type='submit'][value*='注册']",
+                "button[type='submit']"
+            ]:
+                try:
+                    loc = tgt.locator(btn_sel).first
+                    if await loc.is_visible(timeout=100):
+                        is_dis = await loc.is_disabled()
+                        if not is_dis:
+                            await loc.click(force=True)
+                            _emit(cb, f"  🔘 已点击 Offer 订阅提交按钮: {btn_sel}")
+                            btn_clicked = True
+                            await asyncio.sleep(2.0)
+                            break
+                except Exception:
+                    pass
+            if btn_clicked:
+                break
+
+        await asyncio.sleep(1.0)
 
     return True

@@ -400,27 +400,18 @@ async def _submit_visible_password(
             # 输入后人类视线停顿 (0.4~0.8s)
             await asyncio.sleep(random.uniform(0.40, 0.80))
 
-            # 2. 提交密码：优先拟人化移动并点击 Sign in 按钮提交
+            # 2. 提交密码：双重提交机制（先物理 CDP 点击，若未即时响应配合 Enter 键与 JS 触发真实 submit）
             submit_button = await _first_visible_locator(page, SEL_PASSWORD_SUBMIT)
             _emit(cb, "  ✅ 密码已填入，提交登录...")
 
             if submit_button is not None:
-                clicked = await human_hover_and_click(page, submit_button, timeout=5000)
-                if not clicked:
-                    try:
-                        await password_locator.press("Enter", timeout=3000, no_wait_after=True)
-                    except Exception:
-                        pass
-            else:
-                try:
-                    await password_locator.press("Enter", timeout=5000, no_wait_after=True)
-                except Exception:
-                    pass
+                await human_hover_and_click(page, submit_button, timeout=3000)
 
-            # 记录已提交签名及域名，锁定防止重复提交打断请求
-            submitted_forms.add(signature)
-            if netloc:
-                submitted_forms.add(netloc)
+            # 无论 hover_and_click 是否成功，通过原生 Enter 键触发表单提交保障
+            try:
+                await password_locator.press("Enter", timeout=2000, no_wait_after=True)
+            except Exception:
+                pass
 
             # 3. 轮询验证页面响应（等待微软服务器处理并跳转，最多等 12 秒）
             submitted_successfully = False
@@ -433,12 +424,26 @@ async def _submit_visible_password(
                 if cur_pass is None:
                     submitted_successfully = True
                     break
+                if _w == 3:  # 1.2 秒后若仍停留在密码表单，使用 JS evaluate 点击 submit 按钮兜底
+                    try:
+                        await page.evaluate("""() => {
+                            const btn = document.querySelector("#idSIButton9") ||
+                                        document.querySelector("input[type=submit]") ||
+                                        document.querySelector("button[type=submit]");
+                            if (btn) btn.click();
+                        }""")
+                    except Exception:
+                        pass
 
             if submitted_successfully:
+                submitted_forms.add(signature)
+                if netloc:
+                    submitted_forms.add(netloc)
                 _emit(cb, "  ✅ 密码表单已提交，页面响应成功")
+                return True
             else:
-                _emit(cb, "  ✅ 密码表单已提交，等待后续跳转...")
-            return True
+                _emit(cb, "  ⚠️ 密码表单提交后页面未即时响应，等待后续跳转或重新探测...")
+                return False
 
         except Exception as exc:
             message = str(exc).lower()
@@ -1830,7 +1835,18 @@ async def do_azure_login(
                 "input[value='Next']",
                 "button:has-text('下一步')",
                 "input[value='下一步']",
-            ], timeout=8000)
+            ], timeout=4000)
+            try:
+                await page.evaluate("""() => {
+                    const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button]')];
+                    const b = btns.find(x => {
+                        const t = (x.innerText || x.value || '').trim().toLowerCase();
+                        return t === 'next' || t === '下一步' || t === 'continue' || t === '继续';
+                    });
+                    if (b) b.click();
+                }""")
+            except Exception:
+                pass
             for _w in range(8):
                 await asyncio.sleep(0.25)
                 try:

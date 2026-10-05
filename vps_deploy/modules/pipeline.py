@@ -224,13 +224,13 @@ class DynamicProxyBridge:
                         stype = bridge._socks_mod.SOCKS4 if "4" in scheme else bridge._socks_mod.SOCKS5
                         sock = bridge._socks_mod.socksocket()
                         sock.set_proxy(stype, host, port, True, user, pwd)
-                        sock.settimeout(30)
+                        sock.settimeout(15)
                         sock.connect((t_host, t_port))
                         upstream_sock = sock
                     elif scheme in ("http", "https") and host:
                         import base64
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(30)
+                        sock.settimeout(15)
                         sock.connect((host, port))
                         connect_req = f"CONNECT {t_host}:{t_port} HTTP/1.1\r\nHost: {t_host}:{t_port}\r\n"
                         if user and pwd:
@@ -668,9 +668,12 @@ async def process_account(
             return result
 
         else:
-            # 仅执行第一阶段 SheerID 学术资格核验
+            # 执行第一阶段 SheerID 学术资格核验与 Offer 订阅开通
             _emit(cb, "  📝 执行 SheerID 学术资格认证...")
-            await fill_azure_profile_form(page, account.email, cb)
+            verified = await fill_azure_profile_form(page, account.email, cb)
+            if not verified:
+                raise SheerIDVerificationError("SheerID 学术资格核验未通过，终止提 Key 流程")
+            _emit(cb, "  ✅ 学生学术认证与资格已确认通过，准备进入 Azure Portal 提取 Key...")
 
         # ── 步骤3: 新开标签页提取所有产品 key ────────────────
         # 直接调用 extract_all_keys，新开标签页直接导航到 software 页面
@@ -846,7 +849,7 @@ async def run_pipeline(
                 max_network_retries = 0
                 max_login_retries = 0
             else:
-                max_network_retries = min(int(getattr(config, "NETWORK_PROXY_RETRIES", 1)), max(1, pool_size - 1))
+                max_network_retries = min(int(getattr(config, "NETWORK_PROXY_RETRIES", 3)), max(2, pool_size - 1))
                 max_login_retries = 1
             verify_retry = 0
             network_retry = 0
@@ -866,62 +869,9 @@ async def run_pipeline(
                         timeout=account_timeout,
                     )
                     break
-                except (SheerIDVerificationError, AzureCaptchaError) as e:
-                    saved_totp = getattr(account, 'totp_secret', '') or getattr(e, 'totp', '') or get_cached_totp(account.email)
-                    if saved_totp:
-                        account.totp_secret = saved_totp
-                        save_totp_cache(account.email, saved_totp)
-                    totp_msg = f"，已留存 2FA 密钥 ({saved_totp[:6]}...)" if saved_totp else ""
-                    if verify_retry < max_login_retries:
-                        verify_retry += 1
-                        curr_proxy, _ = await rotator.get_next_proxy()
-                        retry_proxy_info = f"代理: {curr_proxy}" if curr_proxy else "直连"
-                        _account_cb(f"⚠️ [新开浏览器重试] {e}，已关闭旧浏览器{totp_msg}，正在启动全新浏览器重试 ({verify_retry}/{max_login_retries}) | {retry_proxy_info}...")
-                        await asyncio.sleep(random.uniform(2.5, 4.0))
-                        continue
-                    if max_login_retries > 0:
-                        _account_cb(f"❌ 全新浏览器重试后仍未通过: {e}")
-                    else:
-                        _account_cb(f"❌ 遇到验证异常，跳过重试以快速推进后续账号: {e}")
-                    result = KeyResult(
-                        account=account, success=False, totp_secret=saved_totp,
-                        message=f"验证异常: {e}"[:200]
-                    )
-                    _persist_result(result)
-                    break
-                except (EmailInputTimeoutError, LoginNetworkError, PortalLoadError) as e:
-                    saved_totp = getattr(account, 'totp_secret', '') or getattr(e, 'totp', '') or get_cached_totp(account.email)
-                    if saved_totp:
-                        account.totp_secret = saved_totp
-                        save_totp_cache(account.email, saved_totp)
-                    totp_msg = f"，已留存 2FA 密钥 ({saved_totp[:6]}...)" if saved_totp else ""
-                    err_msg = str(e)
-                    is_tunnel_err = any(k in err_msg for k in ["ERR_TUNNEL_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE", "ERR_PROXY", "502 Bad Gateway"])
-                    if is_tunnel_err and curr_proxy:
-                        _account_cb(f"⚠️  [代理隧道断开/认证失败] 当前代理 {curr_proxy} 拒绝连接或无法访问目标网站！")
-                    stage = "Portal/提 Key 页面" if isinstance(e, PortalLoadError) else "登录页面"
-                    if network_retry < max_network_retries:
-                        network_retry += 1
-                        old_proxy = curr_proxy
-                        curr_proxy, _ = await rotator.get_next_proxy()
-                        retry_proxy_info = f"代理: {curr_proxy}" if curr_proxy else "直连"
-                        if old_proxy and curr_proxy == old_proxy:
-                            retry_proxy_info += "（代理池仅此一个节点）"
-                        _account_cb(f"⚠️ [网络/代理卡顿] {stage}异常 ({err_msg[:100]}){totp_msg}，关闭浏览器并切换代理重新登录 ({network_retry}/{max_network_retries}) | {retry_proxy_info}...")
-                        await asyncio.sleep(random.uniform(1.5, 3.0))
-                        continue
-                    if is_tunnel_err and curr_proxy:
-                        _account_cb(f"❌ 代理连接失败: 多个代理节点均无法建立连接 (SOCKS5 认证拒绝/流量耗尽)，请检查代理套餐！{totp_msg}")
-                    elif max_network_retries > 0:
-                        _account_cb(f"❌ 已切换 {max_network_retries} 个代理重试仍失败: {err_msg[:120]}{totp_msg}")
-                    else:
-                        _account_cb(f"❌ 处理失败，跳过重试以快速推进后续账号: {err_msg[:120]}{totp_msg}")
-                    result = KeyResult(
-                        account=account, success=False, totp_secret=saved_totp,
-                        message=f"{'换代理重试仍' if max_network_retries > 0 else ''}失败: {err_msg}"[:200]
-                    )
-                    _persist_result(result)
-                    break
+                except asyncio.CancelledError:
+                    _emit(cb, f"{prefix} ⚠️ 任务被取消")
+                    raise
                 except asyncio.TimeoutError:
                     _emit(cb, f"{prefix} ⏰ 账号处理超时（>{account_timeout}s），已放弃")
                     result = KeyResult(
@@ -931,14 +881,79 @@ async def run_pipeline(
                     )
                     _persist_result(result)
                     break
-                except asyncio.CancelledError:
-                    _emit(cb, f"{prefix} ⚠️ 任务被取消")
-                    raise
                 except Exception as e:
-                    _emit(cb, f"{prefix} ❌ 账号处理崩溃: {e}")
+                    saved_totp = getattr(account, 'totp_secret', '') or getattr(e, 'totp', '') or get_cached_totp(account.email)
+                    if saved_totp:
+                        account.totp_secret = saved_totp
+                        save_totp_cache(account.email, saved_totp)
+                    totp_msg = f"，已留存 2FA 密钥 ({saved_totp[:6]}...)" if saved_totp else ""
+                    err_msg = str(e)
+                    err_lower = err_msg.lower()
+
+                    is_captcha_or_sheerid = isinstance(e, (SheerIDVerificationError, AzureCaptchaError))
+                    if is_captcha_or_sheerid:
+                        if verify_retry < max_login_retries:
+                            verify_retry += 1
+                            curr_proxy, _ = await rotator.get_next_proxy()
+                            retry_proxy_info = f"代理: {curr_proxy}" if curr_proxy else "直连"
+                            _account_cb(f"⚠️ [新开浏览器重试] {e}，已关闭旧浏览器{totp_msg}，正在启动全新浏览器重试 ({verify_retry}/{max_login_retries}) | {retry_proxy_info}...")
+                            await asyncio.sleep(random.uniform(2.5, 4.0))
+                            continue
+                        if max_login_retries > 0:
+                            _account_cb(f"❌ 全新浏览器重试后仍未通过: {e}")
+                        else:
+                            _account_cb(f"❌ 遇到验证异常，跳过重试以快速推进后续账号: {e}")
+                        result = KeyResult(
+                            account=account, success=False, totp_secret=saved_totp,
+                            message=f"验证异常: {e}"[:200]
+                        )
+                        _persist_result(result)
+                        break
+
+                    is_net_err = isinstance(e, (EmailInputTimeoutError, LoginNetworkError, PortalLoadError)) or any(
+                        k in err_lower for k in (
+                            "net::err_", "err_tunnel_connection_failed", "err_connection_reset",
+                            "err_connection_closed", "err_proxy_connection_failed", "err_timed_out",
+                            "err_connection_refused", "err_empty_response", "err_http2_protocol_error",
+                            "err_name_not_resolved", "err_internet_disconnected",
+                            "502 bad gateway", "target closed", "browser has been closed",
+                            "proxy error", "connection closed", "connection reset", "socket",
+                            "timeout", "navigation timeout"
+                        )
+                    )
+
+                    if is_net_err:
+                        is_tunnel_err = any(k in err_msg for k in ["ERR_TUNNEL_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE", "ERR_PROXY", "502 Bad Gateway"])
+                        if is_tunnel_err and curr_proxy:
+                            _account_cb(f"⚠️  [代理隧道断开/认证失败] 当前代理 {curr_proxy} 拒绝连接或无法访问目标网站！")
+                        stage = "Portal/提 Key 页面" if isinstance(e, PortalLoadError) else ("登录页面" if isinstance(e, (EmailInputTimeoutError, LoginNetworkError)) else "网络连接")
+                        if network_retry < max_network_retries:
+                            network_retry += 1
+                            old_proxy = curr_proxy
+                            curr_proxy, _ = await rotator.get_next_proxy()
+                            retry_proxy_info = f"代理: {curr_proxy}" if curr_proxy else "直连"
+                            if old_proxy and curr_proxy == old_proxy:
+                                retry_proxy_info += "（代理池仅此一个节点）"
+                            _account_cb(f"⚠️ [网络/代理中断] {stage}异常 ({err_msg[:100]}){totp_msg}，关闭浏览器并切换代理重试 ({network_retry}/{max_network_retries}) | {retry_proxy_info}...")
+                            await asyncio.sleep(random.uniform(1.5, 3.0))
+                            continue
+                        if is_tunnel_err and curr_proxy:
+                            _account_cb(f"❌ 代理连接失败: 多个代理节点均无法建立连接 (SOCKS5 认证拒绝/流量耗尽)，请检查代理套餐！{totp_msg}")
+                        elif max_network_retries > 0:
+                            _account_cb(f"❌ 已切换 {max_network_retries} 个代理重试仍失败: {err_msg[:120]}{totp_msg}")
+                        else:
+                            _account_cb(f"❌ 处理失败，跳过重试以快速推进后续账号: {err_msg[:120]}{totp_msg}")
+                        result = KeyResult(
+                            account=account, success=False, totp_secret=saved_totp,
+                            message=f"{'换代理重试仍' if max_network_retries > 0 else ''}失败: {err_msg}"[:200]
+                        )
+                        _persist_result(result)
+                        break
+
+                    _emit(cb, f"{prefix} ❌ 账号处理异常: {e}")
                     result = KeyResult(
                         account=account, success=False,
-                        totp_secret=getattr(account, 'totp_secret', ''),
+                        totp_secret=saved_totp,
                         message=str(e)[:200]
                     )
                     _persist_result(result)
