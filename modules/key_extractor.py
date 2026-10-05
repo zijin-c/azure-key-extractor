@@ -28,6 +28,31 @@ from utils.totp_cache import save_totp_cache, get_cached_totp
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
 
+# 同一判定用于搜索、清空、页面就绪及保护 Software 根 blade。
+_SOFTWARE_SEARCH_JS = """(i) => {
+    const r = i.getBoundingClientRect();
+    if (!r.width || !r.height || i.disabled || i.readOnly) return false;
+    const label = ((i.placeholder || '') + ' ' + (i.getAttribute('aria-label') || '')).toLowerCase();
+    if (/search resources|global search|搜索资源|全局搜索/.test(label)) return false;
+    return /search|搜索|筛选|filter/.test(label) || i.type === 'search' ||
+        !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
+}"""
+
+
+def _page_targets(page):
+    # Playwright 的 frames 已含 main_frame，避免对同一 DOM 执行两次关闭。
+    return list(page.frames) or [page]
+
+
+async def _has_software_search(page):
+    for frame in _page_targets(page):
+        try:
+            if await frame.evaluate(f"() => [...document.querySelectorAll('input')].some({_SOFTWARE_SEARCH_JS})"):
+                return True
+        except Exception:
+            pass
+    return False
+
 # 目标产品搜索关键词映射（搜索词 → 精确产品名）
 _PRODUCT_SEARCH_MAP = {
     "Visio Professional 2021": "Visio",
@@ -269,21 +294,7 @@ async def _search_product(page: Page, search_term: str, cb: ProgressCallback) ->
     """
     _FIND_SEARCH_JS = """
         () => {
-            const inputs = [...document.querySelectorAll('input')].filter(i => {
-                const r = i.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0 || r.top < 45) return false;
-                if (i.disabled || i.readOnly) return false;
-                const ph = (i.placeholder || '').toLowerCase();
-                const al = (i.getAttribute('aria-label') || '').toLowerCase();
-                const cls = (i.className || '').toLowerCase();
-                if (ph.includes('search resources') || al.includes('search resources') || al.includes('global search') ||
-                    ph.includes('搜索资源') || al.includes('搜索资源') || al.includes('全局搜索')) return false;
-                return ph.includes('search') || al.includes('search') ||
-                       ph.includes('搜索') || al.includes('搜索') ||
-                       ph.includes('筛选') || al.includes('筛选') ||
-                       i.type === 'search' || cls.includes('search') ||
-                       !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
-            });
+            const inputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
             if (inputs.length === 0) return false;
             inputs.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
             const target = inputs[inputs.length - 1];
@@ -303,6 +314,12 @@ async def _search_product(page: Page, search_term: str, cb: ProgressCallback) ->
         if attempt in (2, 5):
             await _close_panel(page)
             await _ensure_software_blade_active(page, cb)
+            if attempt == 5 and not await _has_software_search(page):
+                _emit(cb, "  🔄 软件搜索框仍不可用，重新加载 Software 页...")
+                try:
+                    await page.goto(config.AZURE_EDU_SOFTWARE_URL, wait_until="domcontentloaded", timeout=25000)
+                except Exception:
+                    pass
             await asyncio.sleep(0.2)
         for frame in [page] + list(page.frames):
             try:
@@ -674,88 +691,62 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
 
 
 async def _close_panel(page: Page):
-    """关闭右侧详情面板（按 Escape 键并智能关闭右侧详情 panel / 子 blade，确保绝不误关主 Software 页面）。"""
-    try:
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.15)
-    except Exception:
-        pass
-    for frame in [page] + list(page.frames):
+    """一次只关闭可确认的产品详情层，保护包含软件搜索框的根 blade。"""
+    for frame in _page_targets(page):
         try:
-            await frame.evaluate("""
-                () => {
-                    // 1. 关闭所有 Fluent UI Panel 和 Dialog 弹窗
-                    const panels = document.querySelectorAll('.ms-Panel, [role="dialog"]');
-                    panels.forEach(p => {
-                        const btn = p.querySelector('button[aria-label="Close"], button[aria-label="关闭"], button[title="Close"], button[title="关闭"], .ms-Panel-closeButton, button.ms-Button--icon');
-                        if (btn) btn.click();
-                    });
-
-                    // 2. 仅当存在多于 1 个 blade 时，才关闭最右侧的子 blade，绝不关闭根 blade
-                    const blades = document.querySelectorAll('.fxs-blade');
-                    if (blades.length > 1) {
-                        const lastBlade = blades[blades.length - 1];
-                        const bladeClose = lastBlade.querySelector('.fxs-blade-close, button[aria-label="Close"], button[aria-label="关闭"], [data-telemetry-id="blade-close"]');
-                        if (bladeClose) bladeClose.click();
+            closed = await frame.evaluate("""(products) => {
+                const isSearch = """ + _SOFTWARE_SEARCH_JS + """;
+                const layers = [...document.querySelectorAll('.fxs-blade, .ms-Panel, [role="dialog"]')]
+                    .filter(el => { const r = el.getBoundingClientRect(); return r.width && r.height; });
+                for (const layer of layers.reverse()) {
+                    if ([...layer.querySelectorAll('input')].some(isSearch)) continue;
+                    const text = layer.innerText || '';
+                    const hasProductTitle = [...layer.querySelectorAll('h1, h2, h3, [role="heading"], .fxs-blade-title, .ms-Panel-headerText')]
+                        .some(el => products.includes((el.innerText || '').trim()));
+                    // 根 Education 层不含产品详情，不能仅凭 blade 数量判断可关闭。
+                    if (!hasProductTitle && !/View Key|查看密钥|Product Key|产品密钥|[A-Z0-9]{5}(?:-[A-Z0-9]{5}){4}/i.test(text)) continue;
+                    const btn = layer.querySelector('.fxs-blade-close, [data-telemetry-id="blade-close"], .ms-Panel-closeButton, button[aria-label="Close"], button[aria-label="关闭"], button[title="Close"], button[title="关闭"]');
+                    if (btn && btn.closest('.fxs-blade, .ms-Panel, [role="dialog"]') === layer) {
+                        btn.click();
+                        return true;
                     }
                 }
-            """)
+                return false;
+            }""", list(config.PRODUCTS_TO_EXTRACT))
+            if closed:
+                await asyncio.sleep(0.2)
+                return
         except Exception:
             pass
 
 
 async def _clear_search(page: Page):
-    """彻底清空内部搜索框内容（点击清空按钮 + 原生全选删除 + React input 事件派发）。"""
-    for frame in page.frames:
+    """只清空可见的软件搜索框，不点击全局 Clear/Cancel 图标。"""
+    for frame in _page_targets(page):
         try:
-            # 1. 尝试点击清空按钮 (Clear icon)
-            for clear_btn in [
-                "button[aria-label*='clear' i]",
-                "button[aria-label*='清空' i]",
-                ".ms-SearchBox-clearButton",
-                "[class*='clearButton']",
-                "[data-icon-name='Clear']",
-                "[data-icon-name='Cancel']"
-            ]:
-                try:
-                    loc = frame.locator(clear_btn).first
-                    if await loc.is_visible(timeout=100):
-                        await loc.click()
-                        await asyncio.sleep(0.1)
-                except Exception:
-                    pass
-
-            # 2. JS 强制清空所有搜索框 value 并派发事件
-            await frame.evaluate("""
-                () => {
-                    const inputs = [...document.querySelectorAll('input')].filter(i => {
-                        const r = i.getBoundingClientRect();
-                        if (r.width === 0 || r.height === 0) return false;
-                        const ph = (i.placeholder || '').toLowerCase();
-                        const al = (i.getAttribute('aria-label') || '').toLowerCase();
-                        if (ph.includes('search resources') || al.includes('search resources')) return false;
-                        return ph.includes('search') || al.includes('search') || i.type === 'search';
-                    });
-                    for (const input of inputs) {
-                        input.focus();
-                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        if (setter) setter.call(input, '');
-                        else input.value = '';
-                        input.dispatchEvent(new Event('input', {bubbles: true}));
-                        input.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                }
-            """)
+            focused = await frame.evaluate("""() => {
+                const inputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
+                if (!inputs.length) return false;
+                inputs.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+                inputs[inputs.length - 1].focus();
+                return true;
+            }""")
+            if not focused:
+                continue
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await frame.evaluate("""() => {
+                const input = document.activeElement;
+                if (!input || input.tagName !== 'INPUT' || !(""" + _SOFTWARE_SEARCH_JS + """)(input)) return;
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                setter.call(input, '');
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+            }""")
+            await asyncio.sleep(0.2)
+            return
         except Exception:
             pass
-
-    # 3. 键盘全选删除兜底
-    try:
-        await page.keyboard.press("Control+A")
-        await page.keyboard.press("Backspace")
-    except Exception:
-        pass
-    await asyncio.sleep(0.2)
 
 
 async def _handle_portal_login(page: Page, totp_secret: str,
@@ -1162,13 +1153,8 @@ async def _ensure_software_blade_active(page: Page, cb: ProgressCallback = None)
             res = await frame.evaluate("""
                 () => {
                     // 1. 如果内部软件搜索框已存在，说明已经在 Software 页面
-                    const searchBox = document.querySelector('input[placeholder*="Search" i], input[placeholder*="搜索" i], input[aria-label*="Search" i], input[aria-label*="搜索" i], input[type="search"], .ms-SearchBox');
-                    const isGlobal = searchBox && (
-                        (searchBox.placeholder || '').toLowerCase().includes('resources') ||
-                        (searchBox.getAttribute('aria-label') || '').toLowerCase().includes('resources') ||
-                        (searchBox.placeholder || '').toLowerCase().includes('搜索资源')
-                    );
-                    if (searchBox && !isGlobal) {
+                    const isSoftwareSearch = """ + _SOFTWARE_SEARCH_JS + """;
+                    if ([...document.querySelectorAll('input')].some(isSoftwareSearch)) {
                         return { already_active: true };
                     }
 
@@ -1208,12 +1194,14 @@ async def extract_all_keys(
     cb: ProgressCallback = None,
     proxy_str: str | None = None,
     proxy_ctrl: Optional[Any] = None,
+    keys_out: Optional[dict] = None,
+    on_key: Optional[Callable[[dict, str], None]] = None,
 ) -> tuple[dict, str]:
     """
     提取所有目标产品的 key。
     复用当前 page 页面避免重复冷加载。
     """
-    keys = {}
+    keys = keys_out if keys_out is not None else {}
     totp_secret = totp_secret or (get_cached_totp(ms_email) if ms_email else "")
     _EDU_SW_URL = (
         "https://portal.azure.com/#view/Microsoft_Azure_Education"
@@ -1292,33 +1280,11 @@ async def extract_all_keys(
                             }
 
                             // 2. 内部软件搜索框（排除顶部全局搜索）
-                            const searchInputs = [...document.querySelectorAll('input')].filter(i => {
-                                const r = i.getBoundingClientRect();
-                                if (r.width === 0 || r.height === 0 || r.top < 45 || i.disabled || i.readOnly) return false;
-                                const ph = (i.placeholder || '').toLowerCase();
-                                const al = (i.getAttribute('aria-label') || '').toLowerCase();
-                                if (ph.includes('search resources') || al.includes('search resources') || ph.includes('搜索资源')) return false;
-                                return ph.includes('search') || al.includes('search') || ph.includes('搜索') || al.includes('搜索') ||
-                                       ph.includes('筛选') || al.includes('筛选') || i.type === 'search' ||
-                                       !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
-                            });
+                            const searchInputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
                             const has_search = searchInputs.length > 0;
 
-                            // 3. 软件列表数据行
-                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"], table tr td')];
-                            const has_items = items.some(el => {
-                                const t = (el.innerText || el.textContent || '').toLowerCase();
-                                return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') ||
-                                       t.includes('access') || t.includes('project') || t.includes('visio') ||
-                                       t.includes('office') || t.includes('azure') || t.includes('community') ||
-                                       t.includes('server') || t.includes('developer');
-                            });
-
-                            const rows = document.querySelectorAll('[role="row"], table tr');
-                            const has_grid_rows = rows.length >= 3;
-
                             return {
-                                ready: has_search || has_items || has_grid_rows,
+                                ready: has_search,
                                 no_software: false
                             };
                         }
@@ -1362,25 +1328,9 @@ async def extract_all_keys(
 
         # ── 对每个产品提取 key ───────────────────────────────
         failed_products = []
-        consecutive_search_fails = 0
 
         for product_name in config.PRODUCTS_TO_EXTRACT:
-            # 检查是否真正偏离了软件页：只有当页面上完全没有搜索框和软件列表时，才判定偏离并重导航
-            has_sw_dom = False
-            for frame in [sw_page] + list(sw_page.frames):
-                try:
-                    has_sw_dom = await frame.evaluate("""
-                        () => !!(document.querySelector('input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]') ||
-                                 document.querySelector('.ms-SearchBox') ||
-                                 document.querySelector('[role="grid"]') ||
-                                 document.querySelector('[role="row"]'))
-                    """)
-                    if has_sw_dom:
-                        break
-                except Exception:
-                    pass
-
-            cur_u = (sw_page.url or "").lower()
+            has_sw_dom = await _has_software_search(sw_page)
             if not has_sw_dom:
                 _emit(cb, "  ⚠️ 未检测到软件列表 DOM，尝试激活 Software 菜单或重新导航...")
                 switched = await _ensure_software_blade_active(sw_page, cb)
@@ -1418,6 +1368,8 @@ async def extract_all_keys(
             keys[product_name] = key
 
             if key:
+                if on_key:
+                    on_key(dict(keys), updated_totp)
                 _emit(cb, f"  🎉 {product_name[:40]}: {key}")
             else:
                 _emit(cb, f"  ❌ {product_name[:40]}: 未获取到 key")
@@ -1464,6 +1416,8 @@ async def extract_all_keys(
 
                 if key:
                     keys[product_name] = key
+                    if on_key:
+                        on_key(dict(keys), updated_totp)
                     _emit(cb, f"  🎉 [二次重试成功] {product_name[:40]}: {key}")
                 else:
                     _emit(cb, f"  ❌ [二次重试仍然失败] {product_name[:40]}: 未获取到 key")

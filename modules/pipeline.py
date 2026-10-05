@@ -90,9 +90,9 @@ def _emit(cb: ProgressCallback, msg: str):
 
 def _persist_result(result: KeyResult):
     """追加写入 JSONL 结果文件（含密码，方便后续重新导出）。"""
-    os.makedirs(_RESULTS_DIR, exist_ok=True)
     fpath = os.path.join(_RESULTS_DIR, f"keys_{datetime.now().strftime('%Y%m%d')}.jsonl")
     try:
+        os.makedirs(_RESULTS_DIR, exist_ok=True)
         entry = {
             "ts":          result.ts,
             "email":       result.account.email,
@@ -104,8 +104,12 @@ def _persist_result(result: KeyResult):
         }
         with open(fpath, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return True
     except Exception as e:
         log.warning(f"写入结果失败: {e}")
+        return False
 
 
 class DynamicProxyBridge:
@@ -386,6 +390,7 @@ async def process_account(
     mode: str = "azure_student",
     raise_network_retry: bool = True,
     proxy_rotator: ProxyRotator | None = None,
+    keys_out: Optional[dict] = None,
 ) -> KeyResult:
     """处理单个账号，返回 KeyResult。支持 azure_student 与 direct_ms 两种模式。"""
     _emit(cb, f"\n{'═'*50}")
@@ -397,6 +402,19 @@ async def process_account(
     pw = None
     browser = None
     driver_pid = None
+    keys = keys_out if keys_out is not None else {}
+
+    def _save_key_checkpoint(snapshot, secret):
+        if secret:
+            account.totp_secret = secret
+        checkpoint = KeyResult(
+            account=account, success=True, totp_secret=secret,
+            keys=snapshot, message=f"即时保存 {sum(bool(v) for v in snapshot.values())} 个 key（提取中）",
+        )
+        if _persist_result(checkpoint):
+            _emit(cb, "  💾 已提取的 key 已即时写入本地结果文件")
+        else:
+            _emit(cb, "  ⚠️ key 写入结果文件失败，已保留在内存，流程结束时将再次保存")
 
     try:
         # 构建代理配置
@@ -474,7 +492,7 @@ async def process_account(
                 proxy_ctrl=proxy_ctrl,
             )
             _emit(cb, "  🔑 登录就绪，直接提取 6 个目标产品的 Key...")
-            keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl)
+            keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl, keys_out=keys, on_key=_save_key_checkpoint)
             if totp_secret:
                 account.totp_secret = totp_secret
                 save_totp_cache(account.email, totp_secret)
@@ -647,7 +665,7 @@ async def process_account(
 
         if is_already_registered:
             _emit(cb, "  ℹ️  账号已完成注册，直接提取 key")
-            keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl)
+            keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl, keys_out=keys, on_key=_save_key_checkpoint)
             if totp_secret and not account.totp_secret:
                 account.totp_secret = totp_secret
                 _emit(cb, f"  💾 成功捕获并保存 2FA 密钥: {totp_secret}")
@@ -678,7 +696,7 @@ async def process_account(
         # ── 步骤3: 新开标签页提取所有产品 key ────────────────
         # 直接调用 extract_all_keys，新开标签页直接导航到 software 页面
         _emit(cb, "  🌐 开始提取 key（新开标签页）...")
-        keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl)
+        keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl, keys_out=keys, on_key=_save_key_checkpoint)
         if totp_secret:
             account.totp_secret = totp_secret
             save_totp_cache(account.email, totp_secret)
@@ -712,7 +730,7 @@ async def process_account(
             account.totp_secret = saved_totp
             save_totp_cache(account.email, saved_totp)
             _emit(cb, f"  💾 已保存当前账号 2FA 密钥: {saved_totp}")
-        if raise_network_retry:
+        if raise_network_retry and not any(keys.values()):
             raise
         _emit(cb, f"  ❌ 处理异常: {e}")
         saved_keys = keys if ('keys' in locals() and isinstance(keys, dict)) else {}
@@ -859,6 +877,7 @@ async def run_pipeline(
                 max_login_retries = 1
             verify_retry = 0
             network_retry = 0
+            partial_keys = {}
             while True:
                 try:
                     result = await asyncio.wait_for(
@@ -871,6 +890,7 @@ async def run_pipeline(
                             mode=mode,
                             raise_network_retry=True,
                             proxy_rotator=rotator,
+                            keys_out=partial_keys,
                         ),
                         timeout=account_timeout,
                     )
@@ -881,9 +901,10 @@ async def run_pipeline(
                 except asyncio.TimeoutError:
                     _emit(cb, f"{prefix} ⏰ 账号处理超时（>{account_timeout}s），已放弃")
                     result = KeyResult(
-                        account=account, success=False,
+                        account=account, success=any(partial_keys.values()),
                         totp_secret=getattr(account, 'totp_secret', ''),
-                        message=f"超时跳过（>{account_timeout}s）"
+                        keys=dict(partial_keys),
+                        message=f"账号超时（>{account_timeout}s），保留 {sum(bool(v) for v in partial_keys.values())} 个 key"
                     )
                     _persist_result(result)
                     break
