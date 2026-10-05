@@ -135,6 +135,49 @@ class RoutingTests(CacheFixture, unittest.IsolatedAsyncioTestCase):
         route.continue_.assert_awaited_once()
         route.fetch.assert_not_awaited()
 
+    async def test_telemetry_post_is_answered_without_network(self):
+        for url in ("https://browser.events.data.microsoft.com/OneCollector/1.0/?cors=true", "https://portal.azure.com/api/Telemetry"):
+            handler, route = await self.handler(), self.route(url)
+            request = self.request(url, "POST")
+            request.resource_type = "fetch"
+            request.headers = {"origin": "https://mysignins.microsoft.com"}
+            await handler(route, request)
+            route.continue_.assert_not_awaited()
+            route.fetch.assert_not_awaited()
+            self.assertEqual(route.fulfill.call_args.kwargs["status"], 204)
+            self.assertEqual(route.fulfill.call_args.kwargs["headers"]["access-control-allow-origin"], request.headers["origin"])
+            self.assertEqual(self.stats.telemetry_blocked_count, 1)
+            self.assertEqual(self.stats.get_transfer_bytes(), 0)
+
+    async def test_telemetry_preflight_and_opt_out(self):
+        url = "https://browser.events.data.microsoft.com/OneCollector/1.0/"
+        handler, route = await self.handler(), self.route(url)
+        request = self.request(url, "OPTIONS")
+        request.headers = {"origin": "https://mysignins.microsoft.com", "access-control-request-headers": "content-type,client-id"}
+        await handler(route, request)
+        self.assertEqual(route.fulfill.call_args.kwargs["headers"]["access-control-allow-headers"], "content-type,client-id")
+        with patch.dict("os.environ", {"BLOCK_TELEMETRY": "false"}):
+            handler = await self.handler()
+        route = self.route(url)
+        await handler(route, self.request(url, "POST"))
+        route.continue_.assert_awaited_once()
+        route.fulfill.assert_not_awaited()
+
+    async def test_telemetry_allowlist_preserves_other_apis_and_navigation(self):
+        handler = await self.handler()
+        for url in ("https://portal.azure.com/api/TelemetryConfig", "https://mysignins.microsoft.com/api/authenticationmethods/initializemobileapp?Telemetry=1", "https://portal.azure.com.evil.test/api/Telemetry", "https://browser.events.data.microsoft.com/Other/1.0/"):
+            route = self.route(url)
+            await handler(route, self.request(url, "POST"))
+            route.continue_.assert_awaited_once()
+            route.fulfill.assert_not_awaited()
+        url = "https://portal.azure.com/api/Telemetry"
+        request = self.request(url)
+        request.is_navigation_request = lambda: True
+        route = self.route(url)
+        await handler(route, request)
+        route.continue_.assert_awaited_once()
+        route.fulfill.assert_not_awaited()
+
     async def test_etag_304_reuses_manifest_and_then_needs_no_request(self):
         old = "https://portal.test/ExtensionManifest/old.json?m_type=assetTypes"
         new = "https://portal.test/ExtensionManifest/new.json?m_type=assetTypes"
@@ -183,6 +226,27 @@ class RoutingTests(CacheFixture, unittest.IsolatedAsyncioTestCase):
 
 
 class BrowserCacheTests(CacheFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_browser_telemetry_fetch_accepts_local_response(self):
+        async with async_playwright() as pw:
+            candidates = list((ROOT / "ms-playwright").glob("chromium-*/chrome-win64/chrome.exe"))
+            browser = await pw.chromium.launch(headless=True, proxy={"server": "http://127.0.0.1:9"}, **({"executable_path": str(candidates[0])} if candidates else {}))
+            try:
+                ctx = await browser.new_context()
+                stats = TrafficStats()
+                await setup_save_data_route(ctx, stats)
+                page = await ctx.new_page()
+                await page.set_content("<html></html>")
+                statuses = await page.evaluate("""async () => {
+                    const urls = ['https://browser.events.data.microsoft.com/OneCollector/1.0/?cors=true', 'https://portal.azure.com/api/Telemetry'];
+                    return await Promise.all(urls.map(async url => (await fetch(url, {method: 'POST', credentials: 'include', headers: {'content-type': 'application/json'}, body: JSON.stringify({synthetic: true})})).status));
+                }""")
+                self.assertEqual(statuses, [204, 204])
+                self.assertGreaterEqual(stats.telemetry_blocked_count, 2)
+                self.assertEqual(stats.get_transfer_bytes(), 0)
+                await ctx.close()
+            finally:
+                await browser.close()
+
     async def test_compressed_cold_parallel_and_warm_cache(self):
         counts = Counter()
         guard = threading.Lock()

@@ -762,6 +762,8 @@ async def process_account(
     finally:
         if 'stats' in locals() and stats:
             _emit(cb, f"  📊 本次账号{stats.transfer_source()}约 {stats.get_transfer_mb():.2f} MB | 已知缓存避免的响应体下载约 {stats.get_cache_saved_mb():.2f} MB（命中 {stats.cache_hit_count} 次，拦截媒体/安装包 {stats.blocked_count} 次）")
+            if stats.telemetry_blocked_count:
+                _emit(cb, f"  📉 已在本地响应 {stats.telemetry_blocked_count} 次遥测请求，未发送到远端（未将请求次数折算为节省 MB）")
             if stats.cache_size_unknown_hits:
                 _emit(cb, f"  ℹ️ 另有 {stats.cache_size_unknown_hits} 次缓存命中缺少原压缩尺寸，未计入节省 MB；缓存复用内容总计（解压后）{stats.cache_replayed_bytes / 1048576:.2f} MB")
             if stats.transfer_size_unknown_responses:
@@ -769,7 +771,7 @@ async def process_account(
             if hasattr(stats, "get_top_downloads"):
                 top_dl = stats.get_top_downloads(5)
                 if top_dl:
-                    _emit(cb, "  🔝 本次直连网络请求 Top 5:")
+                    _emit(cb, "  🔝 本次 HTTP 请求估算 Top 5（不含代理连接额外开销）:")
                     for sz_kb, url, r_type in top_dl:
                         if sz_kb >= 1024:
                             _emit(cb, f"    • {sz_kb/1024:.2f} MB [{r_type}] {url[:85]}")

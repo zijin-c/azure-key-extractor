@@ -829,6 +829,7 @@ class TrafficStats:
         self.cache_size_unknown_hits = 0
         self.transfer_size_unknown_responses = 0
         self.blocked_count = 0
+        self.telemetry_blocked_count = 0
         self.proxy_bridge = proxy_bridge
         self.network_requests = []
         self.mfa_diag = []  # 仅诊断：记录 2FA initializemobileapp 请求的次数/大小/结构（不影响任何请求）
@@ -905,7 +906,7 @@ _DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return new Proxy({}, { get: 
 
 
 async def setup_save_data_route(ctx, stats: TrafficStats = None):
-    """公共静态资源持久缓存，认证/API 放行，仅拦截媒体及安装包。"""
+    """公共静态资源持久缓存，业务 API 放行，媒体拦截与遥测本地响应。"""
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
 
@@ -916,12 +917,34 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     )
 
     fulfilled_request_ids = set()
+    block_telemetry = os.getenv("BLOCK_TELEMETRY", "true").strip().lower() not in ("0", "false", "no", "off")
 
     async def _route_handler(route, request):
         r_type = request.resource_type
         url = request.url
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
+
+        # 明确的遥测端点在 POST 放行规则之前处理。返回成功，避免客户端错误重试。
+        parsed = urlsplit(url)
+        telemetry_endpoint = (
+            (parsed.hostname == "browser.events.data.microsoft.com" and parsed.path.rstrip("/").lower() == "/onecollector/1.0")
+            or (parsed.hostname == "portal.azure.com" and parsed.path.rstrip("/").lower() == "/api/telemetry")
+        )
+        if (block_telemetry and telemetry_endpoint and request.method in ("GET", "POST", "OPTIONS")
+                and r_type != "document" and not request.is_navigation_request()):
+            headers = {"cache-control": "no-store"}
+            origin = request.headers.get("origin")
+            if origin:
+                headers.update({"access-control-allow-origin": origin, "access-control-allow-credentials": "true", "vary": "Origin"})
+            if request.method == "OPTIONS":
+                headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+                headers["access-control-allow-headers"] = request.headers.get("access-control-request-headers", "content-type")
+            fulfilled_request_ids.add(id(request))
+            await route.fulfill(status=204, headers=headers, body=b"")
+            if stats:
+                stats.telemetry_blocked_count += 1
+            return
 
         # 1. 核心业务导航、主 HTML 文档以及所有非 GET 请求 (POST/PUT/DELETE/OPTIONS)：100% 原生直连（保证 Cookie、Session、登录跳转与 API 完整性）
         if r_type == "document" or request.is_navigation_request() or request.method != "GET":
