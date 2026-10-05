@@ -1365,8 +1365,8 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     has_banner = False
     detected_text = ""
 
-    _emit(cb, "  🔍 检测 Terms 协议横幅（最多 8 秒，支持就绪秒级直通）...")
-    for w in range(8):
+    _emit(cb, "  🔍 正在检测 Terms 协议横幅（持续监测以确保协议签署完成）...")
+    for w in range(15):
         await asyncio.sleep(1)
         for frame in [sw_page] + list(sw_page.frames):
             try:
@@ -1394,39 +1394,12 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
         if has_banner:
             break
 
-        # 在第 2 秒主动尝试切换到 Software 标签
-        if w == 2:
+        # 在第 2 秒和第 6 秒主动尝试切换到 Software 标签
+        if w in (2, 6):
             await _ensure_software_blade_active(sw_page, cb)
 
-        # 智能短路直通：若轮询超过 2 秒，且页面已渲染出产品列表或搜索输入框，且无 Terms 横幅
-        # 说明条款早已签署完毕，直接秒级跳过 Terms 流程，无需干等！
-        if w >= 2:
-            sw_ready = False
-            for frame in [sw_page] + list(sw_page.frames):
-                try:
-                    sw_ready = await frame.evaluate("""
-                        () => {
-                            const has_search = !!document.querySelector(
-                                'input[placeholder*="Search" i], input[placeholder*="搜索" i], input[aria-label*="Search" i], input[aria-label*="搜索" i], input[type="search"], .ms-SearchBox'
-                            );
-                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"], table tr td')];
-                            const has_items = items.some(el => {
-                                const t = (el.innerText || el.textContent || '').toLowerCase();
-                                return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') || t.includes('access') || t.includes('project') || t.includes('visio');
-                            });
-                            return has_search || has_items;
-                        }
-                    """)
-                    if sw_ready:
-                        break
-                except Exception:
-                    pass
-            if sw_ready:
-                _emit(cb, "  ℹ️  软件列表/搜索框已就绪且无 Terms 横幅，直接进入软件提取")
-                return
-
     if not has_banner:
-        _emit(cb, f"  ℹ️  无 Terms 横幅，直接进入软件提取")
+        _emit(cb, f"  ℹ️  已确认无 Terms 横幅（条款已生效或无需签署），进入软件提取")
         return
 
     _emit(cb, f"  📋 检测到 Terms 横幅/页面: {detected_text[:120]}")
