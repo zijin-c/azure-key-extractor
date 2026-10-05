@@ -161,34 +161,63 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
 
 async def _is_mfa_setup_page(page: Page) -> bool:
-    """检测当前页面是否为 MFA 注册/绑定向导（ProofUp / mysignins / 安装验证器 / 扫码等）"""
+    """检测当前页面是否为 MFA 注册/绑定向导（ProofUp / mysignins / 安装验证器 / 扫码等）。
+    注意：严格排除常规登录页（KMSI / Stay signed in / 验证码输入页 / 账号选择器），
+    避免将包含安全声明页脚的常规登录页误判为向导。
+    """
     try:
         cur_u = (page.url or "").lower()
-        if any(k in cur_u for k in ("mysignins.microsoft.com", "proofup")):
+        if any(k in cur_u for k in ("mysignins.microsoft.com", "proofup", "account.activedirectory.windowsazure.com/proofup")):
             return True
         return await page.evaluate("""
             () => {
-                const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                return txt.includes("let's keep your account secure") ||
-                       txt.includes("keep your account secure") ||
-                       txt.includes("more information required") ||
-                       txt.includes("需要详细信息") ||
-                       txt.includes("需要更多信息") ||
-                       txt.includes("保护帐户安全") ||
-                       txt.includes("保护账户安全") ||
-                       txt.includes("install microsoft authenticator") ||
-                       txt.includes("start by getting the app") ||
-                       txt.includes("获取应用") ||
-                       txt.includes("set up your account in app") ||
-                       txt.includes("set up your account") ||
-                       txt.includes("在应用中设置") ||
-                       txt.includes("scan the qr code") ||
-                       txt.includes("can't scan") ||
-                       txt.includes("扫描二维码") ||
-                       txt.includes("i want to set up a different method") ||
-                       txt.includes("i want to use a different authenticator app") ||
-                       txt.includes("security info") ||
-                       txt.includes("安全信息");
+                const bodyTxt = (document.body ? document.body.innerText : '').toLowerCase();
+                const isKmsi = bodyTxt.includes('stay signed in') || bodyTxt.includes('保持登录') ||
+                               document.querySelector('#idSIButton9') && bodyTxt.includes('do this to reduce the number of times');
+                const hasCodeBox = !!(
+                    document.querySelector("input[name='otc']") ||
+                    document.querySelector("input#idTxtBx_SAOTCC_OTC") ||
+                    document.querySelector("input#idTxtBx_OTC") ||
+                    document.querySelector("input[name='VerificationCode']") ||
+                    document.querySelector("input[autocomplete='one-time-code']")
+                );
+                if (isKmsi || hasCodeBox) return false;
+
+                const headings = [...document.querySelectorAll('h1, h2, h3, #loginHeader, .text-title, [role="heading"], label, p')]
+                    .map(el => (el.innerText || '').trim().toLowerCase())
+                    .filter(t => t.length > 0 && t.length < 150);
+                const hText = headings.join(' | ');
+
+                const isHeaderMatch = (
+                    hText.includes("let's keep your account secure") ||
+                    hText.includes("more information required") ||
+                    hText.includes("需要详细信息") ||
+                    hText.includes("需要更多信息") ||
+                    hText.includes("保护帐户安全") ||
+                    hText.includes("保护账户安全") ||
+                    hText.includes("install microsoft authenticator") ||
+                    hText.includes("start by getting the app") ||
+                    hText.includes("获取应用") ||
+                    hText.includes("set up your account in app") ||
+                    hText.includes("在应用中设置") ||
+                    hText.includes("scan the qr code") ||
+                    hText.includes("扫描二维码") ||
+                    hText.includes("setting up your passkey")
+                );
+                if (isHeaderMatch) return true;
+
+                const specialBtns = [
+                    "input#idSubmit_ProofUp_Redirect",
+                    "[data-automationid='set-up-authenticator-app-next-button']",
+                    "button:has-text('Can\\'t scan the QR code')",
+                    "button:has-text('I want to set up a different method')",
+                    "a:has-text('I want to set up a different method')",
+                    "a:has-text('I want to use a different authenticator app')"
+                ];
+                for (const s of specialBtns) {
+                    if (document.querySelector(s)) return true;
+                }
+                return false;
             }
         """)
     except Exception:
@@ -727,52 +756,24 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     if await _azure_destination_ready(page, cur_u):
         return secret
 
-    # 1. 优先判断是否为 MFA 注册/绑定向导（Let's keep your account secure / ProofUp / 安装验证器 / 扫码等）
-    if await _is_mfa_setup_page(page):
-        _emit(cb, "  🔐 检测到 MFA 注册/绑定向导，启动 MFA 注册流程...")
-        res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
-        if res and ms_email:
-            save_totp_cache(ms_email, res)
-        cur_u_after = (page.url or "").lower()
-        if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
-            _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
-            try:
-                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-            except Exception:
-                pass
-        return res or secret
-
-    # 2. 若已有 Secret，且页面处于常规 2FA 登录验证 / 保持登录 / 账号选择
+    # ── 情况 A: 若已有 Secret，优先执行快速 TOTP 登录验证与 KMSI 推进 ──
     if secret:
         _emit(cb, "  🔑 已有 2FA 密钥，执行快速 TOTP 登录验证...")
-        for _attempt in range(12):  # 最多轮询 ~6 秒
+        for _attempt in range(16):  # 最多轮询 ~8 秒
             await asyncio.sleep(0.5)
             cur_u = (page.url or "").lower()
 
+            # 1. 业务页就绪
             if await _azure_destination_ready(page, cur_u):
                 _emit(cb, "  ✅ 已进入 Azure Portal")
                 return secret
-
-            if await _is_mfa_setup_page(page):
-                _emit(cb, "  🔐 页面跳转至 MFA 注册向导，启动 MFA 注册流程...")
-                res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
-                if res and ms_email:
-                    save_totp_cache(ms_email, res)
-                cur_u_after = (page.url or "").lower()
-                if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
-                    _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
-                    try:
-                        await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-                    except Exception:
-                        pass
-                return res or secret
 
             try:
                 body_lower = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
             except Exception:
                 body_lower = ""
 
-            # 账号选择器 (Pick an account)
+            # 2. 账号选择器 (Pick an account)
             if "pick an account" in body_lower or "choose an account" in body_lower:
                 _emit(cb, "  👆 出现账号选择器，选择已登录账号...")
                 for sel in [f"div:has-text('{ms_email}')", f"small:has-text('{ms_email}')", "[data-test='account-item']", "#tilesHolder .table"]:
@@ -786,7 +787,7 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                         pass
                 continue
 
-            # 保持登录 (Stay signed in / KMSI)
+            # 3. 保持登录 (Stay signed in / KMSI)
             if "stay signed in" in body_lower or "kmsi" in cur_u or "保持登录" in body_lower:
                 _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
                 await _click_first_visible(page, [
@@ -796,10 +797,11 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                 ], timeout=2000)
                 await asyncio.sleep(1.0)
                 if await _azure_destination_ready(page, page.url or ""):
+                    _emit(cb, "  ✅ 已进入 Azure Portal")
                     return secret
                 continue
 
-            # 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
+            # 4. 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
             if any(k in body_lower for k in ("approve a request", "check your mobile device", "sign in another way", "其他登录方式", "其他验证方式")):
                 for sw_sel in [
                     "a:has-text('Sign in another way')", "button:has-text('Sign in another way')",
@@ -834,7 +836,7 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                     except Exception:
                         pass
 
-            # 填入 TOTP 验证码并提交 (仅在页面确实有输入框时尝试)
+            # 5. 填入 TOTP 验证码并提交
             if await _is_totp_input_page(page):
                 code = pyotp.TOTP(secret).now()
                 filled = await _fill_totp_code(page, code, cb)
@@ -852,13 +854,47 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                         "button:has-text('Next')", "input[value='Next']",
                         "button:has-text('验证')", "button:has-text('下一步')"
                     ], timeout=2000)
-                    await asyncio.sleep(1.0)
-                    if await _azure_destination_ready(page, page.url or ""):
-                        _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
-                        return secret
+                    # 提交后实时监测后续状态（进入 Portal 或出现 KMSI）
+                    for _wait_post in range(6):
+                        await asyncio.sleep(0.5)
+                        cur_u_post = (page.url or "").lower()
+                        if await _azure_destination_ready(page, cur_u_post):
+                            _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
+                            return secret
+                        try:
+                            body_post = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
+                        except Exception:
+                            body_post = ""
+                        if "stay signed in" in body_post or "kmsi" in cur_u_post or "保持登录" in body_post:
+                            _emit(cb, "  ✅ 出现「保持登录 (Stay signed in)」，点击「Yes」...")
+                            await _click_first_visible(page, [
+                                "input#idSIButton9", "button#idSIButton9",
+                                "input[type='submit'][value='Yes']", "button:has-text('Yes')",
+                                "input[type='submit'][value='是']", "button:has-text('是')"
+                            ], timeout=2000)
+                            await asyncio.sleep(1.0)
+                            if await _azure_destination_ready(page, page.url or ""):
+                                _emit(cb, "  ✅ 已进入 Azure Portal")
+                                return secret
+                            break
                     continue
 
-    # 3. 未能通过快速登录验证或尚未绑定 2FA，兜底启动 MFA 注册流程
+            # 6. 如果在快速登录流程中页面确实重定向到了 MFA 注册向导（如 ProofUp）
+            if await _is_mfa_setup_page(page):
+                _emit(cb, "  🔐 页面重定向至 MFA 注册向导，启动 MFA 注册流程...")
+                res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
+                if res and ms_email:
+                    save_totp_cache(ms_email, res)
+                cur_u_after = (page.url or "").lower()
+                if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
+                    _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
+                    try:
+                        await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+                    except Exception:
+                        pass
+                return res or secret
+
+    # ── 情况 B: 无 Secret 或首次 MFA 绑定，启动响应式状态机 ──
     _emit(cb, "  🔐 启动 MFA 注册流程 (响应式状态机)...")
     res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
     if res and ms_email:

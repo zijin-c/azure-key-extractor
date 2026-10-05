@@ -916,8 +916,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         elif "install microsoft authenticator" in t or "start by getting the app" in t or "获取应用" in t:
             state = "install_auth"
         # 7. 保持账号安全页（Let's keep your account secure / More information required）
-        elif ("let's keep your account secure" in t or "keep your account secure" in t or
-              "more information required" in t or "需要详细信息" in t or "保护帐户安全" in t or "保护账户安全" in t):
+        elif ("let's keep your account secure" in t or "more information required" in t or "需要详细信息" in t or "需要更多信息" in t or "保护帐户安全" in t or "保护账户安全" in t):
             state = "keep_secure"
         # 8. 配置账号页（仅在具体出现 set up your account in app 且不在二维码/输入码页时触发）
         elif "set up your account in app" in t or "在应用中设置" in t:
