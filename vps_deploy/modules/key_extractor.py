@@ -160,30 +160,75 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
     return False, current_totp
 
 
-async def _is_mfa_login_prompt(page: Page) -> bool:
-    """检测当前页面是否包含 2FA 验证码输入框或 MFA / 登录相关特征。"""
+async def _is_mfa_setup_page(page: Page) -> bool:
+    """检测当前页面是否为 MFA 注册/绑定向导（ProofUp / mysignins / 安装验证器 / 扫码等）"""
     try:
+        cur_u = (page.url or "").lower()
+        if any(k in cur_u for k in ("mysignins.microsoft.com", "proofup")):
+            return True
         return await page.evaluate("""
             () => {
-                const sels = [
-                    "input[name='otc']", "input#idTxtBx_SAOTCC_OTC",
-                    "input[autocomplete='one-time-code']",
-                    "input[placeholder*='code' i]", "input[placeholder*='代码' i]"
-                ];
-                for (const s of sels) {
-                    const el = document.querySelector(s);
-                    if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) return true;
-                }
                 const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                return txt.includes('enter code') || txt.includes('enter the code') ||
-                       txt.includes('set up your account in app') || txt.includes("let's keep your account secure") ||
-                       txt.includes("install microsoft authenticator") || txt.includes("start by getting the app") ||
-                       txt.includes("scan the qr code") || txt.includes("more information required") ||
-                       txt.includes("keep your account secure") || txt.includes("setting up your passkey");
+                return txt.includes("let's keep your account secure") ||
+                       txt.includes("keep your account secure") ||
+                       txt.includes("more information required") ||
+                       txt.includes("需要详细信息") ||
+                       txt.includes("需要更多信息") ||
+                       txt.includes("保护帐户安全") ||
+                       txt.includes("保护账户安全") ||
+                       txt.includes("install microsoft authenticator") ||
+                       txt.includes("start by getting the app") ||
+                       txt.includes("获取应用") ||
+                       txt.includes("set up your account in app") ||
+                       txt.includes("set up your account") ||
+                       txt.includes("在应用中设置") ||
+                       txt.includes("scan the qr code") ||
+                       txt.includes("can't scan") ||
+                       txt.includes("扫描二维码") ||
+                       txt.includes("i want to set up a different method") ||
+                       txt.includes("i want to use a different authenticator app") ||
+                       txt.includes("security info") ||
+                       txt.includes("安全信息");
             }
         """)
     except Exception:
         return False
+
+
+async def _is_totp_input_page(page: Page) -> bool:
+    """检测页面是否为标准的 2FA 验证码输入/登录挑战页"""
+    try:
+        return await page.evaluate("""
+            () => {
+                const sels = [
+                    "input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC",
+                    "input[name='VerificationCode']", "input#VerificationCode",
+                    "input[autocomplete='one-time-code']", "input#otc",
+                    "input[data-automationid='otc-input']",
+                    "input[placeholder*='code' i]", "input[placeholder*='代码' i]", "input[placeholder*='验证码' i]",
+                    "input[aria-label*='code' i]", "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]"
+                ];
+                for (const s of sels) {
+                    const els = document.querySelectorAll(s);
+                    for (const el of els) {
+                        if (el && (el.offsetWidth > 0 || el.offsetHeight > 0) && !el.disabled && !el.readOnly) return true;
+                    }
+                }
+                const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                return txt.includes('enter code') || txt.includes('enter the code') ||
+                       txt.includes('输入代码') || txt.includes('输入验证码') ||
+                       txt.includes('approve a request') || txt.includes('sign in another way') ||
+                       txt.includes('其他登录方式') || txt.includes('其他验证方式') ||
+                       txt.includes('use a verification code') || txt.includes('使用验证码');
+            }
+        """)
+    except Exception:
+        return False
+
+
+async def _is_mfa_login_prompt(page: Page) -> bool:
+    """检测当前页面是否包含 2FA 验证码输入框或 MFA / 登录相关特征。"""
+    return (await _is_mfa_setup_page(page)) or (await _is_totp_input_page(page))
 
 
 
@@ -661,14 +706,14 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                                 ms_email: str, cb: ProgressCallback) -> str:
     """
     处理进入 Azure Portal 过程中的微软验证 / 2FA 流程：
-    1. 若已有 2FA 密钥（前面流程已设置过 2FA）：
-       - 仅作为验证流程：如果出现输入验证码输入框，直接用已有密钥通过 pyotp 生成 TOTP 码填入并提交 Verify；
+    1. 若已在 Azure Portal 业务页面，直接返回；
+    2. 若检测到处于 MFA 注册/绑定向导（ProofUp / mysignins / 安装验证器 / 扫码等）：
+       - 直接启动完整 _handle_mfa_setup 响应式状态机进行 2FA 注册绑定，捕获并保存 Secret；
+    3. 若处于常规 2FA 登录挑战页（Enter code / KMSI 保持登录 / 账号选择）且已有 2FA 密钥：
        - 若出现「以其他方式登录 / Sign in another way」，自动选择「使用验证码 / Use a verification code」；
-       - 若出现「保持登录 (Stay signed in)」，直接点「Yes」；
-       - 若页面停留在 mysignins / proofup，直接导航到 Education Software；
-       - 绝不进入冗长的新 MFA 注册向导！
-    2. 若无 2FA 密钥（前面流程未设置 2FA）：
-       - 启动完整 _handle_mfa_setup 响应式状态机进行 2FA 注册绑定，捕获 Secret 并完成流程。
+       - 若出现验证码输入框，通过 pyotp 生成 TOTP 码填入并提交；
+       - 若出现「保持登录 (Stay signed in)」，点击「Yes」；
+    4. 若未配置 2FA 或快速登录未通过，兜底调用 _handle_mfa_setup 响应式状态机。
     """
     from modules.azure_login import _handle_mfa_setup, _azure_destination_ready, _fill_totp_code
 
@@ -679,41 +724,55 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     )
 
     cur_u = (page.url or "").lower()
-    is_login_page = any(k in cur_u for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com"))
-    if not is_login_page and not await _is_mfa_login_prompt(page):
-        if "portal.azure.com" in cur_u or "education.azure.com" in cur_u:
-            return secret
-
-    if await _azure_destination_ready(page, page.url or ""):
+    if await _azure_destination_ready(page, cur_u):
         return secret
 
-    # ── 情况 A: 前面流程已设置过 2FA（已有 Secret），仅执行快速 TOTP 登录验证 ──
+    # 1. 优先判断是否为 MFA 注册/绑定向导（Let's keep your account secure / ProofUp / 安装验证器 / 扫码等）
+    if await _is_mfa_setup_page(page):
+        _emit(cb, "  🔐 检测到 MFA 注册/绑定向导，启动 MFA 注册流程...")
+        res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
+        if res and ms_email:
+            save_totp_cache(ms_email, res)
+        cur_u_after = (page.url or "").lower()
+        if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
+            _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
+            try:
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                pass
+        return res or secret
+
+    # 2. 若已有 Secret，且页面处于常规 2FA 登录验证 / 保持登录 / 账号选择
     if secret:
         _emit(cb, "  🔑 已有 2FA 密钥，执行快速 TOTP 登录验证...")
         for _attempt in range(12):  # 最多轮询 ~6 秒
             await asyncio.sleep(0.5)
             cur_u = (page.url or "").lower()
 
-            if await _azure_destination_ready(page, page.url or ""):
+            if await _azure_destination_ready(page, cur_u):
                 _emit(cb, "  ✅ 已进入 Azure Portal")
                 return secret
 
-            if any(k in cur_u for k in ("mysignins.microsoft.com", "proofup")):
-                _emit(cb, "  🔄 已有 2FA，直接导航至 Education Software 页面...")
-                try:
-                    await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-                except Exception:
-                    pass
-                await asyncio.sleep(1.0)
-                if await _azure_destination_ready(page, page.url or ""):
-                    return secret
+            if await _is_mfa_setup_page(page):
+                _emit(cb, "  🔐 页面跳转至 MFA 注册向导，启动 MFA 注册流程...")
+                res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
+                if res and ms_email:
+                    save_totp_cache(ms_email, res)
+                cur_u_after = (page.url or "").lower()
+                if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
+                    _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
+                    try:
+                        await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+                    except Exception:
+                        pass
+                return res or secret
 
             try:
                 body_lower = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
             except Exception:
                 body_lower = ""
 
-            # 1. 账号选择器 (Pick an account)
+            # 账号选择器 (Pick an account)
             if "pick an account" in body_lower or "choose an account" in body_lower:
                 _emit(cb, "  👆 出现账号选择器，选择已登录账号...")
                 for sel in [f"div:has-text('{ms_email}')", f"small:has-text('{ms_email}')", "[data-test='account-item']", "#tilesHolder .table"]:
@@ -727,7 +786,7 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                         pass
                 continue
 
-            # 2. 保持登录 (Stay signed in / KMSI)
+            # 保持登录 (Stay signed in / KMSI)
             if "stay signed in" in body_lower or "kmsi" in cur_u or "保持登录" in body_lower:
                 _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
                 await _click_first_visible(page, [
@@ -740,7 +799,7 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                     return secret
                 continue
 
-            # 3. 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
+            # 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
             if any(k in body_lower for k in ("approve a request", "check your mobile device", "sign in another way", "其他登录方式", "其他验证方式")):
                 for sw_sel in [
                     "a:has-text('Sign in another way')", "button:has-text('Sign in another way')",
@@ -775,35 +834,31 @@ async def _handle_portal_login(page: Page, totp_secret: str,
                     except Exception:
                         pass
 
-            # 4. 填入 TOTP 验证码并提交
-            code = pyotp.TOTP(secret).now()
-            filled = await _fill_totp_code(page, code, cb)
-            if filled:
-                _emit(cb, f"  🔢 已填入 TOTP 码: {code}，正在提交验证...")
-                await asyncio.sleep(0.3)
-                try:
-                    await page.keyboard.press("Enter")
-                except Exception:
-                    pass
-                await _click_first_visible(page, [
-                    "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
-                    "input#idSIButton9", "button#idSIButton9",
-                    "button:has-text('Verify')", "input[value='Verify']",
-                    "button:has-text('Next')", "input[value='Next']",
-                    "button:has-text('验证')", "button:has-text('下一步')"
-                ], timeout=2000)
-                await asyncio.sleep(1.0)
-                if await _azure_destination_ready(page, page.url or ""):
-                    _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
-                    return secret
-                continue
+            # 填入 TOTP 验证码并提交 (仅在页面确实有输入框时尝试)
+            if await _is_totp_input_page(page):
+                code = pyotp.TOTP(secret).now()
+                filled = await _fill_totp_code(page, code, cb)
+                if filled:
+                    _emit(cb, f"  🔢 已填入 TOTP 码: {code}，正在提交验证...")
+                    await asyncio.sleep(0.3)
+                    try:
+                        await page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+                    await _click_first_visible(page, [
+                        "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
+                        "input#idSIButton9", "button#idSIButton9",
+                        "button:has-text('Verify')", "input[value='Verify']",
+                        "button:has-text('Next')", "input[value='Next']",
+                        "button:has-text('验证')", "button:has-text('下一步')"
+                    ], timeout=2000)
+                    await asyncio.sleep(1.0)
+                    if await _azure_destination_ready(page, page.url or ""):
+                        _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
+                        return secret
+                    continue
 
-            # 5. 如果页面提示「需要更多信息 / Let's keep your account secure」，说明微软强制要求重新绑定
-            if any(k in body_lower for k in ("let's keep your account secure", "more information required", "需要详细信息", "保护帐户安全", "保护账户安全")):
-                _emit(cb, "  🔑 微软要求重新配置 2FA，进入 MFA 注册流程...")
-                break
-
-    # ── 情况 B: 前面流程未设置 2FA 或微软强制要求重新绑定，调用响应式注册状态机 ──
+    # 3. 未能通过快速登录验证或尚未绑定 2FA，兜底启动 MFA 注册流程
     _emit(cb, "  🔐 启动 MFA 注册流程 (响应式状态机)...")
     res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
     if res and ms_email:
@@ -830,130 +885,6 @@ async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000)
                 return True
         except Exception:
             continue
-    return False
-
-
-async def _click_next_robust(page: Page, cb: ProgressCallback = None) -> bool:
-    """点击 Next / Verify / Submit 按钮（多种方式尝试，含 force + scroll）。"""
-    for sel in [
-        "button#idSubmit_SAOTCC_Continue",
-        "input#idSubmit_SAOTCC_Continue",
-        "input#idSubmit_ProofUp_Redirect",
-        "input#idSIButton9",
-        "button#idSIButton9",
-        "button:has-text('Verify')",
-        "button:has-text('验证')",
-        "input[value='Verify']",
-        "input[value='验证']",
-        "button:has-text('Next')",
-        "button:has-text('下一步')",
-        "input[type='submit'][value='Next']",
-        "input[type='submit'][value='下一步']",
-        "input[type='submit'][value='Sign in']",
-        "button[type='submit']",
-        "input[type='submit']",
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=1500):
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=3000, force=True)
-                return True
-        except Exception:
-            continue
-    try:
-        clicked = await page.evaluate("""
-            () => {
-                const btns = [...document.querySelectorAll('button, input[type=submit]')];
-                const next = btns.find(b => {
-                    const t = (b.innerText || b.value || '').trim().toLowerCase();
-                    return t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'sign in';
-                });
-                if (next && !next.disabled) { next.click(); return true; }
-                return false;
-            }
-        """)
-        return bool(clicked)
-    except Exception:
-        return False
-
-
-async def _click_link_by_text(page: Page, texts: list) -> bool:
-    """按文本点击链接/按钮。"""
-    for text in texts:
-        try:
-            clicked = await page.evaluate("""
-                (text) => {
-                    const els = [...document.querySelectorAll('a, button, [role=link], [role=button]')];
-                    const target = els.find(el => {
-                        const t = (el.innerText || el.textContent || '').trim();
-                        return t === text || t.includes(text);
-                    });
-                    if (target) { target.click(); return true; }
-                    return false;
-                }
-            """, text)
-            if clicked:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback) -> bool:
-    """填入 TOTP 验证码到输入框。"""
-    sels = [
-        "input[name='otc']",
-        "input#idTxtBx_SAOTCC_OTC",
-        "input#idTxtBx_OTC",
-        "input[name='VerificationCode']",
-        "input#VerificationCode",
-        "input[autocomplete='one-time-code']",
-        "input#otc",
-        "input[placeholder*='code' i]",
-        "input[placeholder*='代码' i]",
-        "input[placeholder*='验证码' i]",
-        "input[aria-label*='code' i]",
-        "input[aria-label*='代码' i]",
-        "input[aria-label*='验证码' i]",
-        "input[type='tel']",
-    ]
-    for sel in sels:
-        try:
-            loc = page.locator(sel).first
-            if await loc.is_visible(timeout=2000):
-                await loc.click()
-                await loc.fill("")
-                await loc.fill(code)
-                actual = await loc.input_value()
-                if actual.strip() == code:
-                    _emit(cb, f"  ✅ TOTP 已填入")
-                    return True
-        except Exception:
-            continue
-    try:
-        ok = await page.evaluate("""
-            (code) => {
-                const inputs = [...document.querySelectorAll('input')].filter(i => {
-                    const r = i.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0 && !i.disabled && !i.readOnly
-                        && i.type !== 'hidden' && i.type !== 'submit' && i.type !== 'button';
-                });
-                if (inputs.length === 0) return false;
-                const target = inputs[0];
-                target.focus();
-                target.value = code;
-                target.dispatchEvent(new Event('input', {bubbles:true}));
-                target.dispatchEvent(new Event('change', {bubbles:true}));
-                return true;
-            }
-        """, code)
-        if ok:
-            _emit(cb, "  ✅ TOTP 已填入（JS）")
-            return True
-    except Exception:
-        pass
-    _emit(cb, "  ❌ TOTP 填入失败")
     return False
 
 
