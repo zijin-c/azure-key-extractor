@@ -240,7 +240,7 @@ async def _first_visible_locator(page: Page, selector: str):
 
 
 async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) -> bool:
-    """填入 TOTP 验证码到输入框（支持多选择器、跨 iframe、JS 兜底与快速超时保护）。"""
+    """填入 TOTP 验证码到输入框（支持多选择器、跨 iframe、键盘 Enter 回车与 JS 兜底）。"""
     sels = [
         "input[name='otc']",
         "input#idTxtBx_SAOTCC_OTC",
@@ -259,21 +259,14 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
     ]
     frames_to_try = [page] + list(page.frames)
 
-    # 策略 1: 定位器精准查找与拟人/直接写入
+    # 策略 1: 定位器精准查找与按键/直接写入
     for f in frames_to_try:
         for sel in sels:
             try:
                 loc = f.locator(sel).first
                 if await loc.is_visible(timeout=200):
-                    # 优先拟人化按键
-                    ok = await human_type(f, loc, code, min_delay=0.03, max_delay=0.08)
-                    if not ok:
-                        # 兜底：直接 click 与 fill
-                        try:
-                            await loc.click(timeout=800, force=True)
-                            await loc.fill(code, timeout=800)
-                        except Exception:
-                            pass
+                    await loc.click(timeout=800, force=True)
+                    await loc.fill(code, timeout=800)
                     val = ""
                     try:
                         val = await loc.input_value(timeout=400)
@@ -281,16 +274,20 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
                         pass
                     if val and code in val:
                         _emit(cb, "  ✅ TOTP 已填入")
-                        await asyncio.sleep(random.uniform(0.15, 0.3))
+                        await asyncio.sleep(random.uniform(0.15, 0.25))
                         try:
                             await loc.press("Enter", timeout=800)
+                        except Exception:
+                            pass
+                        try:
+                            await page.keyboard.press("Enter")
                         except Exception:
                             pass
                         return True
             except Exception:
                 continue
 
-    # 策略 2: JS 跨 Frame 深度穿透填入（严格限定为 OTC 验证码专属输入框，杜绝误填其他表单元素）
+    # 策略 2: JS 跨 Frame 深度穿透填入并派发回车事件
     for f in frames_to_try:
         try:
             ok = await f.evaluate("""
@@ -317,6 +314,9 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
                         target.value = code;
                         target.dispatchEvent(new Event('input', {bubbles: true}));
                         target.dispatchEvent(new Event('change', {bubbles: true}));
+                        target.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+                        target.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+                        target.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
                         return true;
                     }
                     return false;
@@ -324,6 +324,10 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
             """, code)
             if ok:
                 _emit(cb, "  ✅ TOTP 已填入 (JS)")
+                try:
+                    await page.keyboard.press("Enter")
+                except Exception:
+                    pass
                 return True
         except Exception:
             continue
@@ -1233,7 +1237,16 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 if filled:
                     consecutive_totp_fails = 0
                     await asyncio.sleep(0.3)
+                    # 1. 触发真实键盘 Enter 回车键提交
+                    try:
+                        await page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+
+                    # 2. 定位器点击提交按钮（优先匹配 Fluent UI Primary 按钮与常用按钮）
                     await _click_first_visible(page, [
+                        "button.ms-Button--primary",
+                        "button[data-automationid='next-button']",
                         "input#idSubmit_SAOTCC_Continue", "button#idSubmit_SAOTCC_Continue",
                         "input#idSIButton9", "button#idSIButton9",
                         "button:has-text('Verify')", "input[value='Verify']",
@@ -1241,17 +1254,19 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         "button:has-text('验证')", "button:has-text('下一步')",
                         "[role='button']:has-text('Next')", "[role='button']:has-text('下一步')",
                         "[role='button']:has-text('Verify')", "[role='button']:has-text('验证')"
-                    ], timeout=2500)
+                    ], timeout=2000)
+
+                    # 3. JS evaluate 点击 Primary / Submit 按钮
                     try:
                         await page.evaluate("""() => {
                             const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role="button"]')];
-                            for (const b of btns) {
+                            const btn = btns.find(b => {
+                                const cls = (b.className || '').toString();
                                 const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
-                                if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续' || t === 'done' || t === '完成') {
-                                    b.click();
-                                    break;
-                                }
-                            }
+                                if (b.disabled || b.getBoundingClientRect().width === 0) return false;
+                                return cls.includes('primary') || t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续' || t === 'done' || t === '完成';
+                            });
+                            if (btn) btn.click();
                         }""")
                     except Exception:
                         pass
@@ -1293,7 +1308,12 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                             }""")
                             if has_done or any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added", "you're all set", "app registered", "已成功注册", "成功添加验证器")):
                                 _emit(cb, "  🏁 验证码校验通过，点击 Done/完成...")
+                                try:
+                                    await page.keyboard.press("Enter")
+                                except Exception:
+                                    pass
                                 await _click_first_visible(page, [
+                                    "button.ms-Button--primary",
                                     "button:has-text('Done')", "input[value='Done']",
                                     "[role='button']:has-text('Done')", "button:has-text('完成')",
                                     "button:has-text('Next')", "input[value='Next']",
@@ -1417,7 +1437,12 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         if state == "done":
             _emit(cb, "  🏁 MFA 注册成功，点击 Next/Done/完成...")
             _sync_secret(secret)
+            try:
+                await page.keyboard.press("Enter")
+            except Exception:
+                pass
             await _click_first_visible(page, [
+                "button.ms-Button--primary",
                 "button:has-text('Done')", "input[value='Done']",
                 "[role='button']:has-text('Done')", "button:has-text('完成')",
                 "input[value='完成']", "[role='button']:has-text('完成')",
