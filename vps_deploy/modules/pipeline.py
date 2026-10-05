@@ -589,8 +589,8 @@ async def process_account(
                 last_change_time = asyncio.get_event_loop().time()
             else:
                 stagnant = asyncio.get_event_loop().time() - last_change_time
-                max_stagnant = 60 if is_confirming else 25
-                if stagnant >= max_stagnant and refresh_count < 2:
+                max_stagnant = 45 if is_confirming else 25
+                if stagnant >= max_stagnant and refresh_count < 1:
                     refresh_count += 1
                     last_change_time = asyncio.get_event_loop().time()
                     switched_p = None
@@ -600,12 +600,12 @@ async def process_account(
                         except Exception:
                             pass
                     p_msg = f"，已热切换至代理: {switched_p}" if switched_p else ""
-                    _emit(cb, f"  ⚠️ [网络延迟适配] 界面 {int(stagnant)} 秒无响应{p_msg}，重新加载学生认证页面 ({refresh_count}/2)...")
+                    _emit(cb, f"  ⚠️ [网络延迟适配] 界面 {int(stagnant)} 秒无响应{p_msg}，重新加载学生认证页面 ({refresh_count}/1)...")
                     try:
                         await page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=25000)
                     except Exception as e:
                         _emit(cb, f"  ⚠️ 重新导航异常: {e}")
-                elif stagnant >= max_stagnant and refresh_count >= 2:
+                elif stagnant >= max_stagnant and refresh_count >= 1:
                     if account.email and account.totp_secret:
                         save_totp_cache(account.email, account.totp_secret)
                     raise LoginNetworkError("学生认证界面停滞超过 25 秒无响应（疑似网络/代理卡顿），换代理重试", totp=account.totp_secret)
@@ -840,8 +840,14 @@ async def run_pipeline(
             _emit(cb, f"[{display_idx}/{display_total}] 处理账号: {account.email} 开始处理: {account.email}")
 
             result = None
-            max_login_retries = 1  # SheerID / 验证码类失败：换浏览器重试 1 次
-            max_network_retries = int(getattr(config, "NETWORK_PROXY_RETRIES", 3))  # 网络/代理卡顿：换代理重试次数
+            pool_size = len(rotator.proxy_pool)
+            # 代理池仅 1 个节点或直连时，无冗余节点可切，在同一卡顿节点上反复重试只会浪费数倍时间；直接 0 重试快速推进
+            if pool_size <= 1:
+                max_network_retries = 0
+                max_login_retries = 0
+            else:
+                max_network_retries = min(int(getattr(config, "NETWORK_PROXY_RETRIES", 1)), max(1, pool_size - 1))
+                max_login_retries = 1
             verify_retry = 0
             network_retry = 0
             while True:
@@ -873,10 +879,13 @@ async def run_pipeline(
                         _account_cb(f"⚠️ [新开浏览器重试] {e}，已关闭旧浏览器{totp_msg}，正在启动全新浏览器重试 ({verify_retry}/{max_login_retries}) | {retry_proxy_info}...")
                         await asyncio.sleep(random.uniform(2.5, 4.0))
                         continue
-                    _account_cb(f"❌ 全新浏览器重试后仍未通过: {e}")
+                    if max_login_retries > 0:
+                        _account_cb(f"❌ 全新浏览器重试后仍未通过: {e}")
+                    else:
+                        _account_cb(f"❌ 遇到验证异常，跳过重试以快速推进后续账号: {e}")
                     result = KeyResult(
                         account=account, success=False, totp_secret=saved_totp,
-                        message=f"新开浏览器重试仍失败: {e}"[:200]
+                        message=f"验证异常: {e}"[:200]
                     )
                     _persist_result(result)
                     break
@@ -902,12 +911,14 @@ async def run_pipeline(
                         await asyncio.sleep(random.uniform(1.5, 3.0))
                         continue
                     if is_tunnel_err and curr_proxy:
-                        _account_cb("❌ 代理连接失败: 多个代理节点均无法建立连接 (SOCKS5 认证拒绝/流量耗尽)，请检查代理套餐！")
+                        _account_cb(f"❌ 代理连接失败: 多个代理节点均无法建立连接 (SOCKS5 认证拒绝/流量耗尽)，请检查代理套餐！{totp_msg}")
+                    elif max_network_retries > 0:
+                        _account_cb(f"❌ 已切换 {max_network_retries} 个代理重试仍失败: {err_msg[:120]}{totp_msg}")
                     else:
-                        _account_cb(f"❌ 已切换 {max_network_retries} 个代理重试仍失败: {err_msg[:150]}")
+                        _account_cb(f"❌ 处理失败，跳过重试以快速推进后续账号: {err_msg[:120]}{totp_msg}")
                     result = KeyResult(
                         account=account, success=False, totp_secret=saved_totp,
-                        message=f"换代理重试 {max_network_retries} 次仍失败: {err_msg}"[:200]
+                        message=f"{'换代理重试仍' if max_network_retries > 0 else ''}失败: {err_msg}"[:200]
                     )
                     _persist_result(result)
                     break

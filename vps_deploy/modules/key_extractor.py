@@ -52,17 +52,17 @@ class PortalLoadError(RuntimeError):
         self.totp = totp or ""
 
 
-async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 50,
+async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 25,
                                    totp_secret: str = "", ms_email: str = "", proxy_ctrl: Optional[Any] = None) -> tuple[bool, str]:
     """等待 Azure Portal 完全加载（出现导航栏或搜索框）。
     在等待过程中实时感知 2FA / 登录重定向并自动输入 TOTP 验证码。
-    如果超过 25 秒没响应，强制重新导航到 Education Software 页面。
+    如果超过 12 秒没响应，强制重新导航到 Education Software 页面。
     """
     _EDU_SW_URL = (
         "https://portal.azure.com/#view/Microsoft_Azure_Education"
         "/EducationMenuBlade/~/software"
     )
-    _emit(cb, "  ⏳ 等待 Azure Portal 加载...")
+    _emit(cb, "  ⏳ 等待 Azure Portal 加载（最多 25 秒）...")
     start_time = asyncio.get_event_loop().time()
     deadline = start_time + timeout
     retry_done = False
@@ -116,13 +116,13 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
         except Exception:
             pass
 
-        # 超过 25 秒未就绪，强制重新导航/刷新（只重试一次）
+        # 超过 12 秒未就绪，强制重新导航/刷新（只重试一次）
         elapsed = asyncio.get_event_loop().time() - start_time
-        if elapsed > 25 and not retry_done:
+        if elapsed > 12 and not retry_done:
             retry_done = True
-            _emit(cb, "  ⚠️  Portal 加载超过 25 秒未就绪，强制重新导航/刷新...")
+            _emit(cb, "  ⚠️  Portal 加载超过 12 秒未就绪，尝试重新导航/刷新...")
             try:
-                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
                 _emit(cb, "  🔄 已重新导航到 Education Software 页面")
             except Exception as e:
                 _emit(cb, f"  ⚠️  重新导航异常: {e}")
@@ -139,7 +139,8 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
         await asyncio.sleep(1)
 
-    raise PortalLoadError("Azure Portal 加载超过 25 秒仍未就绪（框架加载超时/代理卡顿），换代理重试", totp=current_totp)
+    _emit(cb, "  ⚠️  Portal 加载超过 25 秒仍未就绪，尝试继续提取...")
+    return False, current_totp
 
 
 async def _is_mfa_login_prompt(page: Page) -> bool:
@@ -179,12 +180,18 @@ async def _search_product(page: Page, search_term: str, cb: ProgressCallback) ->
         () => {
             const inputs = [...document.querySelectorAll('input')].filter(i => {
                 const r = i.getBoundingClientRect();
-                if (r.width === 0 || r.height === 0) return false;
+                if (r.width === 0 || r.height === 0 || r.top < 45) return false;
                 if (i.disabled || i.readOnly) return false;
                 const ph = (i.placeholder || '').toLowerCase();
                 const al = (i.getAttribute('aria-label') || '').toLowerCase();
-                if (ph.includes('search resources') || al.includes('search resources') || al.includes('global search')) return false;
-                return ph.includes('search') || al.includes('search') || i.type === 'search';
+                const cls = (i.className || '').toLowerCase();
+                if (ph.includes('search resources') || al.includes('search resources') || al.includes('global search') ||
+                    ph.includes('搜索资源') || al.includes('搜索资源') || al.includes('全局搜索')) return false;
+                return ph.includes('search') || al.includes('search') ||
+                       ph.includes('搜索') || al.includes('搜索') ||
+                       ph.includes('筛选') || al.includes('筛选') ||
+                       i.type === 'search' || cls.includes('search') ||
+                       !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
             });
             if (inputs.length === 0) return false;
             inputs.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
@@ -1002,6 +1009,54 @@ async def _extract_secret_key_robust(page: Page, cb: ProgressCallback) -> str:
     return ""
 
 
+async def _ensure_software_blade_active(page: Page, cb: ProgressCallback = None) -> bool:
+    """
+    确保当前处于 Education 的 Software (软件) 子页面。
+    若停留在 Overview (概览) 或其他标签，自动在左侧菜单中定位并点击「Software / 软件」。
+    """
+    for frame in [page] + list(page.frames):
+        try:
+            res = await frame.evaluate("""
+                () => {
+                    // 1. 如果内部软件搜索框已存在，说明已经在 Software 页面
+                    const searchBox = document.querySelector('input[placeholder*="Search" i], input[placeholder*="搜索" i], input[aria-label*="Search" i], input[aria-label*="搜索" i], input[type="search"], .ms-SearchBox');
+                    const isGlobal = searchBox && (
+                        (searchBox.placeholder || '').toLowerCase().includes('resources') ||
+                        (searchBox.getAttribute('aria-label') || '').toLowerCase().includes('resources') ||
+                        (searchBox.placeholder || '').toLowerCase().includes('搜索资源')
+                    );
+                    if (searchBox && !isGlobal) {
+                        return { already_active: true };
+                    }
+
+                    // 2. 在左侧菜单栏寻找并点击 Software / 软件
+                    const candidates = [...document.querySelectorAll('a, button, [role="menuitem"], [role="treeitem"], [role="tab"], [role="listitem"], li, span, div')];
+                    for (const el of candidates) {
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (/^(Software|软件)$/i.test(txt)) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0 && r.left < 500 && r.top > 30) {
+                                el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                                el.click();
+                                return { clicked: true, text: txt };
+                            }
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if res and isinstance(res, dict):
+                if res.get("clicked"):
+                    if cb:
+                        _emit(cb, f"  🖱️ 自动点击 Education 菜单项「{res.get('text')}」以切换至软件列表...")
+                    return True
+                elif res.get("already_active"):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 async def extract_all_keys(
     page: Page,
     ctx: BrowserContext,
@@ -1068,33 +1123,79 @@ async def extract_all_keys(
         # ── 处理 Terms Acceptance ────────────────────────────
         await _handle_terms_flow(sw_page, cb)
 
-        # ── 等待软件列表加载（必须确认出现产品数据行）─────────────────
+        # ── 等待软件列表加载（支持侧边栏自动点击切换与秒级就绪）─────────────
         _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")
         list_ready = False
-        for w in range(35):
+        for w in range(25):
             await asyncio.sleep(1)
+
+            # 在第 1, 4, 8, 14 秒主动尝试点击左侧 Education 菜单中的「Software / 软件」
+            if w in (1, 4, 8, 14):
+                await _ensure_software_blade_active(sw_page, cb)
+
             for frame in [sw_page] + list(sw_page.frames):
                 try:
-                    has_data = await frame.evaluate("""
+                    status = await frame.evaluate("""
                         () => {
-                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"]')];
-                            return items.some(el => {
-                                const t = (el.innerText || el.textContent || '').toLowerCase();
-                                return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') || t.includes('access') || t.includes('project') || t.includes('visio');
+                            const txt = (document.body ? document.body.innerText : '') || '';
+                            const lower = txt.toLowerCase();
+
+                            // 1. 显式检测是否无软件授权或无可用产品
+                            if (lower.includes('no software available') || lower.includes('无可用软件') ||
+                                lower.includes('没有可用的软件') || lower.includes('no packages available') ||
+                                lower.includes('no software packages') || lower.includes('无软件授权') ||
+                                lower.includes('you do not have access to software')) {
+                                return { no_software: true };
+                            }
+
+                            // 2. 内部软件搜索框（排除顶部全局搜索）
+                            const searchInputs = [...document.querySelectorAll('input')].filter(i => {
+                                const r = i.getBoundingClientRect();
+                                if (r.width === 0 || r.height === 0 || r.top < 45 || i.disabled || i.readOnly) return false;
+                                const ph = (i.placeholder || '').toLowerCase();
+                                const al = (i.getAttribute('aria-label') || '').toLowerCase();
+                                if (ph.includes('search resources') || al.includes('search resources') || ph.includes('搜索资源')) return false;
+                                return ph.includes('search') || al.includes('search') || ph.includes('搜索') || al.includes('搜索') ||
+                                       ph.includes('筛选') || al.includes('筛选') || i.type === 'search' ||
+                                       !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
                             });
+                            const has_search = searchInputs.length > 0;
+
+                            // 3. 软件列表数据行
+                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"], table tr td')];
+                            const has_items = items.some(el => {
+                                const t = (el.innerText || el.textContent || '').toLowerCase();
+                                return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') ||
+                                       t.includes('access') || t.includes('project') || t.includes('visio') ||
+                                       t.includes('office') || t.includes('azure') || t.includes('community') ||
+                                       t.includes('server') || t.includes('developer');
+                            });
+
+                            const rows = document.querySelectorAll('[role="row"], table tr');
+                            const has_grid_rows = rows.length >= 3;
+
+                            return {
+                                ready: has_search || has_items || has_grid_rows,
+                                no_software: false
+                            };
                         }
                     """)
-                    if has_data:
-                        list_ready = True
-                        break
+                    if isinstance(status, dict):
+                        if status.get("no_software"):
+                            _emit(cb, "  ℹ️  该账号无可用 Education 软件授权，直接记录并跳过")
+                            return {}, updated_totp
+                        if status.get("ready"):
+                            list_ready = True
+                            break
                 except Exception:
                     pass
+
             if list_ready:
-                _emit(cb, f"  ✅ 软件列表已就绪（{w+1}s）")
+                _emit(cb, f"  ✅ 软件列表/搜索框已就绪（{w+1}s）")
                 break
 
-            # 如果 10 秒后仍未就绪且出现红条横幅，自动重试一次条款接受
-            if w == 10:
+            # 如果 8 秒后仍未就绪且出现红条横幅，自动重试一次条款接受
+            if w == 8:
                 try:
                     has_red = await sw_page.evaluate("() => (document.body.innerText || '').includes('accept the terms')")
                     if has_red:
@@ -1103,11 +1204,11 @@ async def extract_all_keys(
                 except Exception:
                     pass
 
-            # 25 秒仍未就绪：重新导航软件页再给一次机会
-            if w == 25:
-                _emit(cb, "  🔄 软件列表 25 秒未加载，重新导航 Education Software 页面...")
+            # 16 秒仍未就绪：重新导航软件页再给一次机会
+            if w == 16:
+                _emit(cb, "  🔄 软件列表 16 秒未加载，重新导航 Education Software 页面...")
                 try:
-                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
                 except Exception as e:
                     _emit(cb, f"  ⚠️ 重新导航异常: {str(e)[:80]}")
 
@@ -1262,8 +1363,8 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     has_banner = False
     detected_text = ""
 
-    _emit(cb, "  🔍 检测 Terms 协议横幅（最多 25 秒，支持就绪秒级直通）...")
-    for w in range(25):
+    _emit(cb, "  🔍 检测 Terms 协议横幅（最多 8 秒，支持就绪秒级直通）...")
+    for w in range(8):
         await asyncio.sleep(1)
         for frame in [sw_page] + list(sw_page.frames):
             try:
@@ -1291,16 +1392,22 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
         if has_banner:
             break
 
-        # 智能短路直通：若轮询超过 3 秒，且页面已渲染出产品列表或搜索输入框，且无 Terms 横幅
+        # 在第 2 秒主动尝试切换到 Software 标签
+        if w == 2:
+            await _ensure_software_blade_active(sw_page, cb)
+
+        # 智能短路直通：若轮询超过 2 秒，且页面已渲染出产品列表或搜索输入框，且无 Terms 横幅
         # 说明条款早已签署完毕，直接秒级跳过 Terms 流程，无需干等！
-        if w >= 3:
+        if w >= 2:
             sw_ready = False
             for frame in [sw_page] + list(sw_page.frames):
                 try:
                     sw_ready = await frame.evaluate("""
                         () => {
-                            const has_search = !!document.querySelector('input[placeholder*="Search" i], input[aria-label*="Search" i], input[type="search"]');
-                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"]')];
+                            const has_search = !!document.querySelector(
+                                'input[placeholder*="Search" i], input[placeholder*="搜索" i], input[aria-label*="Search" i], input[aria-label*="搜索" i], input[type="search"], .ms-SearchBox'
+                            );
+                            const items = [...document.querySelectorAll('a, [role="row"], [role="gridcell"], table tr td')];
                             const has_items = items.some(el => {
                                 const t = (el.innerText || el.textContent || '').toLowerCase();
                                 return t.includes('visual studio') || t.includes('windows') || t.includes('sql server') || t.includes('access') || t.includes('project') || t.includes('visio');

@@ -1693,14 +1693,14 @@ async def do_azure_login(
                 "username may be incorrect" in body_lower or "账户不存在" in body_lower or "帐户不存在" in body_lower):
             raise RuntimeError(f"账号不存在: {ms_email}")
 
-        # 检查单步骤 25 秒停滞无动静与 2 次刷新 (共 50s 超时换代理)
+        # 检查单步骤 25 秒停滞无动静与 1 次刷新 (共 25s 周期快速判定换代理/切账号)
         login_snap = f"{url_lower}"
         if login_snap != login_last_snapshot:
             login_last_snapshot = login_snap
             login_last_change = asyncio.get_event_loop().time()
         else:
             stagnant_login = asyncio.get_event_loop().time() - login_last_change
-            if stagnant_login >= 25 and login_refresh_count < 2:
+            if stagnant_login >= 25 and login_refresh_count < 1:
                 login_refresh_count += 1
                 login_last_change = asyncio.get_event_loop().time()
                 switched_p = None
@@ -1710,15 +1710,15 @@ async def do_azure_login(
                     except Exception:
                         pass
                 p_msg = f"，已热切换至代理: {switched_p}" if switched_p else ""
-                _emit(cb, f"  ⚠️ [网络延迟适配] 登录界面 25 秒无响应{p_msg}，尝试自动刷新网页 ({login_refresh_count}/2)...")
+                _emit(cb, f"  ⚠️ [网络延迟适配] 登录界面 25 秒无响应{p_msg}，尝试自动刷新网页 ({login_refresh_count}/1)...")
                 try:
                     await page.reload(wait_until="domcontentloaded", timeout=20000)
                 except Exception as e:
                     _emit(cb, f"  ⚠️ 自动刷新异常: {e}")
-            elif stagnant_login >= 25 and login_refresh_count >= 2:
+            elif stagnant_login >= 20 and login_refresh_count >= 1:
                 if ms_email and totp_secret:
                     save_totp_cache(ms_email, totp_secret)
-                raise LoginNetworkError(f"登录界面停滞 25 秒无响应且刷新无进展（疑似网络/代理卡顿），换代理重试", totp=totp_secret)
+                raise LoginNetworkError(f"登录界面停滞超过 25 秒无响应且刷新无进展（疑似网络/代理卡顿），换代理重试", totp=totp_secret)
 
         # 确认已进入业务页面
         if await _azure_destination_ready(page, url):
