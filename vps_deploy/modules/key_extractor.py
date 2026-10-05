@@ -79,6 +79,9 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
                 current_totp = new_totp
                 if ms_email:
                     save_totp_cache(ms_email, current_totp)
+            # 处理完 2FA 或在登录流程中，重置计时器，确保 30 秒是从 2FA 真正完成进入 Portal 后才开始计算
+            start_time = asyncio.get_event_loop().time()
+            deadline = start_time + timeout
             await asyncio.sleep(1)
             continue
 
@@ -135,6 +138,8 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
                 current_totp = new_totp
                 if ms_email:
                     save_totp_cache(ms_email, current_totp)
+            start_time = asyncio.get_event_loop().time()
+            deadline = start_time + timeout
             continue
 
         await asyncio.sleep(1)
