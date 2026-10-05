@@ -73,6 +73,18 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
         # 1. 实时检测是否触发微软登录/OAuth/2FA 验证页 (如 login.microsoftonline.com/organizations/oauth2/...)
         if any(k in cur_url for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com")) or await _is_mfa_login_prompt(page):
+            # 如果已有 TOTP 密钥且页面停留在 mysignins / proofup，优先直接导航到 Portal 避免重复进入 2FA 绑定向导
+            if current_totp and any(k in cur_url for k in ("mysignins.microsoft.com", "proofup")):
+                _emit(cb, "  🔄 2FA 密钥已就绪，直接导航到 Education Software 页面...")
+                try:
+                    await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+                except Exception:
+                    pass
+                start_time = asyncio.get_event_loop().time()
+                deadline = start_time + timeout
+                await asyncio.sleep(1)
+                continue
+
             _emit(cb, "  🔑 检测到 Portal 登录/2FA 重定向，正在自动处理...")
             new_totp = await _handle_portal_login(page, current_totp, ms_email, cb)
             if new_totp:
@@ -672,7 +684,15 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     res = await _handle_mfa_setup(page, cb, existing_secret=totp_secret, ms_email=ms_email)
     if res and ms_email:
         save_totp_cache(ms_email, res)
-    return res
+
+    cur_u_after = (page.url or "").lower()
+    if (res or totp_secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
+        _emit(cb, "  🔄 2FA 验证已完成，主动导航至 Education Software 页面...")
+        try:
+            await page.goto("https://portal.azure.com/#view/Microsoft_Azure_Education/EducationMenuBlade/~/software", wait_until="domcontentloaded", timeout=25000)
+        except Exception:
+            pass
+    return res or totp_secret
 
 
 async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000) -> bool:

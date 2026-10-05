@@ -240,7 +240,7 @@ async def _first_visible_locator(page: Page, selector: str):
 
 
 async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) -> bool:
-    """填入 TOTP 验证码到输入框（支持多选择器、跨 iframe、键盘 Enter 回车与 JS 兜底）。"""
+    """填入 TOTP 验证码到输入框（支持 React 16+ 原生 value setter、Fluent UI 深度穿透、跨 iframe 与真实按键）。"""
     sels = [
         "input[name='otc']",
         "input#idTxtBx_SAOTCC_OTC",
@@ -249,6 +249,7 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
         "input#VerificationCode",
         "input[autocomplete='one-time-code']",
         "input#otc",
+        "input[data-automationid='otc-input']",
         "input[placeholder*='code' i]",
         "input[placeholder*='代码' i]",
         "input[placeholder*='验证码' i]",
@@ -256,27 +257,88 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
         "input[aria-label*='代码' i]",
         "input[aria-label*='验证码' i]",
         "input[type='tel']",
+        "input[type='number']",
+        "input.ms-TextField-field",
     ]
     frames_to_try = [page] + list(page.frames)
 
-    # 策略 1: 定位器精准查找与按键/直接写入
+    # 策略 1: JS 原生 Setter 穿透填入（触发 React synthetic events，确保 Fluent UI Primary 按钮激活）
+    for f in frames_to_try:
+        try:
+            ok = await f.evaluate("""
+                (code) => {
+                    const otcSels = [
+                        "input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC",
+                        "input[name='VerificationCode']", "input#VerificationCode",
+                        "input[autocomplete='one-time-code']", "input#otc",
+                        "input[data-automationid='otc-input']",
+                        "input[placeholder*='code' i]", "input[placeholder*='代码' i]",
+                        "input[placeholder*='验证码' i]", "input[aria-label*='code' i]",
+                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]",
+                        "input[type='tel']", "input.ms-TextField-field"
+                    ];
+                    let target = null;
+                    for (const s of otcSels) {
+                        const els = document.querySelectorAll(s);
+                        for (const el of els) {
+                            if (el && !el.disabled && !el.readOnly) {
+                                const r = el.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) { target = el; break; }
+                            }
+                        }
+                        if (target) break;
+                    }
+                    if (target) {
+                        target.focus();
+                        target.value = '';
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                        if (setter) {
+                            setter.call(target, code);
+                        } else {
+                            target.value = code;
+                        }
+                        target.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                        target.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                        return true;
+                    }
+                    return false;
+                }
+            """, code)
+            if ok:
+                _emit(cb, "  ✅ TOTP 已填入")
+                try:
+                    await page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            continue
+
+    # 策略 2: 定位器精准查找与按键/直接写入
     for f in frames_to_try:
         for sel in sels:
             try:
                 loc = f.locator(sel).first
-                if await loc.is_visible(timeout=200):
-                    await loc.click(timeout=800, force=True)
-                    await loc.fill(code, timeout=800)
-                    val = ""
+                if await loc.is_visible(timeout=150):
+                    await loc.click(timeout=500, force=True)
                     try:
-                        val = await loc.input_value(timeout=400)
+                        await loc.fill("")
                     except Exception:
                         pass
+                    await loc.fill(code, timeout=600)
+                    val = ""
+                    try:
+                        val = await loc.input_value(timeout=300)
+                    except Exception:
+                        pass
+                    if not val or code not in val:
+                        await loc.type(code, delay=20)
+                        val = await loc.input_value(timeout=300)
                     if val and code in val:
                         _emit(cb, "  ✅ TOTP 已填入")
-                        await asyncio.sleep(random.uniform(0.15, 0.25))
+                        await asyncio.sleep(random.uniform(0.1, 0.2))
                         try:
-                            await loc.press("Enter", timeout=800)
+                            await loc.press("Enter", timeout=500)
                         except Exception:
                             pass
                         try:
@@ -286,51 +348,6 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
                         return True
             except Exception:
                 continue
-
-    # 策略 2: JS 跨 Frame 深度穿透填入并派发回车事件
-    for f in frames_to_try:
-        try:
-            ok = await f.evaluate("""
-                (code) => {
-                    const otcSels = [
-                        "input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC",
-                        "input[name='VerificationCode']", "input#VerificationCode",
-                        "input[autocomplete='one-time-code']", "input#otc",
-                        "input[placeholder*='code' i]", "input[placeholder*='代码' i]",
-                        "input[placeholder*='验证码' i]", "input[aria-label*='code' i]",
-                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]",
-                        "input[type='tel']"
-                    ];
-                    let target = null;
-                    for (const s of otcSels) {
-                        const el = document.querySelector(s);
-                        if (el && !el.disabled && !el.readOnly) {
-                            const r = el.getBoundingClientRect();
-                            if (r.width > 0 && r.height > 0) { target = el; break; }
-                        }
-                    }
-                    if (target) {
-                        target.focus();
-                        target.value = code;
-                        target.dispatchEvent(new Event('input', {bubbles: true}));
-                        target.dispatchEvent(new Event('change', {bubbles: true}));
-                        target.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-                        target.dispatchEvent(new KeyboardEvent('keypress', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-                        target.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-                        return true;
-                    }
-                    return false;
-                }
-            """, code)
-            if ok:
-                _emit(cb, "  ✅ TOTP 已填入 (JS)")
-                try:
-                    await page.keyboard.press("Enter")
-                except Exception:
-                    pass
-                return True
-        except Exception:
-            continue
 
     _emit(cb, "  ❌ TOTP 填入失败")
     return False
@@ -1247,6 +1264,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     await _click_first_visible(page, [
                         "button.ms-Button--primary",
                         "button[data-automationid='next-button']",
+                        "button[data-automationid='set-up-authenticator-app-next-button']",
                         "input#idSubmit_SAOTCC_Continue", "button#idSubmit_SAOTCC_Continue",
                         "input#idSIButton9", "button#idSIButton9",
                         "button:has-text('Verify')", "input[value='Verify']",
@@ -1291,64 +1309,66 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 _emit(cb, "  ⚠️ TOTP 验证码校验未通过，准备重新生成填入...")
                                 break
 
-                            # 2. 检测是否到达成功完成/Done 界面（点击 Done/完成 并等待页面离开 mysignins）
+                            # 2. 检测是否到达成功完成/Done 界面（推进所有后续 Next/Done 按钮）
                             has_done = await page.evaluate("""() => {
                                 const btns = [...document.querySelectorAll('button, input[type=button], input[type=submit], a, [role="button"]')];
                                 const doneBtn = btns.find(b => {
                                     const r = b.getBoundingClientRect();
                                     if (r.width === 0 || r.height === 0 || b.disabled) return false;
                                     const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
-                                    return t === 'done' || t === '完成' || t === 'finish' || t === 'finished';
+                                    return t === 'done' || t === '完成' || t === 'finish' || t === 'finished' || t === 'next' || t === '下一步';
                                 });
-                                if (doneBtn) {
-                                    doneBtn.click();
-                                    return true;
-                                }
-                                return false;
+                                return !!doneBtn;
                             }""")
-                            if has_done or any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added", "you're all set", "app registered", "已成功注册", "成功添加验证器")):
-                                _emit(cb, "  🏁 验证码校验通过，点击 Done/完成...")
-                                try:
-                                    await page.keyboard.press("Enter")
-                                except Exception:
-                                    pass
-                                await _click_first_visible(page, [
-                                    "button.ms-Button--primary",
-                                    "button:has-text('Done')", "input[value='Done']",
-                                    "[role='button']:has-text('Done')", "button:has-text('完成')",
-                                    "button:has-text('Next')", "input[value='Next']",
-                                    "button:has-text('下一步')"
-                                ], timeout=2000)
-                                try:
-                                    await page.evaluate("""() => {
-                                        const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
-                                        for (const b of btns) {
-                                            const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
-                                            if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步') {
-                                                b.click();
-                                                break;
+                            is_success_msg = any(k in cur_body for k in (
+                                "notification approved", "great job", "successfully registered",
+                                "authenticator app added", "authenticator app was successfully",
+                                "you're all set", "app registered", "已成功注册", "成功添加验证器", "太棒了"
+                            ))
+                            if has_done or is_success_msg:
+                                _emit(cb, "  🏁 验证码校验通过，点击 Done/Next 推进完成...")
+                                for _done_round in range(4):
+                                    try:
+                                        await page.keyboard.press("Enter")
+                                    except Exception:
+                                        pass
+                                    await _click_first_visible(page, [
+                                        "button.ms-Button--primary",
+                                        "button[data-automationid='done-button']",
+                                        "button[data-automationid='next-button']",
+                                        "button:has-text('Done')", "input[value='Done']",
+                                        "[role='button']:has-text('Done')", "button:has-text('完成')",
+                                        "button:has-text('Finish')", "button:has-text('Continue')",
+                                        "button:has-text('Next')", "input[value='Next']",
+                                        "button:has-text('下一步')", "input[value='下一步']"
+                                    ], timeout=1200)
+                                    try:
+                                        await page.evaluate("""() => {
+                                            const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
+                                            for (const b of btns) {
+                                                const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                                                if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步' || t === 'continue' || t === '继续') {
+                                                    b.click();
+                                                    break;
+                                                }
                                             }
-                                        }
-                                    }""")
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(1.0)
-                                for _w2 in range(20):
+                                        }""")
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(0.5)
                                     if await _azure_destination_ready(page, page.url or ""):
                                         _emit(cb, "  ✅ 已进入 Azure 业务页面")
                                         return secret
-                                    cur_u2 = (page.url or "").lower()
-                                    if "kmsi" in cur_u2:
+                                    cur_u_d = (page.url or "").lower()
+                                    if "kmsi" in cur_u_d:
                                         _emit(cb, "  ✅ 到达「保持登录」界面，点击 Yes...")
                                         await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
                                         await asyncio.sleep(1.0)
                                         if await _azure_destination_ready(page, page.url or ""):
-                                            _emit(cb, "  ✅ 已进入 Azure 业务页面")
                                             return secret
                                         break
-                                    if "mysignins.microsoft.com" not in cur_u2:
+                                    if "mysignins.microsoft.com" not in cur_u_d:
                                         break
-                                    await asyncio.sleep(0.5)
                                 _emit(cb, "  ✅ MFA 绑定已完成，退出 MFA 流程")
                                 return secret
 
@@ -1372,6 +1392,8 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                             if not has_input and not is_code_error:
                                 # 尝试点击可能刚渲染出的 Done / 完成 / Next 按钮推进
                                 await _click_first_visible(page, [
+                                    "button.ms-Button--primary",
+                                    "button[data-automationid='done-button']",
                                     "button:has-text('Done')", "input[value='Done']",
                                     "[role='button']:has-text('Done')", "button:has-text('完成')",
                                     "button:has-text('Finish')", "button:has-text('Next')",
@@ -1437,36 +1459,38 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         if state == "done":
             _emit(cb, "  🏁 MFA 注册成功，点击 Next/Done/完成...")
             _sync_secret(secret)
-            try:
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-            await _click_first_visible(page, [
-                "button.ms-Button--primary",
-                "button:has-text('Done')", "input[value='Done']",
-                "[role='button']:has-text('Done')", "button:has-text('完成')",
-                "input[value='完成']", "[role='button']:has-text('完成')",
-                "button:has-text('Finish')", "button:has-text('Continue')",
-                "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
-                "button#idSIButton9", "input#idSIButton9",
-                "button:has-text('Next')", "input[value='Next']",
-                "button:has-text('下一步')", "input[value='下一步']",
-            ], timeout=2500)
-            try:
-                await page.evaluate("""() => {
-                    const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
-                    for (const b of btns) {
-                        const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
-                        if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步' || t === 'continue' || t === '继续') {
-                            b.click();
-                            break;
+            for _done_step in range(4):
+                try:
+                    await page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                await _click_first_visible(page, [
+                    "button.ms-Button--primary",
+                    "button[data-automationid='done-button']",
+                    "button[data-automationid='next-button']",
+                    "button:has-text('Done')", "input[value='Done']",
+                    "[role='button']:has-text('Done')", "button:has-text('完成')",
+                    "input[value='完成']", "[role='button']:has-text('完成')",
+                    "button:has-text('Finish')", "button:has-text('Continue')",
+                    "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
+                    "button#idSIButton9", "input#idSIButton9",
+                    "button:has-text('Next')", "input[value='Next']",
+                    "button:has-text('下一步')", "input[value='下一步']",
+                ], timeout=1500)
+                try:
+                    await page.evaluate("""() => {
+                        const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
+                        for (const b of btns) {
+                            const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                            if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步' || t === 'continue' || t === '继续') {
+                                b.click();
+                                break;
+                            }
                         }
-                    }
-                }""")
-            except Exception:
-                pass
-            await asyncio.sleep(0.8)
-            for _w in range(12):
+                    }""")
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
                 if await _azure_destination_ready(page, page.url or ""):
                     _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
                     return secret
@@ -1484,7 +1508,8 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         _emit(cb, "  ✅ 已进入 Azure 业务页面")
                         return secret
                     break
-                await asyncio.sleep(0.3)
+                if "mysignins.microsoft.com" not in cur_url:
+                    break
 
             # MFA 绑定已在微软云端生效，直接返回 secret 并退出状态机！
             _emit(cb, "  ✅ MFA 注册已确认完成，退出 MFA 流程进入后续步骤")
@@ -2055,6 +2080,13 @@ async def do_azure_login(
                     await asyncio.sleep(0.5)
                 if login_completed:
                     break
+                cur_u = (page.url or "").lower()
+                if totp_secret and any(k in cur_u for k in ("mysignins.microsoft.com", "proofup")):
+                    _emit(cb, f"  🔄 2FA 绑定已完成，主动导航至目标页面...")
+                    try:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                    except Exception:
+                        pass
             except Exception as e:
                 _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
@@ -2103,6 +2135,13 @@ async def do_azure_login(
                     await asyncio.sleep(0.5)
                 if login_completed:
                     break
+                cur_u = (page.url or "").lower()
+                if totp_secret and any(k in cur_u for k in ("mysignins.microsoft.com", "proofup")):
+                    _emit(cb, f"  🔄 2FA 绑定已完成，主动导航至目标页面...")
+                    try:
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=25000)
+                    except Exception:
+                        pass
             except Exception as e:
                 _emit(cb, f"  ⚠️  MFA 流程异常: {e}")
             continue
