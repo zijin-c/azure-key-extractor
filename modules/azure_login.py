@@ -1240,12 +1240,13 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                     consecutive_totp_fails = 0
                     await asyncio.sleep(0.3)
                     await _click_first_visible(page, [
-                        "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
-                        "button#idSIButton9", "input#idSIButton9",
-                        "button:has-text('Next')", "input[value='Next']",
+                        "input#idSubmit_SAOTCC_Continue", "button#idSubmit_SAOTCC_Continue",
+                        "input#idSIButton9", "button#idSIButton9",
                         "button:has-text('Verify')", "input[value='Verify']",
-                        "button:has-text('下一步')", "button:has-text('验证')",
-                        "[role='button']:has-text('Next')", "[role='button']:has-text('下一步')"
+                        "button:has-text('Next')", "input[value='Next']",
+                        "button:has-text('验证')", "button:has-text('下一步')",
+                        "[role='button']:has-text('Next')", "[role='button']:has-text('下一步')",
+                        "[role='button']:has-text('Verify')", "[role='button']:has-text('验证')"
                     ], timeout=2500)
                     try:
                         await page.evaluate("""() => {
@@ -1260,12 +1261,35 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         }""")
                     except Exception:
                         pass
+
+                    # 深度等待 TOTP 验证响应与状态流转（最多等待 8 秒）
                     for _w in range(16):
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(0.5)
                         try:
                             if await _azure_destination_ready(page, page.url or ""):
                                 _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
                                 return secret
+                            cur_u = (page.url or "").lower()
+                            cur_body = await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")
+                            # 1. 检测是否到达 KMSI 保持登录界面
+                            if "kmsi" in cur_u or "stay signed in" in cur_body or "保持登录" in cur_body:
+                                _emit(cb, "  ✅ 验证码通过，到达「保持登录」界面，点击 Yes...")
+                                await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')", "input[value='Yes']", "button:has-text('是')"], timeout=2000)
+                                await asyncio.sleep(1.0)
+                                if await _azure_destination_ready(page, page.url or ""):
+                                    _emit(cb, "  ✅ 已进入 Azure 业务页面")
+                                    return secret
+                                break
+                            # 2. 检测是否到达成功完成界面
+                            if any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added")):
+                                _emit(cb, "  🏁 验证码通过，MFA 注册成功，点击下一步/完成...")
+                                await _click_first_visible(page, ["button:has-text('Done')", "button:has-text('Next')", "input[value='Next']", "button:has-text('完成')", "button:has-text('下一步')"], timeout=2000)
+                                await asyncio.sleep(1.0)
+                                break
+                            # 3. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交并通过）
+                            has_input = await page.evaluate("() => !!(document.querySelector('input[name=\"otc\"], input#idTxtBx_SAOTCC_OTC, input[name=\"VerificationCode\"], input#VerificationCode'))")
+                            if not has_input:
+                                break
                         except Exception:
                             pass
                 else:
