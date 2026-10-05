@@ -903,25 +903,25 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             "注册成功", "已完成设置", "完成设置"
         )):
             state = "done"
-        # 3. 保持账号安全页（Let's keep your account secure / More information required）
+        # 3. 填入 TOTP 码页 (严格优先：页面存在真正可见的验证码输入框)
+        elif has_code_input:
+            state = "enter_code"
+        # 4. 显示 Secret Key 页
+        elif has_visible_secret or ("enter the following" in t and "scan" not in t) or ("secret key" in t and "scan" not in t):
+            state = "show_secret"
+        # 5. 扫描二维码页 (页面包含 QR code、can't scan、扫描二维码 等)
+        elif "scan the qr code" in t or "scan image" in t or "can't scan" in t or "扫描二维码" in t:
+            state = "scan_qr"
+        # 6. 安装验证器页（Start by getting the app / Install Microsoft Authenticator）
+        elif "install microsoft authenticator" in t or "start by getting the app" in t or "获取应用" in t:
+            state = "install_auth"
+        # 7. 保持账号安全页（Let's keep your account secure / More information required）
         elif ("let's keep your account secure" in t or "keep your account secure" in t or
               "more information required" in t or "需要详细信息" in t or "保护帐户安全" in t or "保护账户安全" in t):
             state = "keep_secure"
-        # 4. 安装验证器页（Start by getting the app / Install Microsoft Authenticator）
-        elif "install microsoft authenticator" in t or "start by getting the app" in t or "获取应用" in t:
-            state = "install_auth"
-        # 5. 配置账号页（Set up your account in app）
-        elif ("set up your account in app" in t or "set up your account" in t or "在应用中设置" in t) and not has_code_input:
+        # 8. 配置账号页（仅在具体出现 set up your account in app 且不在二维码/输入码页时触发）
+        elif "set up your account in app" in t or "在应用中设置" in t:
             state = "setup_account"
-        # 6. 显示 Secret Key 页
-        elif has_visible_secret or ("enter the following" in t and "scan" not in t) or ("secret key" in t and "scan" not in t):
-            state = "show_secret"
-        # 7. 扫描二维码页
-        elif "scan the qr code" in t or "scan image" in t or "can't scan" in t or "扫描二维码" in t:
-            state = "scan_qr"
-        # 8. 填入 TOTP 码页 (严格要求页面存在真正可见的验证码输入框)
-        elif has_code_input:
-            state = "enter_code"
 
         # 9. 状态未识别但包含 Next/下一步 按钮时，作为 keep_secure 推进按钮兜底
         if state == "unknown":
