@@ -715,11 +715,14 @@ async def process_account(
         if raise_network_retry:
             raise
         _emit(cb, f"  ❌ 处理异常: {e}")
+        saved_keys = keys if ('keys' in locals() and isinstance(keys, dict)) else {}
+        got_any_keys = bool(any(saved_keys.values()))
         result = KeyResult(
             account=account,
-            success=False,
+            success=got_any_keys,
             totp_secret=saved_totp,
-            message=str(e)[:200],
+            keys=saved_keys,
+            message=(f"提取到 {len([k for k, v in saved_keys.items() if v])} 个 key，后续异常: {e}" if got_any_keys else str(e))[:200],
         )
     except Exception as e:
         _emit(cb, f"  ❌ 处理异常: {e}")
@@ -728,11 +731,14 @@ async def process_account(
             account.totp_secret = saved_totp
             save_totp_cache(account.email, saved_totp)
             _emit(cb, f"  💾 已保存当前账号 2FA 密钥: {saved_totp}")
+        saved_keys = keys if ('keys' in locals() and isinstance(keys, dict)) else {}
+        got_any_keys = bool(any(saved_keys.values()))
         result = KeyResult(
             account=account,
-            success=False,
+            success=got_any_keys,
             totp_secret=saved_totp,
-            message=str(e)[:200],
+            keys=saved_keys,
+            message=(f"提取到 {len([k for k, v in saved_keys.items() if v])} 个 key，后续异常: {e}" if got_any_keys else str(e))[:200],
         )
 
     finally:

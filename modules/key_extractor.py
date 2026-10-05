@@ -302,6 +302,7 @@ async def _search_product(page: Page, search_term: str, cb: ProgressCallback) ->
     for attempt in range(10):  # 最多等待 5 秒
         if attempt in (2, 5):
             await _close_panel(page)
+            await _ensure_software_blade_active(page, cb)
             await asyncio.sleep(0.2)
         for frame in [page] + list(page.frames):
             try:
@@ -673,7 +674,7 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
 
 
 async def _close_panel(page: Page):
-    """关闭右侧详情面板（按 Escape 键并智能点击右侧详情 blade 的关闭按钮，确保搜索框恢复可交互状态）。"""
+    """关闭右侧详情面板（按 Escape 键并智能关闭右侧详情 panel / 子 blade，确保绝不误关主 Software 页面）。"""
     try:
         await page.keyboard.press("Escape")
         await asyncio.sleep(0.15)
@@ -683,14 +684,19 @@ async def _close_panel(page: Page):
         try:
             await frame.evaluate("""
                 () => {
-                    const closeBtns = [...document.querySelectorAll('.fxs-blade-close, button[aria-label="Close"], button[aria-label="关闭"], button[title="Close"], button[title="关闭"], [data-telemetry-id="blade-close"], .ms-Panel-closeButton, .ms-Button--icon')];
-                    const rightside = closeBtns.filter(b => {
-                        const r = b.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0 && r.left > 400;
+                    // 1. 关闭所有 Fluent UI Panel 和 Dialog 弹窗
+                    const panels = document.querySelectorAll('.ms-Panel, [role="dialog"]');
+                    panels.forEach(p => {
+                        const btn = p.querySelector('button[aria-label="Close"], button[aria-label="关闭"], button[title="Close"], button[title="关闭"], .ms-Panel-closeButton, button.ms-Button--icon');
+                        if (btn) btn.click();
                     });
-                    if (rightside.length > 0) {
-                        rightside.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-                        rightside[0].click();
+
+                    // 2. 仅当存在多于 1 个 blade 时，才关闭最右侧的子 blade，绝不关闭根 blade
+                    const blades = document.querySelectorAll('.fxs-blade');
+                    if (blades.length > 1) {
+                        const lastBlade = blades[blades.length - 1];
+                        const bladeClose = lastBlade.querySelector('.fxs-blade-close, button[aria-label="Close"], button[aria-label="关闭"], [data-telemetry-id="blade-close"]');
+                        if (bladeClose) bladeClose.click();
                     }
                 }
             """)
@@ -1477,7 +1483,7 @@ async def extract_all_keys(
             pass
 
     success_count = len([k for k, v in keys.items() if v])
-    _emit(cb, f"  ℹ️  当前账号 key 提取流程结束（成功获取 {success_count}/{len(targets)} 个产品 key），直接进入下一步")
+    _emit(cb, f"  ℹ️  当前账号 key 提取流程结束（成功获取 {success_count}/{len(config.PRODUCTS_TO_EXTRACT)} 个产品 key），直接进入下一步")
 
     if updated_totp and ms_email:
         save_totp_cache(ms_email, updated_totp)
