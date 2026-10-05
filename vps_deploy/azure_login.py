@@ -891,10 +891,10 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             state = "kmsi"
         # 2. 成功通过页（Notification approved / Great job / Authenticator app added / Success / App registered）
         elif any(k in t for k in (
-            "notification approved", "great job", "successfully registered", "registered",
+            "notification approved", "great job", "successfully registered",
             "authenticator app added", "authenticator app was successfully",
-            "you're all set", "success", "已成功注册", "成功", "完成"
-        )) and ("enter the following" not in t and "scan" not in t and "enter code" not in t and "enter the code" not in t):
+            "you're all set", "app registered", "已成功注册", "成功添加验证器", "应用已成功注册"
+        )):
             state = "done"
         # 3. 保持账号安全页（Let's keep your account secure / More information required）
         elif ("let's keep your account secure" in t or "keep your account secure" in t or
@@ -1244,8 +1244,22 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         "button#idSIButton9", "input#idSIButton9",
                         "button:has-text('Next')", "input[value='Next']",
                         "button:has-text('Verify')", "input[value='Verify']",
-                        "button:has-text('下一步')", "button:has-text('验证')"
+                        "button:has-text('下一步')", "button:has-text('验证')",
+                        "[role='button']:has-text('Next')", "[role='button']:has-text('下一步')"
                     ], timeout=2500)
+                    try:
+                        await page.evaluate("""() => {
+                            const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role="button"]')];
+                            for (const b of btns) {
+                                const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+                                if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续') {
+                                    b.click();
+                                    break;
+                                }
+                            }
+                        }""")
+                    except Exception:
+                        pass
                     for _w in range(16):
                         await asyncio.sleep(0.25)
                         try:
