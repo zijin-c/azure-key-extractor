@@ -264,33 +264,33 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
         for sel in sels:
             try:
                 loc = f.locator(sel).first
-                if await loc.is_visible(timeout=250):
+                if await loc.is_visible(timeout=200):
                     # 优先拟人化按键
-                    ok = await human_type(f, loc, code, min_delay=0.04, max_delay=0.09)
+                    ok = await human_type(f, loc, code, min_delay=0.03, max_delay=0.08)
                     if not ok:
                         # 兜底：直接 click 与 fill
                         try:
-                            await loc.click(timeout=1000, force=True)
-                            await loc.fill(code, timeout=1000)
+                            await loc.click(timeout=800, force=True)
+                            await loc.fill(code, timeout=800)
                         except Exception:
                             pass
                     val = ""
                     try:
-                        val = await loc.input_value(timeout=500)
+                        val = await loc.input_value(timeout=400)
                     except Exception:
                         pass
                     if val and code in val:
                         _emit(cb, "  ✅ TOTP 已填入")
-                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                        await asyncio.sleep(random.uniform(0.15, 0.3))
                         try:
-                            await loc.press("Enter", timeout=1000)
+                            await loc.press("Enter", timeout=800)
                         except Exception:
                             pass
                         return True
             except Exception:
                 continue
 
-    # 策略 2: JS 跨 Frame 深度穿透填入
+    # 策略 2: JS 跨 Frame 深度穿透填入（严格限定为 OTC 验证码专属输入框，杜绝误填其他表单元素）
     for f in frames_to_try:
         try:
             ok = await f.evaluate("""
@@ -310,22 +310,6 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
                         if (el && !el.disabled && !el.readOnly) {
                             const r = el.getBoundingClientRect();
                             if (r.width > 0 && r.height > 0) { target = el; break; }
-                        }
-                    }
-                    if (!target) {
-                        const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                        if ((txt.includes('enter code') || txt.includes('enter the code') ||
-                             txt.includes('输入代码') || txt.includes('验证码')) &&
-                            !txt.includes('scan the qr') && !txt.includes('start by getting the app')) {
-                            const inputs = [...document.querySelectorAll('input')].filter(i => {
-                                const r = i.getBoundingClientRect();
-                                return r.width > 0 && r.height > 0 && !i.disabled && !i.readOnly &&
-                                       !['hidden', 'submit', 'button', 'checkbox', 'radio', 'password'].includes(i.type);
-                            });
-                            for (const inp of inputs) {
-                                const ml = inp.getAttribute('maxlength');
-                                if (!ml || parseInt(ml) <= 10) { target = inp; break; }
-                            }
                         }
                     }
                     if (target) {
@@ -854,29 +838,14 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                         "input[autocomplete='one-time-code']", "input#otc",
                         "input[placeholder*='code' i]", "input[placeholder*='代码' i]",
                         "input[placeholder*='验证码' i]", "input[aria-label*='code' i]",
-                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]"
+                        "input[aria-label*='代码' i]", "input[aria-label*='验证码' i]",
+                        "input[type='tel']"
                     ];
                     for (const s of sels) {
                         const el = document.querySelector(s);
                         if (el) {
                             const r = el.getBoundingClientRect();
                             if (r.width > 0 && r.height > 0 && !el.disabled && !el.readOnly) return true;
-                        }
-                    }
-                    // 仅当页面明确包含 enter code / verification 等提示且无 scan / setup app 时，查找短文本框
-                    const bodyText = (document.body ? document.body.innerText : '').toLowerCase();
-                    const isCodePrompt = (bodyText.includes('enter code') || bodyText.includes('enter the code') ||
-                                         bodyText.includes('输入代码') || bodyText.includes('验证码')) &&
-                                         !bodyText.includes('scan the qr') && !bodyText.includes('start by getting the app');
-                    if (isCodePrompt) {
-                        const inputs = [...document.querySelectorAll('input')].filter(i => {
-                            const r = i.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0 && !i.disabled && !i.readOnly &&
-                                   !['hidden', 'submit', 'button', 'checkbox', 'radio', 'password'].includes(i.type);
-                        });
-                        for (const inp of inputs) {
-                            const ml = inp.getAttribute('maxlength');
-                            if (!ml || parseInt(ml) <= 10) return true;
                         }
                     }
                     return false;
@@ -921,7 +890,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         elif "install microsoft authenticator" in t or "start by getting the app" in t or "获取应用" in t:
             state = "install_auth"
         # 5. 配置账号页（Set up your account in app）
-        elif ("set up your account in app" in t or "set up your account" in t or "在应用中设置" in t) and "enter the code" not in t and "enter code" not in t:
+        elif ("set up your account in app" in t or "set up your account" in t or "在应用中设置" in t) and not has_code_input:
             state = "setup_account"
         # 6. 显示 Secret Key 页
         elif has_visible_secret or ("enter the following" in t and "scan" not in t) or ("secret key" in t and "scan" not in t):
@@ -929,8 +898,8 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         # 7. 扫描二维码页
         elif "scan the qr code" in t or "scan image" in t or "can't scan" in t or "扫描二维码" in t:
             state = "scan_qr"
-        # 8. 填入 TOTP 码页 (Enter the code / 2FA 动态码校验)
-        elif has_code_input or (any(k in t for k in ("enter the code", "enter code", "verification code", "输入代码", "验证码")) and "scan" not in t and "start by getting the app" not in t):
+        # 8. 填入 TOTP 码页 (严格要求页面存在真正可见的验证码输入框)
+        elif has_code_input:
             state = "enter_code"
 
         # 9. 状态未识别但包含 Next/下一步 按钮时，作为 keep_secure 推进按钮兜底
@@ -1270,7 +1239,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                             const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], [role="button"]')];
                             for (const b of btns) {
                                 const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
-                                if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续') {
+                                if (t === 'next' || t === '下一步' || t === 'verify' || t === '验证' || t === 'continue' || t === '继续' || t === 'done' || t === '完成') {
                                     b.click();
                                     break;
                                 }
@@ -1289,7 +1258,17 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                             cur_u = (page.url or "").lower()
                             cur_body = await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")
 
-                            # 1. 检测是否到达成功完成/Done 界面（直接点击 Done/完成 并推进）
+                            # 1. 检查是否存在明确的 TOTP 验证码错误提示
+                            is_code_error = any(err_k in cur_body for err_k in (
+                                "that code didn't work", "incorrect code", "code incorrect",
+                                "请输入正确的代码", "代码不正确", "验证码错误", "验证码无效",
+                                "enter the code that appears", "verification failed"
+                            ))
+                            if is_code_error:
+                                _emit(cb, "  ⚠️ TOTP 验证码校验未通过，准备重新生成填入...")
+                                break
+
+                            # 2. 检测是否到达成功完成/Done 界面（直接点击 Done/完成 并退出）
                             has_done = await page.evaluate("""() => {
                                 const btns = [...document.querySelectorAll('button, input[type=button], input[type=submit], a, [role="button"]')];
                                 const doneBtn = btns.find(b => {
@@ -1304,7 +1283,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 }
                                 return false;
                             }""")
-                            if has_done or any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added", "you're all set", "app registered")):
+                            if has_done or any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added", "you're all set", "app registered", "已成功注册", "成功添加验证器")):
                                 _emit(cb, "  🏁 验证码校验通过，点击 Done/完成...")
                                 await _click_first_visible(page, [
                                     "button:has-text('Done')", "input[value='Done']",
@@ -1312,26 +1291,36 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                     "button:has-text('Next')", "input[value='Next']",
                                     "button:has-text('下一步')"
                                 ], timeout=2000)
-                                await asyncio.sleep(1.2)
-                                if await _azure_destination_ready(page, page.url or ""):
-                                    _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
-                                    return secret
-                                break
+                                await asyncio.sleep(1.0)
+                                if "kmsi" in (page.url or "").lower():
+                                    await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
+                                _emit(cb, "  ✅ MFA 绑定已完成，退出 MFA 流程")
+                                return secret
 
-                            # 2. 检测是否到达 KMSI 保持登录界面
+                            # 3. 检测是否到达 KMSI 保持登录界面
                             if "kmsi" in cur_u or "stay signed in" in cur_body or "保持登录" in cur_body:
                                 _emit(cb, "  ✅ 验证码通过，到达「保持登录」界面，点击 Yes...")
                                 await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')", "input[value='Yes']", "button:has-text('是')"], timeout=2000)
                                 await asyncio.sleep(1.0)
-                                if await _azure_destination_ready(page, page.url or ""):
-                                    _emit(cb, "  ✅ 已进入 Azure 业务页面")
-                                    return secret
-                                break
+                                _emit(cb, "  ✅ 登录完成，退出 MFA 流程")
+                                return secret
 
-                            # 3. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交并通过）
-                            has_input = await page.evaluate("() => !!(document.querySelector('input[name=\"otc\"], input#idTxtBx_SAOTCC_OTC, input[name=\"VerificationCode\"], input#VerificationCode'))")
-                            if not has_input:
-                                break
+                            # 4. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交并通过，正在跳转中）
+                            has_input = await page.evaluate("""() => {
+                                const sels = ["input[name='otc']", "input#idTxtBx_SAOTCC_OTC", "input#idTxtBx_OTC", "input[name='VerificationCode']", "input#VerificationCode", "input#otc"];
+                                for (const s of sels) {
+                                    const el = document.querySelector(s);
+                                    if (el && el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0) return true;
+                                }
+                                return false;
+                            }""")
+                            if not has_input and not is_code_error:
+                                _emit(cb, "  ✅ TOTP 提交成功（验证码框已消失），等待跳转...")
+                                await asyncio.sleep(1.5)
+                                if "kmsi" in (page.url or "").lower():
+                                    await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')"], timeout=2000)
+                                _emit(cb, "  ✅ 2FA 验证已通过，退出 MFA 流程")
+                                return secret
                         except Exception:
                             pass
                 else:
@@ -1400,7 +1389,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             except Exception:
                 pass
             await asyncio.sleep(0.8)
-            for _w in range(10):
+            for _w in range(12):
                 if await _azure_destination_ready(page, page.url or ""):
                     _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
                     return secret
@@ -1411,15 +1400,18 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 except Exception:
                     pass
                 if "kmsi" in cur_url or "stay signed in" in cur_title or "保持登录" in cur_title:
+                    _emit(cb, "  ✅ MFA 完成后到达「保持登录」界面，点击 Yes...")
+                    await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')", "input[value='Yes']"], timeout=2000)
+                    await asyncio.sleep(1.0)
+                    if await _azure_destination_ready(page, page.url or ""):
+                        _emit(cb, "  ✅ 已进入 Azure 业务页面")
+                        return secret
                     break
                 await asyncio.sleep(0.3)
 
-            # 关键突破：连续 2 轮确认处于 Done 成功状态，MFA 绑定已在微软云端生效！
-            # 立即返回 secret 并退出状态机，直接让外层逻辑导航到 Portal / 业务目标页，彻底杜绝死循环！
-            if same_state_count >= 2:
-                _emit(cb, "  ✅ MFA 注册已确认成功，直接进入后续业务流程")
-                return secret
-            continue
+            # MFA 绑定已在微软云端生效，直接返回 secret 并退出状态机！
+            _emit(cb, "  ✅ MFA 注册已确认完成，退出 MFA 流程进入后续步骤")
+            return secret
 
         if state == "kmsi":
             _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
@@ -1438,14 +1430,13 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                 "input[type='submit']", "button[type='submit']"
             ], timeout=3000)
 
-            for _w in range(20):
+            for _w in range(16):
                 await asyncio.sleep(0.3)
                 if await _azure_destination_ready(page, page.url or ""):
                     _emit(cb, "  ✅ 已进入 Azure 业务页面")
                     return secret
-            if same_state_count >= 2:
-                return secret
-            continue
+            _emit(cb, "  ✅ KMSI 已确认提交，退出 MFA 流程")
+            return secret
 
     return secret
 
