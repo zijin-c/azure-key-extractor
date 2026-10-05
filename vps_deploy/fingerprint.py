@@ -1165,6 +1165,31 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
 
+    TELEMETRY_PATTERNS = (
+        "browser.events.data.microsoft.com",
+        "portal.azure.com/api/telemetry",
+        "portal.azure.com/api/clientlog",
+        "signup.azure.com/api/clientlog",
+        "pipe.aria.microsoft.com",
+        "vortex.data.microsoft.com",
+        "telemetry.microsoft.com",
+        "dc.services.visualstudio.com",
+        "clarity.ms",
+        "bing.com/as/",
+        "c.msn.com",
+        "mobile.events.data.microsoft.com",
+        "onesettings-bn2.met.live.com",
+        "web.vortex.data.microsoft.com",
+    )
+
+    BLOCKED_IMAGE_EXTS = (
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg"
+    )
+
+    CAPTCHA_DOMAINS = (
+        "arkose", "arkoselabs", "funcaptcha", "hcaptcha", "recaptcha", "geetest", "sheerid"
+    )
+
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
         ".zip", ".iso", ".exe", ".msi", ".rar", ".7z", ".tar", ".gz",
@@ -1184,7 +1209,48 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.continue_()
             return
 
-        # 2. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
+        # 2. 遥测、日志与埋点数据拦截 (无论 GET / POST / PING / XHR / Beacon)：本地 200 Mock 响应，阻断后台持续上传大体积日志
+        if any(tp in url_lower for tp in TELEMETRY_PATTERNS):
+            if stats:
+                stats.record_blocked(est_size=60000)
+            fulfilled_request_ids.add(id(request))
+            if "browser.events.data.microsoft.com" in url_lower:
+                resp_body = b'{"statusCode":200,"itemsReceived":1,"itemsAccepted":1,"errors":[]}'
+            else:
+                resp_body = b'{"status":"success"}'
+            await route.fulfill(
+                body=resp_body,
+                headers={
+                    "content-type": "application/json",
+                    "access-control-allow-origin": "*",
+                    "access-control-allow-methods": "GET, POST, OPTIONS, PING",
+                    "access-control-allow-headers": "*",
+                },
+                status=200
+            )
+            return
+
+        # 3. 拦截/Mock 非必要图片资产（装饰背景壁纸、Passkey GIF动画、Azure Portal 图标），人机验证/Captcha 图片严格放行
+        is_captcha_asset = any(c in url_lower for c in CAPTCHA_DOMAINS)
+        if not is_captcha_asset and (r_type == "image" or clean_url.endswith(BLOCKED_IMAGE_EXTS)):
+            if stats:
+                stats.record_blocked(est_size=80000)
+            fulfilled_request_ids.add(id(request))
+            is_svg = clean_url.endswith(".svg") or "image/svg" in (request.headers.get("accept") or "")
+            body = _DUMMY_SVG_IMAGE if is_svg else _DUMMY_PNG_IMAGE
+            c_type = "image/svg+xml" if is_svg else "image/png"
+            await route.fulfill(
+                body=body,
+                headers={
+                    "content-type": c_type,
+                    "access-control-allow-origin": "*",
+                    "cache-control": "public, max-age=31536000, immutable"
+                },
+                status=200
+            )
+            return
+
+        # 4. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
         if request.method != "GET":
             # 严格拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2，体积高达 2.3MB 且对自动化提取毫无用处)
             if "initializemobileapp" in url_lower and request.method == "POST":
@@ -1201,7 +1267,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.continue_()
             return
 
-        # 3. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
+        # 5. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
         if "extensionmanifest/" in url_lower:
             cached_manifest = LocalHttpCache.get_canonical_manifest(url)
             if cached_manifest:
@@ -1232,7 +1298,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             except Exception:
                 pass
 
-        # 4. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON/Arkose静态字体)：本地秒级响应，0 网络流量
+        # 6. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON/Arkose静态字体)：本地秒级响应，0 网络流量
         if LocalHttpCache.is_cacheable(url, "GET"):
             cached = LocalHttpCache.get(url)
             if cached:
@@ -1265,19 +1331,19 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.continue_()
                 return
 
-        # 5. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
+        # 7. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
             await route.continue_()
             return
 
-        # 6. 拦截大体积音视频及安装包
+        # 8. 拦截大体积音视频及安装包
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
             await route.abort()
             return
 
-        # 7. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
+        # 9. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
         await route.continue_()
 
     await ctx.route("**/*", _route_handler)
@@ -1345,6 +1411,12 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                             for p in getattr(ctx, "pages", []):
                                 try:
                                     p._captured_totp_secret = clean_sec
+                                except Exception:
+                                    pass
+                            cb_func = getattr(ctx, "_on_totp_captured", None)
+                            if callable(cb_func):
+                                try:
+                                    cb_func(clean_sec)
                                 except Exception:
                                     pass
                             log.info(f"[2FA] 网络层秒级捕获 SecretKey: {clean_sec}")
@@ -1584,6 +1656,12 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
                             for p in getattr(ctx, "pages", []):
                                 try:
                                     p._captured_totp_secret = clean_sec
+                                except Exception:
+                                    pass
+                            cb_func = getattr(ctx, "_on_totp_captured", None)
+                            if callable(cb_func):
+                                try:
+                                    cb_func(clean_sec)
                                 except Exception:
                                     pass
             except Exception:
