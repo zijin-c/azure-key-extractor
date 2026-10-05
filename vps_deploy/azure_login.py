@@ -885,15 +885,32 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
         except Exception:
             pass
 
+        has_done_btn = False
+        try:
+            has_done_btn = await page.evaluate("""
+                () => {
+                    const btns = [...document.querySelectorAll('button, input[type=button], input[type=submit], a, [role="button"]')];
+                    return btns.some(b => {
+                        const r = b.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0 || b.disabled) return false;
+                        const txt = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                        return txt === 'done' || txt === '完成' || txt === 'finish' || txt === 'finished';
+                    });
+                }
+            """)
+        except Exception:
+            pass
+
         state = "unknown"
         # 1. 优先检查 KMSI (Stay signed in)
         if "stay signed in" in t or "保持登录" in t or "kmsi" in cur_url:
             state = "kmsi"
-        # 2. 成功通过页（Notification approved / Great job / Authenticator app added / Success / App registered）
-        elif any(k in t for k in (
+        # 2. 成功通过页（存在 Done / 完成 按钮，或包含 Notification approved / Great job / Authenticator app added / Success / App registered 等）
+        elif has_done_btn or any(k in t for k in (
             "notification approved", "great job", "successfully registered",
             "authenticator app added", "authenticator app was successfully",
-            "you're all set", "app registered", "已成功注册", "成功添加验证器", "应用已成功注册"
+            "you're all set", "app registered", "已成功注册", "成功添加验证器", "应用已成功注册",
+            "注册成功", "已完成设置", "完成设置"
         )):
             state = "done"
         # 3. 保持账号安全页（Let's keep your account secure / More information required）
@@ -1271,7 +1288,37 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                 return secret
                             cur_u = (page.url or "").lower()
                             cur_body = await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")
-                            # 1. 检测是否到达 KMSI 保持登录界面
+
+                            # 1. 检测是否到达成功完成/Done 界面（直接点击 Done/完成 并推进）
+                            has_done = await page.evaluate("""() => {
+                                const btns = [...document.querySelectorAll('button, input[type=button], input[type=submit], a, [role="button"]')];
+                                const doneBtn = btns.find(b => {
+                                    const r = b.getBoundingClientRect();
+                                    if (r.width === 0 || r.height === 0 || b.disabled) return false;
+                                    const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
+                                    return t === 'done' || t === '完成' || t === 'finish' || t === 'finished';
+                                });
+                                if (doneBtn) {
+                                    doneBtn.click();
+                                    return true;
+                                }
+                                return false;
+                            }""")
+                            if has_done or any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added", "you're all set", "app registered")):
+                                _emit(cb, "  🏁 验证码校验通过，点击 Done/完成...")
+                                await _click_first_visible(page, [
+                                    "button:has-text('Done')", "input[value='Done']",
+                                    "[role='button']:has-text('Done')", "button:has-text('完成')",
+                                    "button:has-text('Next')", "input[value='Next']",
+                                    "button:has-text('下一步')"
+                                ], timeout=2000)
+                                await asyncio.sleep(1.2)
+                                if await _azure_destination_ready(page, page.url or ""):
+                                    _emit(cb, "  ✅ MFA 验证通过，已进入 Azure 业务页面")
+                                    return secret
+                                break
+
+                            # 2. 检测是否到达 KMSI 保持登录界面
                             if "kmsi" in cur_u or "stay signed in" in cur_body or "保持登录" in cur_body:
                                 _emit(cb, "  ✅ 验证码通过，到达「保持登录」界面，点击 Yes...")
                                 await _click_first_visible(page, ["input#idSIButton9", "button#idSIButton9", "button:has-text('Yes')", "input[value='Yes']", "button:has-text('是')"], timeout=2000)
@@ -1280,12 +1327,7 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
                                     _emit(cb, "  ✅ 已进入 Azure 业务页面")
                                     return secret
                                 break
-                            # 2. 检测是否到达成功完成界面
-                            if any(k in cur_body for k in ("notification approved", "great job", "successfully registered", "authenticator app added")):
-                                _emit(cb, "  🏁 验证码通过，MFA 注册成功，点击下一步/完成...")
-                                await _click_first_visible(page, ["button:has-text('Done')", "button:has-text('Next')", "input[value='Next']", "button:has-text('完成')", "button:has-text('下一步')"], timeout=2000)
-                                await asyncio.sleep(1.0)
-                                break
+
                             # 3. 检测 OTC 输入框是否已从 DOM 消失（代表已成功提交并通过）
                             has_input = await page.evaluate("() => !!(document.querySelector('input[name=\"otc\"], input#idTxtBx_SAOTCC_OTC, input[name=\"VerificationCode\"], input#VerificationCode'))")
                             if not has_input:
@@ -1335,19 +1377,20 @@ async def _handle_mfa_setup(page: Page, cb: ProgressCallback, existing_secret: s
             _emit(cb, "  🏁 MFA 注册成功，点击 Next/Done/完成...")
             _sync_secret(secret)
             await _click_first_visible(page, [
+                "button:has-text('Done')", "input[value='Done']",
+                "[role='button']:has-text('Done')", "button:has-text('完成')",
+                "input[value='完成']", "[role='button']:has-text('完成')",
+                "button:has-text('Finish')", "button:has-text('Continue')",
                 "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
                 "button#idSIButton9", "input#idSIButton9",
-                "button:has-text('Done')", "input[value='Done']",
-                "button:has-text('Finish')", "button:has-text('Continue')",
-                "button:has-text('完成')", "button:has-text('下一步')",
                 "button:has-text('Next')", "input[value='Next']",
-                "[role='button']:has-text('Done')", "[role='button']:has-text('完成')",
+                "button:has-text('下一步')", "input[value='下一步']",
             ], timeout=2500)
             try:
                 await page.evaluate("""() => {
                     const btns = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, [role="button"]')];
                     for (const b of btns) {
-                        const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+                        const t = (b.innerText || b.value || b.textContent || b.getAttribute('aria-label') || '').trim().toLowerCase();
                         if (t === 'done' || t === 'finish' || t === '完成' || t === 'next' || t === '下一步' || t === 'continue' || t === '继续') {
                             b.click();
                             break;
