@@ -15,7 +15,7 @@
 12. Screen.orientation 真实桌面横屏对象与真实屏幕几何视口联动；
 13. Battery API (navigator.getBattery) 与完整 SpeechSynthesis 语音库对齐；
 14. 完整 navigator.userAgentData (Client Hints) 高熵值接口 (包含 wow64: false) 与 Win32 原型链严格原生化；
-15. 极限省流架构（确定性本地磁盘强缓存系统与 1-Byte 极简图片 Mock，mysignins 与 Azure 静态切片 0 字节秒开）；
+15. 公共静态资源持久化缓存，动态认证/API 放行；
 16. 每个账号完全隔离的 BrowserContext 独立生命周期，彻底杜绝跨账号污染。
 """
 import asyncio
@@ -26,7 +26,8 @@ import os
 import random
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
+from utils.http_cache import LocalHttpCache, transfer_body_size
 
 log = logging.getLogger(__name__)
 
@@ -818,422 +819,15 @@ PYTHON_HTTP_CACHE_DIR = os.path.abspath(
 os.makedirs(PYTHON_HTTP_CACHE_DIR, exist_ok=True)
 
 
-class LocalHttpCache:
-    """全静态资产本地磁盘强缓存系统：
-    支持 JS/CSS/字体(woff2/woff/ttf/otf)/静态JSON/图标 本地永久缓存与秒级命中。
-    支持 Azure Portal 7 大 ExtensionManifest 规范化类型缓存，杜绝 Hash 漂移重复下载。
-    """
-    CACHEABLE_EXTENSIONS = (
-        ".js", ".mjs", ".ts", ".css",
-        ".woff2", ".woff", ".ttf", ".otf", ".eot",
-        ".svg", ".ico", ".png", ".jpg", ".jpeg", ".webp",
-        ".json"
-    )
-
-    IMAGE_EXTS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".bmp", ".tiff"
-    )
-
-    DYNAMIC_SECURITY_PATTERNS = (
-        # 动态人机验证与风控挑战交互/PoW接口（Arkose / Turnstile / SheerID / hCaptcha / reCAPTCHA / GeeTest 等）
-        "arkose", "arkoselabs", "funcaptcha", "powseq", "turnstile",
-        "challenges.cloudflare.com", "cloudflare.com", "challenge-platform",
-        "hcaptcha", "recaptcha", "geetest",
-        # 仅放行 SheerID 动态核验/提交/组织搜索 API，静态 JS/CSS/字体放行强缓存
-        "services.sheerid.com/api/", "services.sheerid.com/rest/",
-        "services.sheerid.com/verify/", "services.sheerid.com/submission/",
-        "services.sheerid.com/orgsearch", "sheerid.com/api/",
-        # 动态认证/登录授权交互接口（注意：精确指定动态接口路径，确保域名的静态JS/CSS正常享受本地强缓存与省流）
-        "/common/oauth2/", "/oauth20_authorize", "/login.srf",
-        "/kmsi", "/kmsi.srf", "/getcredentialtype", "/getsessionstate",
-        "/sas/processauth", "/ppsecure/post.srf", "/processauth",
-        "/oauth2/token", "/oauth2/v2.0/token",
-        "/reprocess", "/federal/login",
-        # 动态 2FA 注册与验证接口（绝对保证 TOTP 密钥提取）
-        "/api/authenticationmethods/",
-        # 动态 ARM 资源与提 Key 接口
-        "management.azure.com/providers/microsoft.education",
-        "management.azure.com/providers/microsoft.billing",
-        "management.azure.com/subscriptions",
-        "management.azure.com/tenants",
-        "management.azure.com/batch",
-        # 动态学生认证交互接口（注意：精确放行动态 API 和认证页面，允许静态 JS/CSS 走本地强缓存与背景图片 Mock）
-        "signup.azure.com/api/",
-        "signup.azure.com/studentverification",
-        "signup.azure.com/signup?offer=",
-        # 带有动态临时签名与时间戳的 PoW / challenge 脚本
-        "/fc/", "/challenge", "/enforcement",
-        "expires=", "signature=", "key-pair-id="
-    )
-
-    CANONICAL_DIR = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests")
-    HASH_MAP_FILE = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests", "manifest_hashes.json")
-    _manifest_hash_to_type: dict[str, str] = {}
-    _canonical_initialized: bool = False
-
-    @classmethod
-    def identify_manifest_by_size(cls, size_bytes: int) -> str | None:
-        """根据 Content-Length 大小（支持 Raw 或 Gzip 传输尺寸）精准反推 Manifest 规范化类型。
-        Azure Portal 7 大清单尺寸阶梯严格非重叠，可实现 0 字节内容下载下的 100% 盲判。
-        """
-        if size_bytes > 10_000_000 or (300_000 <= size_bytes <= 600_000):
-            return "extensionConfiguration"
-        elif (4_000_000 <= size_bytes <= 7_000_000) or (700_000 <= size_bytes <= 1_200_000):
-            return "assetTypes"
-        elif (1_500_000 <= size_bytes <= 3_000_000) or (100_000 <= size_bytes <= 250_000):
-            return "assetTypesBrowse"
-        elif (200_000 <= size_bytes <= 400_000) or (30_000 <= size_bytes <= 80_000):
-            return "browseMenus"
-        elif (115_000 <= size_bytes <= 150_000) or (18_000 <= size_bytes <= 30_000):
-            return "featureCards"
-        elif (90_000 <= size_bytes <= 114_000) or (12_000 <= size_bytes <= 20_000):
-            return "portalServices"
-        elif (10_000 <= size_bytes <= 30_000) or (2_000 <= size_bytes <= 8_000):
-            return "tourGuide"
-        return None
-
-    @classmethod
-    def learn_hashes_from_html(cls, html_content: bytes | str):
-        """从 Azure Portal 入口 HTML 中提取 extensionsManifestHash 映射表，瞬间学习数百个 Hash。"""
-        if not html_content:
-            return
-        try:
-            if isinstance(html_content, bytes):
-                text = html_content.decode("utf-8", errors="ignore")
-            else:
-                text = str(html_content)
-            idx = text.find('"extensionsManifestHash":')
-            if idx == -1:
-                idx = text.find('extensionsManifestHash')
-                if idx != -1:
-                    colon = text.find(':', idx)
-                    if colon != -1:
-                        idx = colon - len('"extensionsManifestHash"')
-            if idx == -1:
-                return
-            start = text.find('{', idx)
-            if start == -1:
-                return
-            depth = 0
-            end = start
-            for i in range(start, len(text)):
-                if text[i] == '{':
-                    depth += 1
-                elif text[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            data = json.loads(text[start:end])
-            new_learned = False
-            for m_type, items in data.items():
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if isinstance(item, list):
-                        for h in item:
-                            if isinstance(h, str) and h:
-                                if h not in cls._manifest_hash_to_type:
-                                    cls._manifest_hash_to_type[h] = m_type
-                                    cls._manifest_hash_to_type[f"{h}.json"] = m_type
-                                    new_learned = True
-                    elif isinstance(item, str) and item:
-                        if item not in cls._manifest_hash_to_type:
-                            cls._manifest_hash_to_type[item] = m_type
-                            cls._manifest_hash_to_type[f"{item}.json"] = m_type
-                            new_learned = True
-            if new_learned:
-                cls._persist_hash_map()
-        except Exception:
-            pass
-
-    @classmethod
-    def learn_hash_mapping(cls, hash_name: str, m_type: str):
-        """动态注册单条 Hash 到规范类型的映射并持久化。"""
-        if not hash_name or not m_type:
-            return
-        clean_h = hash_name.split("?")[0].split("#")[0]
-        base_h = clean_h[:-5] if clean_h.endswith(".json") else clean_h
-        cls._manifest_hash_to_type[clean_h] = m_type
-        cls._manifest_hash_to_type[base_h] = m_type
-        cls._manifest_hash_to_type[f"{base_h}.json"] = m_type
-        cls._persist_hash_map()
-
-    @classmethod
-    def _persist_hash_map(cls):
-        """持久化当前学习到的全量 Hash 字典到磁盘。"""
-        try:
-            os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
-            with open(cls.HASH_MAP_FILE, "w", encoding="utf-8") as f:
-                json.dump(cls._manifest_hash_to_type, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    @classmethod
-    def detect_manifest_type(cls, data: dict) -> str | None:
-        """从 Manifest JSON 数据结构中精准识别其规范化类型。"""
-        if not isinstance(data, dict):
-            return None
-        manifest = data.get("manifest")
-        if not isinstance(manifest, dict):
-            return None
-        sample_ext = manifest.get("Microsoft_Azure_Education") or {}
-        ext_keys = set(sample_ext.keys()) if isinstance(sample_ext, dict) else set()
-        if "extensionConfiguration" in ext_keys:
-            return "extensionConfiguration"
-        if "assetTypesBrowse" in ext_keys:
-            return "assetTypesBrowse"
-        if "assetTypes" in ext_keys:
-            return "assetTypes"
-        if "browseMenus" in ext_keys:
-            return "browseMenus"
-        if "featureCards" in ext_keys or "featureCardEnvironmentConfiguration" in ext_keys:
-            return "featureCards"
-        if "portalServices" in ext_keys:
-            return "portalServices"
-        if "tourIds" in ext_keys:
-            return "tourGuide"
-        for ext_val in manifest.values():
-            if isinstance(ext_val, dict):
-                k_set = set(ext_val.keys())
-                if "extensionConfiguration" in k_set: return "extensionConfiguration"
-                if "assetTypesBrowse" in k_set: return "assetTypesBrowse"
-                if "assetTypes" in k_set: return "assetTypes"
-                if "browseMenus" in k_set: return "browseMenus"
-                if "featureCards" in k_set: return "featureCards"
-                if "portalServices" in k_set: return "portalServices"
-                if "tourIds" in k_set: return "tourGuide"
-        return None
-
-    @classmethod
-    def init_canonical_manifests(cls):
-        """初始化规范化清单元数据缓存池，自动利用现有缓存与持久化 Hash 字典预热。"""
-        if cls._canonical_initialized:
-            return
-        os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
-        # 1. 优先从磁盘持久化文件加载全量 Hash 字典（包含跨代理节点 CDN 哈希池）
-        if os.path.exists(cls.HASH_MAP_FILE):
-            try:
-                with open(cls.HASH_MAP_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    if isinstance(saved, dict):
-                        cls._manifest_hash_to_type.update(saved)
-            except Exception:
-                pass
-
-        # 2. 扫描历史 .meta / .body 记录补充
-        try:
-            for fname in os.listdir(PYTHON_HTTP_CACHE_DIR):
-                if fname.endswith(".meta"):
-                    m_path = os.path.join(PYTHON_HTTP_CACHE_DIR, fname)
-                    b_path = os.path.join(PYTHON_HTTP_CACHE_DIR, fname[:-5] + ".body")
-                    if not os.path.exists(b_path):
-                        continue
-                    try:
-                        with open(m_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        url = meta.get("url", "")
-                        if "ExtensionManifest/" in url:
-                            hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
-                            if hash_name not in cls._manifest_hash_to_type:
-                                b_size = os.path.getsize(b_path)
-                                m_type = cls.identify_manifest_by_size(b_size)
-                                if m_type:
-                                    cls._manifest_hash_to_type[hash_name] = m_type
-                                    cls._manifest_hash_to_type[clean_h] = m_type
-                                    cls._manifest_hash_to_type[f"{clean_h}.json"] = m_type
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        cls._canonical_initialized = True
-
-    @classmethod
-    def get_canonical_manifest(cls, url: str) -> tuple[bytes, dict, int] | None:
-        """根据 URL (解析 m_type 参数或已学到的 hash 映射) 读取规范化 Manifest 强缓存。"""
-        cls.init_canonical_manifests()
-        m_type = None
-        if "m_type=" in url:
-            parts = url.split("m_type=", 1)[1]
-            m_type = parts.split("&")[0].split("#")[0]
-        if not m_type:
-            hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
-            m_type = cls._manifest_hash_to_type.get(hash_name) or cls._manifest_hash_to_type.get(clean_h)
-        if not m_type:
-            return None
-        canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
-        canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
-        if os.path.exists(canon_b) and os.path.exists(canon_m):
-            try:
-                with open(canon_m, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                with open(canon_b, "rb") as f:
-                    body = f.read()
-                if body and meta.get("headers"):
-                    return body, meta.get("headers"), meta.get("status", 200)
-            except Exception:
-                pass
-        return None
-
-    @classmethod
-    def save_canonical_manifest(cls, url: str, body: bytes, headers: dict):
-        """将新拉取的 Manifest 数据解析并更新到规范化缓存中。"""
-        cls.init_canonical_manifests()
-        try:
-            m_type = None
-            if "m_type=" in url:
-                m_type = url.split("m_type=", 1)[1].split("&")[0].split("#")[0]
-            if not m_type:
-                data = json.loads(body.decode("utf-8", errors="ignore"))
-                m_type = cls.detect_manifest_type(data)
-            if not m_type:
-                m_type = cls.identify_manifest_by_size(len(body))
-            if m_type:
-                hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                cls.learn_hash_mapping(hash_name, m_type)
-                canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
-                canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
-                clean_headers = {
-                    "content-type": "application/json; charset=utf-8",
-                    "access-control-allow-origin": "*",
-                    "cache-control": "public, max-age=31536000, immutable",
-                }
-                for k, v in headers.items():
-                    if k.lower() not in ("content-length", "content-encoding", "transfer-encoding"):
-                        clean_headers[k] = v
-                with open(canon_b, "wb") as f:
-                    f.write(body)
-                with open(canon_m, "w", encoding="utf-8") as f:
-                    json.dump({"status": 200, "headers": clean_headers, "url": url}, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    @classmethod
-    def is_cacheable(cls, url: str, method: str = "GET") -> bool:
-        """精准判定指定 URL 请求是否属于可无状态本地强缓存的公共静态资产。"""
-        if method.upper() != "GET":
-            return False
-        url_lower = url.lower()
-        clean = url_lower.split("?")[0].split("#")[0]
-        # Arkose CDN 静态字体与静态样式资产允许强缓存（保证真实字体度量避免触发风控）
-        if "/style-manager/fonts/" in clean or "/assets/style-manager/" in clean or ("/fc/assets/" in clean and (clean.endswith(cls.CACHEABLE_EXTENSIONS) or "/fonts/" in clean)):
-            return True
-        # Microsoft CDN 静态登录背景与插画图片（无后缀的哈希图片资产）允许强缓存
-        if any(h in clean for h in ("msauthimages.net", "msftauthimages.net", "aadcdn.msauth.net", "aadcdn.msftauth.net")):
-            return True
-        if any(p in url_lower for p in cls.DYNAMIC_SECURITY_PATTERNS):
-            return False
-        if clean.endswith(cls.CACHEABLE_EXTENSIONS):
-            return True
-        if any(path in clean for path in (
-            "/content/dynamic/", "/content/portalrequireconfig/",
-            "/bundle/", "/shared/1.0/", "/ests/2.1/", "/fonts/", "/content/scripts/",
-            "cdn.sheerid.com", "services.sheerid.com/assets/"
-        )):
-            return True
-        return False
-
-    @staticmethod
-    def _url_to_key(url: str) -> str:
-        clean = url.split("?")[0].split("#")[0]
-        return hashlib.sha256(clean.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def get(cls, url: str) -> tuple[bytes, dict, int] | None:
-        """根据 URL 查找本地强缓存。返回 (body_bytes, headers_dict, status_code) 或 None。
-        具备自动自愈机制：若检测到 body/meta 缺失或损坏，自动清理残片并回退到网络请求。
-        """
-        if not cls.is_cacheable(url, "GET"):
-            return None
-
-        key = cls._url_to_key(url)
-        body_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.body")
-        meta_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.meta")
-
-        has_body = os.path.exists(body_file)
-        has_meta = os.path.exists(meta_file)
-
-        if has_body and has_meta:
-            try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                with open(body_file, "rb") as f:
-                    body = f.read()
-                if body and len(body) > 10 and meta.get("headers"):
-                    return body, meta.get("headers"), meta.get("status", 200)
-            except Exception:
-                pass
-            # 残损自愈清理
-            try:
-                if os.path.exists(body_file): os.remove(body_file)
-                if os.path.exists(meta_file): os.remove(meta_file)
-            except Exception:
-                pass
-        elif has_body or has_meta:
-            # 孤立残片清理
-            try:
-                if os.path.exists(body_file): os.remove(body_file)
-                if os.path.exists(meta_file): os.remove(meta_file)
-            except Exception:
-                pass
-
-        return None
-
-    @classmethod
-    def put(cls, url: str, body: bytes, headers: dict, status: int = 200):
-        """保存响应数据到本地强缓存。"""
-        if not body or status != 200 or not cls.is_cacheable(url, "GET"):
-            return
-
-        key = cls._url_to_key(url)
-        body_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.body")
-        meta_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.meta")
-        temp_body = f"{body_file}.tmp"
-        temp_meta = f"{meta_file}.tmp"
-
-        clean_headers = {
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, HEAD, OPTIONS",
-            "access-control-allow-headers": "*",
-            "cache-control": "public, max-age=31536000, immutable",
-        }
-        skip_headers = {
-            "content-length", "content-encoding", "transfer-encoding",
-            "connection", "keep-alive", "content-security-policy",
-            "x-frame-options", "cross-origin-resource-policy",
-            "cross-origin-embedder-policy", "cross-origin-opener-policy",
-            "set-cookie"
-        }
-        for k, v in headers.items():
-            if k.lower() not in skip_headers:
-                clean_headers[k] = v
-
-        try:
-            with open(temp_body, "wb") as f:
-                f.write(body)
-            with open(temp_meta, "w", encoding="utf-8") as f:
-                json.dump({"status": status, "headers": clean_headers, "url": url}, f, ensure_ascii=False)
-
-            os.replace(temp_body, body_file)
-            os.replace(temp_meta, meta_file)
-        except Exception:
-            try:
-                if os.path.exists(temp_body):
-                    os.remove(temp_body)
-                if os.path.exists(temp_meta):
-                    os.remove(temp_meta)
-            except Exception:
-                pass
-
-
 class TrafficStats:
-    """高精度网络流量与省流统计器（支持 Socket 物理层与 HTTP 协议层多维统计）。"""
+    """代理连接字节或 HTTP 估算；缓存节省量使用压缩传输体积。"""
     def __init__(self, proxy_bridge=None):
         self.net_transfer_bytes = 0
         self.cache_saved_bytes = 0
         self.cache_hit_count = 0
+        self.cache_replayed_bytes = 0
+        self.cache_size_unknown_hits = 0
+        self.transfer_size_unknown_responses = 0
         self.blocked_count = 0
         self.proxy_bridge = proxy_bridge
         self.network_requests = []
@@ -1248,13 +842,33 @@ class TrafficStats:
             if url:
                 self.network_requests.append((num_bytes, url, r_type, status))
 
-    def record_cache_hit(self, body_size: int):
+    def record_cache_hit(self, body_size: int, wire_size: int | None = None):
         self.cache_hit_count += 1
-        self.cache_saved_bytes += max(body_size, 2048)
+        self.cache_replayed_bytes += body_size
+        if wire_size is None:
+            self.cache_size_unknown_hits += 1
+        else:
+            self.cache_saved_bytes += wire_size
 
-    def record_blocked(self, est_size: int = 50000):
+    def record_blocked(self, est_size: int = 0):
+        # 未下载的媒体没有实际传输尺寸，只记录次数。
         self.blocked_count += 1
-        self.cache_saved_bytes += est_size
+
+    def record_response(self, response, request=None, decoded_size=None):
+        request = request or response.request
+        req_size = 250 + sum(len(k) + len(v) + 4 for k, v in request.headers.items())
+        payload = request.post_data_buffer
+        req_size += len(payload) if payload else 0
+        headers = response.headers
+        body_size = 0 if response.status in (204, 304) or request.method == "HEAD" else transfer_body_size(headers, decoded_size)
+        if body_size is None:
+            self.transfer_size_unknown_responses += 1
+            body_size = 0
+        header_size = 250 + sum(len(k) + len(v) + 4 for k, v in headers.items())
+        self.record_transfer(req_size + header_size + body_size, response.url, request.resource_type, response.status)
+
+    def transfer_source(self):
+        return "代理连接累计传输" if self.proxy_bridge and hasattr(self.proxy_bridge, "get_total_bytes") and self.proxy_bridge.get_total_bytes() > 0 else "HTTP 传输估算"
 
     def get_transfer_bytes(self) -> int:
         if self.proxy_bridge and hasattr(self.proxy_bridge, "get_total_bytes"):
@@ -1275,17 +889,7 @@ class TrafficStats:
 
     def add_response(self, response):
         try:
-            req = response.request
-            resp_bytes = 250
-            try:
-                cl = response.headers.get("content-length")
-                if cl and cl.isdigit():
-                    resp_bytes += int(cl)
-                else:
-                    resp_bytes += 4096
-            except Exception:
-                resp_bytes += 2048
-            self.record_transfer(resp_bytes, response.url, req.resource_type, response.status)
+            self.record_response(response)
         except Exception:
             pass
 
@@ -1301,48 +905,9 @@ _DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return new Proxy({}, { get: 
 
 
 async def setup_save_data_route(ctx, stats: TrafficStats = None):
-    """纯净极速省流路由系统：
-    1. ExtensionManifest 走本地规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）；
-    2. 本地强缓存公共无状态静态 JS/CSS/字体/图标/静态JSON（portal.azure.com/*.js, aadcdn.msauth.net 等 0 字节复用）；
-    3. 拦截大体积无用媒体/安装包 (.mp4, .zip, .iso, .exe 等)；
-    4. 彻底移除所有域名黑名单、路径黑名单、语言包拦截与模块剪枝，100% 杜绝任何误杀或页面阻塞；
-    5. 100% 绝对原生放行所有认证、导航、ARM 接口与 Portal 核心 SPA 资源！
-    """
+    """公共静态资源持久缓存，认证/API 放行，仅拦截媒体及安装包。"""
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
-
-    TELEMETRY_PATTERNS = (
-        "browser.events.data.microsoft.com",
-        "events.data.microsoft.com",
-        "portal.azure.com/api/telemetry",
-        "portal.azure.com/azurehubs/api/telemetry",
-        "/azurehubs/api/telemetry",
-        "/api/telemetry",
-        "portal.azure.com/api/clientlog",
-        "portal.azure.com/azurehubs/api/clientlog",
-        "/azurehubs/api/clientlog",
-        "/api/clientlog",
-        "signup.azure.com/api/clientlog",
-        "pipe.aria.microsoft.com",
-        "vortex.data.microsoft.com",
-        "telemetry.microsoft.com",
-        "dc.services.visualstudio.com",
-        "clarity.ms",
-        "bing.com/as/",
-        "c.msn.com",
-        "mobile.events.data.microsoft.com",
-        "onesettings-bn2.met.live.com",
-        "web.vortex.data.microsoft.com",
-        "/api/diagnostics",
-    )
-
-    BLOCKED_IMAGE_EXTS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg"
-    )
-
-    CAPTCHA_DOMAINS = (
-        "arkose", "arkoselabs", "funcaptcha", "hcaptcha", "recaptcha", "geetest", "sheerid"
-    )
 
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
@@ -1370,73 +935,69 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.abort()
             return
 
-        # 3. 微软 / Azure 官方域名的所有 API、XHR 与 Fetch 请求：100% 原生直连，杜绝任何遥测 mock 导致的状态机报错或风控
-        if any(d in url_lower for d in ("portal.azure.com/api", "mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "signup.azure.com/api")):
+        # 动态认证/API 放行；认证域名的公共脚本、CSS、字体可进入静态缓存。
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        public_auth_asset = host in ("mysignins.microsoft.com", "login.microsoftonline.com") and LocalHttpCache.is_cacheable(url)
+        core_request = host in ("mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com") or host in ("portal.azure.com", "signup.azure.com") and parsed.path.lower().startswith("/api/")
+        if core_request and not public_auth_asset:
             await route.continue_()
             return
 
-        # 5. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
-        if "extensionmanifest/" in url_lower:
-            cached_manifest = LocalHttpCache.get_canonical_manifest(url)
-            if cached_manifest:
-                body, headers, status = cached_manifest
-                if stats:
-                    stats.record_cache_hit(len(body))
-                fulfilled_request_ids.add(id(request))
-                await route.fulfill(body=body, headers=headers, status=status)
-                return
-
-            # 若静态索引未命中，通过 0 字节内容下载的 HEAD 探测反查清单类型，秒级回退至规范化强缓存
-            try:
-                head_resp = await route.fetch(method="HEAD")
-                cl = head_resp.headers.get("content-length")
-                if cl and cl.isdigit():
-                    m_type = LocalHttpCache.identify_manifest_by_size(int(cl))
-                    if m_type:
-                        hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                        LocalHttpCache.learn_hash_mapping(hash_name, m_type)
-                        cached_manifest = LocalHttpCache.get_canonical_manifest(url)
-                        if cached_manifest:
-                            body, headers, status = cached_manifest
-                            if stats:
-                                stats.record_cache_hit(len(body))
-                            fulfilled_request_ids.add(id(request))
-                            await route.fulfill(body=body, headers=headers, status=status)
-                            return
-            except Exception:
-                pass
-
-        # 6. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON/Arkose静态字体)：本地秒级响应，0 网络流量
         if LocalHttpCache.is_cacheable(url, "GET"):
-            cached = LocalHttpCache.get(url)
-            if cached:
-                body, headers, status = cached
-                if stats:
-                    stats.record_cache_hit(len(body))
-                fulfilled_request_ids.add(id(request))
-                await route.fulfill(body=body, headers=headers, status=status)
-                return
-
-            # 首次未命中强缓存的静态资源：通过 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存
-            try:
-                fetch_resp = await route.fetch()
-                if fetch_resp.status == 200:
-                    resp_body = await fetch_resp.body()
-                    if resp_body and len(resp_body) > 10:
-                        resp_headers = dict(fetch_resp.headers)
-                        if "extensionmanifest/" in url_lower:
-                            LocalHttpCache.save_canonical_manifest(url, resp_body, resp_headers)
-                        LocalHttpCache.put(url, resp_body, resp_headers, fetch_resp.status)
+            # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
+            async with LocalHttpCache.download_lock(url):
+                is_manifest = "extensionmanifest/" in url_lower
+                cached = LocalHttpCache.get_canonical_manifest(url) if is_manifest else LocalHttpCache.get(url)
+                if cached:
+                    body, headers, status = cached
                     if stats:
-                        stats.record_transfer(len(resp_body) + 400, url, r_type, fetch_resp.status)
+                        stats.record_cache_hit(len(body), LocalHttpCache.get_wire_size(url))
                     fulfilled_request_ids.add(id(request))
-                    await route.fulfill(response=fetch_resp, body=resp_body)
+                    await route.fulfill(body=body, headers=headers, status=status)
                     return
-                else:
-                    await route.fulfill(response=fetch_resp)
+
+                candidate = LocalHttpCache.manifest_candidate(url) if is_manifest else None
+                fetch_kwargs = {}
+                if candidate:
+                    etag = candidate[1].get("headers", {}).get("etag")
+                    if etag:
+                        fetch_kwargs["headers"] = {**request.headers, "If-None-Match": etag}
+                try:
+                    fetched = await route.fetch(**fetch_kwargs)
+                except Exception:
+                    # fetch 失败后允许浏览器正常请求，不计为缓存命中。
+                    await route.continue_()
                     return
-            except Exception:
-                await route.continue_()
+
+                if candidate and fetched.status == 304:
+                    body, meta = candidate
+                    headers = dict(meta["headers"])
+                    if fetched.headers.get("etag"):
+                        headers["etag"] = fetched.headers["etag"]
+                    try:
+                        LocalHttpCache.save_canonical_manifest(url, body, headers, meta.get("wire_body_bytes"))
+                    except OSError:
+                        pass
+                    if stats:
+                        stats.record_response(fetched, request)
+                        stats.record_cache_hit(len(body), meta.get("wire_body_bytes"))
+                    fulfilled_request_ids.add(id(request))
+                    await route.fulfill(body=body, headers=headers, status=200)
+                    return
+
+                body = await fetched.body()
+                if stats:
+                    stats.record_response(fetched, request, len(body))
+                if fetched.status == 200:
+                    try:
+                        LocalHttpCache.put(url, body, fetched.headers, fetched.status)
+                        if is_manifest:
+                            LocalHttpCache.save_canonical_manifest(url, body, fetched.headers)
+                    except OSError as error:
+                        log.warning("静态缓存写入失败，已继续返回网络响应: %s", error)
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(response=fetched, body=body)
                 return
 
         # 7. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
@@ -1464,34 +1025,16 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 fulfilled_request_ids.discard(req_id)
                 return  # 本地强缓存与本地 Mock 命中，不计入网络传输！
 
-            req_bytes = 250
-            try:
-                for k, v in req.headers.items():
-                    req_bytes += len(k) + len(v) + 4
-            except Exception:
-                pass
-            try:
-                pd = req.post_data_buffer
-                if pd:
-                    req_bytes += len(pd)
-            except Exception:
-                pass
-
-            resp_bytes = 250
-            try:
-                r_headers = response.headers
-                for k, v in r_headers.items():
-                    resp_bytes += len(k) + len(v) + 4
-                cl = r_headers.get("content-length")
-                if cl and cl.isdigit():
-                    resp_bytes += int(cl)
-                else:
-                    resp_bytes += 4096
-            except Exception:
-                resp_bytes += 2048
-
             if stats:
-                stats.record_transfer(req_bytes + resp_bytes, response.url, req.resource_type, response.status)
+                stats.record_response(response, req)
+            resp_bytes = transfer_body_size(response.headers) or 0
+            if req.resource_type == "document" and urlsplit(response.url).hostname == "portal.azure.com":
+                async def learn_portal_hashes():
+                    try:
+                        LocalHttpCache.learn_hashes_from_html(await response.body())
+                    except Exception:
+                        pass
+                asyncio.ensure_future(learn_portal_hashes())
 
             # 记录 2FA initializemobileapp 的调用与秒级捕获 TOTP 密钥
             if "initializemobileapp" in (response.url or "").lower():

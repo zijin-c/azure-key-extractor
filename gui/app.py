@@ -25,6 +25,7 @@ from modules.batch_manager import BatchManager
 from modules.excel_export import export_to_excel, PRODUCT_COLUMNS, PRODUCT_SHORT
 from utils.xray_proxy import XrayProxyChain
 from utils.process_manager import BrowserProcessManager, release_system_memory
+from utils.session_secret import load_session_secret
 from gui.auth import (
     init_db, create_user, verify_user, login_required,
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
@@ -38,7 +39,8 @@ else:
     _tmpl_dir = os.path.join(os.path.dirname(__file__), 'templates')
 
 app = Flask(__name__, template_folder=_tmpl_dir)
-app.secret_key = "azure_key_extractor_2025_secure"
+app.secret_key = load_session_secret()
+_task_start_lock = threading.Lock()
 
 # 初始化数据库
 with app.app_context():
@@ -55,7 +57,7 @@ def _startup_check_batch():
             return
         status = task_info.get("status")
         sid = task_info.get("sid", "")
-        if status == "batch_restarting":
+        if status in ("running", "batch_restarting"):
             curr_b = task_info.get("current_batch_index", 0)
             total_b = task_info.get("total_batches", 1)
             total_accs = task_info.get("total_accounts", 0)
@@ -66,10 +68,10 @@ def _startup_check_batch():
 
             # 恢复 session 状态与已完成结果
             s = _get_sess(sid)
-            s.running = True
-            s.results = BatchManager.get_all_results()
-
-            threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
+            with _task_start_lock:
+                s.running = True
+                s.results = BatchManager.get_all_results()
+                threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
         elif status == "all_done_restarting":
             if sid:
                 _push_log(sid, f"{'═'*50}")
@@ -329,55 +331,65 @@ def api_start():
     sid  = data.get("sid") or session.get("sid", "")
     s    = _get_sess(sid)
 
-    if s.running or BatchManager.is_running():
-        return jsonify({"ok": False, "error": "已有任务在运行中或在批次重启过渡中"}), 400
+    with _task_start_lock:
+        if s.running or BatchManager.is_running():
+            return jsonify({"ok": False, "error": "已有任务在运行中或在批次重启过渡中"}), 400
 
-    raw_accounts = data.get("accounts", "").strip()
-    headless     = data.get("headless", False)
-    if sys.platform != "win32" and "DISPLAY" not in os.environ:
-        headless = True
-    proxy        = data.get("proxy", "").strip() or None
-    vless_proxy  = data.get("vless_proxy", "").strip() or None
-    selected_products = data.get("products", None)  # 用户选择的产品列表
-    concurrency  = int(data.get("concurrency", 3))
-    mode         = data.get("mode", "azure_student").strip()
-    batch_size   = int(data.get("batch_size", getattr(config, "BATCH_SIZE", 0)))
+        raw_accounts = data.get("accounts", "").strip()
+        headless     = data.get("headless", False)
+        if sys.platform != "win32" and "DISPLAY" not in os.environ:
+            headless = True
+        proxy        = data.get("proxy", "").strip() or None
+        vless_proxy  = data.get("vless_proxy", "").strip() or None
+        selected_products = data.get("products", None)  # 用户选择的产品列表
+        try:
+            concurrency = max(1, min(20, int(data.get("concurrency", 3))))
+            batch_size = max(0, int(data.get("batch_size", getattr(config, "BATCH_SIZE", 0))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "并发数和批次大小必须为整数"}), 400
+        mode         = data.get("mode", "azure_student").strip()
 
-    if not raw_accounts:
-        return jsonify({"ok": False, "error": "账号列表为空"}), 400
+        if not raw_accounts:
+            return jsonify({"ok": False, "error": "账号列表为空"}), 400
 
-    accounts = _parse_accounts(raw_accounts)
-    if not accounts:
-        return jsonify({"ok": False, "error": "账号格式错误，每行: 邮箱 TAB 密码 (可选 TAB TOTP密钥)"}), 400
+        accounts = _parse_accounts(raw_accounts)
+        if not accounts:
+            return jsonify({"ok": False, "error": "账号格式错误，每行: 邮箱 TAB 密码 (可选 TAB TOTP密钥)"}), 400
 
-    s.running = True
-    s.results = []
-    s.log_history.clear()
-    for q in list(s.listeners):
-        while not q.empty():
-            try:
-                q.get_nowait()
-            except Exception:
-                break
+        s.running = True
+        s.results = []
+        s.log_history.clear()
+        for q in list(s.listeners):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
 
-    # 初始化批次任务管理与持久化队列
-    BatchManager.init_task(
-        sid=sid,
-        user_id=session.get("user_id"),
-        accounts=accounts,
-        headless=headless,
-        proxy=proxy,
-        vless_proxy=vless_proxy,
-        selected_products=selected_products,
-        concurrency=concurrency,
-        mode=mode,
-        batch_size=batch_size,
-    )
+        try:
+            # 初始化批次任务管理与持久化队列
+            BatchManager.init_task(
+                sid=sid,
+                user_id=session.get("user_id"),
+                accounts=accounts,
+                headless=headless,
+                proxy=proxy,
+                vless_proxy=vless_proxy,
+                selected_products=selected_products,
+                concurrency=concurrency,
+                mode=mode,
+                batch_size=batch_size,
+            )
 
-    threading.Thread(
-        target=_run_batch_worker, args=(sid,), daemon=True
-    ).start()
-    return jsonify({"ok": True, "count": len(accounts)})
+            threading.Thread(
+                target=_run_batch_worker, args=(sid,), daemon=True
+            ).start()
+        except Exception:
+            s.running = False
+            BatchManager.clear_task()
+            app.logger.exception("启动任务失败")
+            return jsonify({"ok": False, "error": "启动任务失败，请检查服务日志"}), 500
+        return jsonify({"ok": True, "count": len(accounts)})
 
 
 
@@ -702,10 +714,6 @@ def _run_batch_worker(sid: str):
         return
 
     batch_accounts, batch_idx, total_batches, offset, total_accs = BatchManager.get_current_batch()
-    if not batch_accounts:
-        s.running = False
-        return
-
     s.running = True
     headless = task.get("headless", False)
     proxy = task.get("proxy")
@@ -733,9 +741,6 @@ def _run_batch_worker(sid: str):
                 break
 
             batch_accounts, batch_idx, total_batches, offset, total_accs = BatchManager.get_current_batch()
-            if not batch_accounts:
-                break
-
             pl(f"{'═'*50}")
             if total_batches > 1:
                 pl(f"📦 启动批次 [{batch_idx + 1}/{total_batches}]  本批账号数={len(batch_accounts)}  总账号数={total_accs} (进度: {offset + 1}~{offset + len(batch_accounts)}/{total_accs})")

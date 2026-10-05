@@ -17,6 +17,9 @@ import time
 import math
 import logging
 import subprocess
+import tempfile
+import threading
+from functools import wraps
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -24,6 +27,20 @@ from modules.pipeline import Account, KeyResult
 from utils.process_manager import BrowserProcessManager
 
 log = logging.getLogger(__name__)
+_QUEUE_LOCK = threading.RLock()
+
+
+def _locked_queue(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with _QUEUE_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def _account_identity(data):
+    return (data.get("email", "").strip().lower(), data.get("password", ""))
+
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DATA_DIR = os.path.join(_BASE_DIR, "data")
@@ -74,25 +91,26 @@ class BatchManager:
     """管理多批次任务持久化与服务自动重启调度器。"""
 
     @classmethod
+    @_locked_queue
     def _save_task_data(cls, data: dict):
         """原子写入任务队列文件，避免突然被终止时数据损坏。"""
-        tmp_file = _QUEUE_FILE + ".tmp"
+        os.makedirs(os.path.dirname(_QUEUE_FILE), exist_ok=True)
+        fd, tmp_file = tempfile.mkstemp(dir=os.path.dirname(_QUEUE_FILE), prefix=".task-")
         try:
-            with open(tmp_file, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            if os.path.exists(_QUEUE_FILE):
-                os.replace(tmp_file, _QUEUE_FILE)
-            else:
-                os.rename(tmp_file, _QUEUE_FILE)
-        except Exception as e:
-            log.error(f"保存任务状态文件失败: {e}")
-            try:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-            except Exception:
-                pass
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, _QUEUE_FILE)
+        except Exception:
+            log.exception("保存任务状态文件失败")
+            raise
+        finally:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
 
     @classmethod
+    @_locked_queue
     def get_active_task(cls) -> Optional[dict]:
         """读取当前正在进行的任务配置与状态。"""
         if not os.path.exists(_QUEUE_FILE):
@@ -105,6 +123,7 @@ class BatchManager:
             return None
 
     @classmethod
+    @_locked_queue
     def init_task(
         cls,
         sid: str,
@@ -151,6 +170,7 @@ class BatchManager:
         return task_data
 
     @classmethod
+    @_locked_queue
     def get_current_batch(cls) -> Tuple[List[Account], int, int, int, int]:
         """
         获取当前批次的账号列表及进度信息。
@@ -169,22 +189,35 @@ class BatchManager:
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, total)
 
-        batch_raw = accounts_data[start_idx:end_idx]
+        completed = {_account_identity(d) for d in task.get("completed_results", [])}
+        batch_raw = [d for d in accounts_data[start_idx:end_idx] if _account_identity(d) not in completed]
         batch_accounts = [_dict_to_account(d) for d in batch_raw]
         return batch_accounts, batch_idx, total_batches, start_idx, total
 
     @classmethod
+    @_locked_queue
     def record_account_result(cls, result: KeyResult):
         """记录单个账号的处理结果（用于跨批次/跨重启汇总）。"""
         task = cls.get_active_task()
         if not task:
             return
         results = task.setdefault("completed_results", [])
-        results.append(_result_to_dict(result))
+        item = _result_to_dict(result)
+        for i, existing in enumerate(results):
+            if _account_identity(existing) == _account_identity(item):
+                merged = dict(existing.get("keys", {}))
+                merged.update({k: v for k, v in item["keys"].items() if v})
+                item["keys"] = merged
+                item["success"] = bool(any(merged.values())) or item["success"]
+                results[i] = item
+                break
+        else:
+            results.append(item)
         task["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cls._save_task_data(task)
 
     @classmethod
+    @_locked_queue
     def has_next_batch(cls) -> bool:
         """判断是否还有下一批次待执行。"""
         task = cls.get_active_task()
@@ -195,6 +228,7 @@ class BatchManager:
         return (curr + 1) < total_b
 
     @classmethod
+    @_locked_queue
     def advance_to_next_batch(cls, restarting: bool = False):
         """推进批次索引，并更新状态。"""
         task = cls.get_active_task()
@@ -206,6 +240,7 @@ class BatchManager:
         cls._save_task_data(task)
 
     @classmethod
+    @_locked_queue
     def mark_all_done(cls):
         """标记所有批次已跑完，准备执行最终重启。"""
         task = cls.get_active_task()
@@ -216,6 +251,7 @@ class BatchManager:
         cls._save_task_data(task)
 
     @classmethod
+    @_locked_queue
     def stop_task(cls):
         """用户中止任务：清理/置停任务状态。"""
         task = cls.get_active_task()
@@ -226,6 +262,7 @@ class BatchManager:
         cls.clear_task()
 
     @classmethod
+    @_locked_queue
     def clear_task(cls):
         """彻底移除任务文件。"""
         if os.path.exists(_QUEUE_FILE):
@@ -235,6 +272,7 @@ class BatchManager:
                 log.warning(f"清除任务状态文件失败: {e}")
 
     @classmethod
+    @_locked_queue
     def is_running(cls) -> bool:
         """检查是否有正在运行或在批次重启过渡中的任务。"""
         task = cls.get_active_task()
@@ -243,6 +281,7 @@ class BatchManager:
         return task.get("status") in ("running", "batch_restarting")
 
     @classmethod
+    @_locked_queue
     def get_completed_count(cls) -> int:
         """获取已完成账号数量。"""
         task = cls.get_active_task()
@@ -251,6 +290,7 @@ class BatchManager:
         return len(task.get("completed_results", []))
 
     @classmethod
+    @_locked_queue
     def get_all_results(cls) -> List[KeyResult]:
         """获取所有批次已累积的完整 KeyResult 列表。"""
         task = cls.get_active_task()

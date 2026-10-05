@@ -465,7 +465,7 @@ async def process_account(
         tz_info = fp.get('timezone', 'UTC')
         _emit(cb, f"  🖥️  指纹: Chrome/{c_ver} | {vp_info['width']}x{vp_info['height']} | TZ={tz_info}")
         if config.ENABLE_SAVE_DATA:
-            _emit(cb, "  🚀 省流量模式已开启（已自动拦截图片、媒体、字体与遥测数据）")
+            _emit(cb, "  🚀 省流量模式已开启（公共静态资源缓存复用，媒体/安装包拦截，认证/API 放行）")
         else:
             _emit(cb, "  🌐 全量资源模式已开启（无拦截，完整下载 Angular 前端、字体及所有依赖资源）")
 
@@ -761,7 +761,11 @@ async def process_account(
 
     finally:
         if 'stats' in locals() and stats:
-            _emit(cb, f"  📊 本次账号真实网络消耗约 {stats.get_transfer_mb():.2f} MB | 本地强缓存为您节省 {stats.get_cache_saved_mb():.2f} MB（命中强缓存 {stats.cache_hit_count} 次，拦截非必要请求 {stats.blocked_count} 个）")
+            _emit(cb, f"  📊 本次账号{stats.transfer_source()}约 {stats.get_transfer_mb():.2f} MB | 已知缓存避免的响应体下载约 {stats.get_cache_saved_mb():.2f} MB（命中 {stats.cache_hit_count} 次，拦截媒体/安装包 {stats.blocked_count} 次）")
+            if stats.cache_size_unknown_hits:
+                _emit(cb, f"  ℹ️ 另有 {stats.cache_size_unknown_hits} 次缓存命中缺少原压缩尺寸，未计入节省 MB；缓存复用内容总计（解压后）{stats.cache_replayed_bytes / 1048576:.2f} MB")
+            if stats.transfer_size_unknown_responses:
+                _emit(cb, f"  ℹ️ {stats.transfer_size_unknown_responses} 个网络响应缺少传输长度，HTTP 估算未包含其响应体")
             if hasattr(stats, "get_top_downloads"):
                 top_dl = stats.get_top_downloads(5)
                 if top_dl:
