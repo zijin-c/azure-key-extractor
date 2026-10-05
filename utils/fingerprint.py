@@ -209,9 +209,9 @@ def random_fingerprint(major_ver: str = "131") -> dict:
 
 
 def build_init_script(fp: dict) -> str:
-    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v14 终极开源全维融合版)。
-    参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite 与 camoufox 的核心防检测逻辑：
-    1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，杜绝 Function.prototype.hasOwnProperty('prototype') 与 new 异常检测；
+    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v15 终极防检测全维融合版)。
+    参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite、camoufox 与 CreepJS 测试基准：
+    1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，严格对齐 V8 函数名与 toString，杜绝 Function.prototype.hasOwnProperty('prototype') 探测；
     2. WeakMap 原生函数原型链伪装 (Function.prototype.toString 严格对齐 V8 原生 [native code]，杜绝 AST/代码字符串化检测)；
     3. Web Worker / Blob Worker 深度域隔离同步：拦截 URL.createObjectURL 与 Worker 构造函数，向 Worker 线程内无缝注入硬件与语言环境；
     4. Console / CDP Getter 探测陷阱全面消除：防御 Cloudflare Turnstile 在 console.debug/dir 中传入带 Getter 对象的 CDP 自动化监听陷阱；
@@ -221,11 +221,16 @@ def build_init_script(fp: dict) -> str:
     8. 硬件参数全面对齐 (hardwareConcurrency, deviceMemory, maxTouchPoints=0 严格挂载在 Navigator.prototype)；
     9. 语言参数对齐 (language, languages 严格挂载在 Navigator.prototype 并与代理出口 IP 国家对齐)；
     10. 提供完整 navigator.userAgentData (Client Hints) 高熵接口 (包含 wow64: false，挂载于原型链)；
-    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter 伪装；
-    12. Notification.permission 与 Permissions API (navigator.permissions.query) 原生状态对齐；
-    13. Document.prototype.hasFocus / visibilityState / hidden 原生对齐 (杜绝 Headless 失去焦点与隐藏特征)；
-    14. 屏幕与视口几何参数严格一致 (Screen.prototype 尺寸与 window.outerWidth/outerHeight 严格匹配物理显示器)；
-    15. 保持 Canvas 2D 像素与 AudioContext 原生数学纯净度，保证 Arkose PoW 与 Cloudflare 客户端 Hash 计算 100% 真实通过。
+    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter/ShaderPrecision 深度伪装；
+    12. Canvas 2D 亚像素级微偏移与噪点扰动 (基于种子生成独立 Canvas 哈希，杜绝多账号在同一服务器上的特征聚类)；
+    13. AudioContext & OfflineAudioContext 频域/时域微扰动 (消除跨账号音频指纹碰撞)；
+    14. SpeechSynthesis 语音库模拟 (补齐 Linux Headless 环境下缺失的 Windows 桌面语音库)；
+    15. MediaDevices 摄像头/麦克风设备模拟 (对齐真实物理 PC 硬件外设枚举列表)；
+    16. Battery API 与 NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
+    17. WebRTC 本地内网 IP 防泄漏保护；
+    18. Notification.permission 与 Permissions API 原生状态对齐；
+    19. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
+    20. 屏幕与视口几何参数严格一致。
     """
     brands_json = json.dumps(fp.get("brand_entries", [
         {"brand": "Chromium", "version": fp.get("major_ver", "131")},
@@ -239,12 +244,18 @@ def build_init_script(fp: dict) -> str:
     frame_h = fp.get("frame_h_diff", 88)
     hw = fp.get("hw", 8)
     dm = fp.get("dm", 8)
+    rtt = fp.get("rtt", 50)
+    dl = fp.get("dl", 25.0)
     sw = fp.get("screen_width", 1920)
     sh = fp.get("screen_height", 1080)
     saw = fp.get("screen_avail_width", 1920)
     sah = fp.get("screen_avail_height", 1040)
     loc = fp.get("locale", "en-US")
     langs_json = json.dumps(fp.get("languages", ["en-US", "en"]))
+    seed = fp.get("seed", 0.12345678)
+    audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
+    audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
+    cam_in = fp.get("cam_in", "HD WebCam")
 
     return f"""
 (() => {{
@@ -574,6 +585,11 @@ def build_init_script(fp: dict) -> str:
             const hooked = helper.createNativeMethod('getParameter', function(param) {{
                 if (param === 0x9245) return spoofVendor;      // UNMASKED_VENDOR_WEBGL
                 if (param === 0x9246) return spoofRenderer;    // UNMASKED_RENDERER_WEBGL
+                if (param === 0x1F00) return "WebKit";         // VENDOR
+                if (param === 0x1F01) return "WebKit WebGL";   // RENDERER
+                if (param === 0x0D33) return 16384;            // MAX_TEXTURE_SIZE
+                if (param === 0x84E8) return 16384;            // MAX_CUBE_MAP_TEXTURE_SIZE
+                if (param === 0x84E4) return 16384;            // MAX_RENDERBUFFER_SIZE
                 return orig.apply(this, arguments);
             }});
             proto.getParameter = hooked;
@@ -583,7 +599,133 @@ def build_init_script(fp: dict) -> str:
         if (window.WebGL2RenderingContext) hookGetParameter(WebGL2RenderingContext.prototype);
     }} catch (e) {{}}
 
-    // ── 7. Permissions API & Notification Alignment ────────────────────────
+    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise Injection ──────────────
+    try {{
+        const noiseSeed = {seed};
+        if (window.CanvasRenderingContext2D) {{
+            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = helper.createNativeMethod('getImageData', function(...args) {{
+                const res = origGetImageData.apply(this, args);
+                if (res && res.data && res.data.length >= 4) {{
+                    const d = res.data;
+                    const step = Math.max(16, Math.floor(d.length / 32));
+                    for (let i = 0; i < d.length; i += step) {{
+                        if (d[i + 3] > 0) {{
+                            const delta = ((i * noiseSeed) % 3) - 1;
+                            d[i] = Math.min(255, Math.max(0, d[i] + delta));
+                        }}
+                    }}
+                }}
+                return res;
+            }});
+
+            const origMeasureText = CanvasRenderingContext2D.prototype.measureText;
+            CanvasRenderingContext2D.prototype.measureText = helper.createNativeMethod('measureText', function(...args) {{
+                const res = origMeasureText.apply(this, args);
+                if (res && typeof res.width === 'number') {{
+                    const delta = (noiseSeed * 0.00004) - 0.00002;
+                    try {{
+                        Object.defineProperty(res, 'width', {{
+                            value: res.width + delta,
+                            configurable: true,
+                            enumerable: true
+                        }});
+                    }} catch(e) {{}}
+                }}
+                return res;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 8. AudioContext & OfflineAudioContext Fingerprint Hardening ─────────
+    try {{
+        const audioSeed = {seed};
+        if (window.AudioBuffer) {{
+            const origGetChannelData = AudioBuffer.prototype.getChannelData;
+            AudioBuffer.prototype.getChannelData = helper.createNativeMethod('getChannelData', function(channel) {{
+                const data = origGetChannelData.apply(this, arguments);
+                if (data && data.length > 0) {{
+                    const step = Math.max(20, Math.floor(data.length / 50));
+                    for (let i = 0; i < data.length; i += step) {{
+                        data[i] += (audioSeed * 0.0000001) - 0.00000005;
+                    }}
+                }}
+                return data;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 9. SpeechSynthesis Voice Library Alignment (Windows 10/11) ──────────
+    try {{
+        if (window.speechSynthesis) {{
+            const fakeVoices = [
+                {{ voiceURI: "Microsoft David - English (United States)", name: "Microsoft David - English (United States)", lang: "en-US", localService: true, default: true }},
+                {{ voiceURI: "Microsoft Zira - English (United States)", name: "Microsoft Zira - English (United States)", lang: "en-US", localService: true, default: false }},
+                {{ voiceURI: "Microsoft Mark - English (United States)", name: "Microsoft Mark - English (United States)", lang: "en-US", localService: true, default: false }},
+                {{ voiceURI: "Google US English", name: "Google US English", lang: "en-US", localService: false, default: false }}
+            ];
+            window.speechSynthesis.getVoices = helper.createNativeMethod('getVoices', function() {{
+                return fakeVoices;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 10. MediaDevices Real Hardware Alignment ────────────────────────────
+    try {{
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+            const fakeDevices = [
+                {{ deviceId: "default", kind: "audioinput", label: "{audio_in}", groupId: "group_1" }},
+                {{ deviceId: "default", kind: "audiooutput", label: "{audio_out}", groupId: "group_1" }},
+                {{ deviceId: "video_cam_1", kind: "videoinput", label: "{cam_in}", groupId: "group_2" }}
+            ];
+            navigator.mediaDevices.enumerateDevices = helper.createNativeMethod('enumerateDevices', function() {{
+                return Promise.resolve(fakeDevices);
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 11. Battery & Network Information (navigator.connection) ───────────
+    try {{
+        if (!navigator.getBattery) {{
+            const batteryObj = {{
+                charging: true,
+                chargingTime: 0,
+                dischargingTime: Infinity,
+                level: 1.0,
+                onchargingchange: null,
+                onchargingtimechange: null,
+                ondischargingtimechange: null,
+                onlevelchange: null,
+                addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+                removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+                dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }})
+            }};
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            navProto.getBattery = helper.createNativeMethod('getBattery', function() {{
+                return Promise.resolve(batteryObj);
+            }});
+        }}
+
+        const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+        const connectionObj = {{
+            effectiveType: '4g',
+            rtt: {rtt},
+            downlink: {dl},
+            saveData: false,
+            onchange: null,
+            addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+            removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+            dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }})
+        }};
+        delete navigator.connection;
+        Object.defineProperty(navProto, 'connection', {{
+            get: helper.createNativeGetter('connection', function() {{ return connectionObj; }}),
+            configurable: true,
+            enumerable: true
+        }});
+    }} catch (e) {{}}
+
+    // ── 12. Permissions API & Notification Alignment ────────────────────────
     try {{
         if (navigator.permissions && navigator.permissions.query) {{
             const origQuery = navigator.permissions.query;
@@ -600,7 +742,7 @@ def build_init_script(fp: dict) -> str:
         }}
     }} catch (e) {{}}
 
-    // ── 8. Document Visibility & Focus (Headless Neutralization) ───────────
+    // ── 13. Document Visibility & Focus (Headless Neutralization) ───────────
     try {{
         Document.prototype.hasFocus = helper.createNativeMethod('hasFocus', function() {{ return true; }});
         Object.defineProperty(Document.prototype, 'hidden', {{
@@ -615,7 +757,7 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 9. Window Geometry & Screen Consistency ────────────────────────────
+    // ── 14. Window Geometry & Screen Consistency ────────────────────────────
     try {{
         const winProto = Object.getPrototypeOf(window) || Window.prototype;
         delete window.outerWidth;
