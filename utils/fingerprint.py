@@ -1358,68 +1358,20 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
 
-        # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转与 CSP 安全）
-        if r_type == "document" or request.is_navigation_request():
+        # 1. 核心业务导航、主 HTML 文档以及所有非 GET 请求 (POST/PUT/DELETE/OPTIONS)：100% 原生直连（保证 Cookie、Session、登录跳转与 API 完整性）
+        if r_type == "document" or request.is_navigation_request() or request.method != "GET":
             await route.continue_()
             return
 
-        # 2. 遥测、日志与埋点数据拦截 (无论 GET / POST / PING / XHR / Beacon)：本地 200 Mock 响应，阻断后台持续上传大体积日志
-        if any(tp in url_lower for tp in TELEMETRY_PATTERNS):
+        # 2. 拦截超大体积无用媒体与安装包文件 (.mp4, .zip, .iso, .exe, .msi 等)
+        if clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
-                stats.record_blocked(est_size=60000)
-            fulfilled_request_ids.add(id(request))
-            if "events.data.microsoft.com" in url_lower:
-                resp_body = b'{"statusCode":200,"itemsReceived":1,"itemsAccepted":1,"errors":[]}'
-            else:
-                resp_body = b'{"status":"success"}'
-            origin = request.headers.get("origin") or "*"
-            await route.fulfill(
-                body=resp_body,
-                headers={
-                    "content-type": "application/json",
-                    "access-control-allow-origin": origin,
-                    "access-control-allow-credentials": "true",
-                    "access-control-allow-methods": "GET, POST, OPTIONS, PING",
-                    "access-control-allow-headers": "*",
-                },
-                status=200
-            )
+                stats.record_blocked(est_size=5000000)
+            await route.abort()
             return
 
-        # 3. 拦截/Mock 非必要图片资产（装饰背景壁纸、Passkey GIF动画、Azure Portal 图标），人机验证/Captcha 图片严格放行
-        is_captcha_asset = any(c in url_lower for c in CAPTCHA_DOMAINS)
-        if not is_captcha_asset and (r_type == "image" or clean_url.endswith(BLOCKED_IMAGE_EXTS)):
-            if stats:
-                stats.record_blocked(est_size=80000)
-            fulfilled_request_ids.add(id(request))
-            is_svg = clean_url.endswith(".svg") or "image/svg" in (request.headers.get("accept") or "")
-            body = _DUMMY_SVG_IMAGE if is_svg else _DUMMY_PNG_IMAGE
-            c_type = "image/svg+xml" if is_svg else "image/png"
-            await route.fulfill(
-                body=body,
-                headers={
-                    "content-type": c_type,
-                    "access-control-allow-origin": "*",
-                    "cache-control": "public, max-age=31536000, immutable"
-                },
-                status=200
-            )
-            return
-
-        # 4. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
-        if request.method != "GET":
-            # 严格拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2，体积高达 2.3MB 且对自动化提取毫无用处)
-            if "initializemobileapp" in url_lower and request.method == "POST":
-                try:
-                    pd = request.post_data or ""
-                    if '"securityinfotype":2' in pd.lower() or '"securityinfotype": 2' in pd.lower():
-                        log.info("[2FA] 拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2)，节省 2.3MB 流量")
-                        if stats:
-                            stats.record_blocked(est_size=2300000)
-                        await route.abort()
-                        return
-                except Exception:
-                    pass
+        # 3. 微软 / Azure 官方域名的所有 API、XHR 与 Fetch 请求：100% 原生直连，杜绝任何遥测 mock 导致的状态机报错或风控
+        if any(d in url_lower for d in ("portal.azure.com/api", "mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "signup.azure.com/api")):
             await route.continue_()
             return
 

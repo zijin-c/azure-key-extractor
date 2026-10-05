@@ -209,9 +209,9 @@ def random_fingerprint(major_ver: str = "131") -> dict:
 
 
 def build_init_script(fp: dict) -> str:
-    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v14 终极开源全维融合版)。
-    参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite 与 camoufox 的核心防检测逻辑：
-    1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，杜绝 Function.prototype.hasOwnProperty('prototype') 与 new 异常检测；
+    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v15 终极防检测全维融合版)。
+    参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite、camoufox 与 CreepJS 测试基准：
+    1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，严格对齐 V8 函数名与 toString，杜绝 Function.prototype.hasOwnProperty('prototype') 探测；
     2. WeakMap 原生函数原型链伪装 (Function.prototype.toString 严格对齐 V8 原生 [native code]，杜绝 AST/代码字符串化检测)；
     3. Web Worker / Blob Worker 深度域隔离同步：拦截 URL.createObjectURL 与 Worker 构造函数，向 Worker 线程内无缝注入硬件与语言环境；
     4. Console / CDP Getter 探测陷阱全面消除：防御 Cloudflare Turnstile 在 console.debug/dir 中传入带 Getter 对象的 CDP 自动化监听陷阱；
@@ -221,11 +221,16 @@ def build_init_script(fp: dict) -> str:
     8. 硬件参数全面对齐 (hardwareConcurrency, deviceMemory, maxTouchPoints=0 严格挂载在 Navigator.prototype)；
     9. 语言参数对齐 (language, languages 严格挂载在 Navigator.prototype 并与代理出口 IP 国家对齐)；
     10. 提供完整 navigator.userAgentData (Client Hints) 高熵接口 (包含 wow64: false，挂载于原型链)；
-    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter 伪装；
-    12. Notification.permission 与 Permissions API (navigator.permissions.query) 原生状态对齐；
-    13. Document.prototype.hasFocus / visibilityState / hidden 原生对齐 (杜绝 Headless 失去焦点与隐藏特征)；
-    14. 屏幕与视口几何参数严格一致 (Screen.prototype 尺寸与 window.outerWidth/outerHeight 严格匹配物理显示器)；
-    15. 保持 Canvas 2D 像素与 AudioContext 原生数学纯净度，保证 Arkose PoW 与 Cloudflare 客户端 Hash 计算 100% 真实通过。
+    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter/ShaderPrecision 深度伪装；
+    12. Canvas 2D 亚像素级微偏移与噪点扰动 (基于种子生成独立 Canvas 哈希，杜绝多账号在同一服务器上的特征聚类)；
+    13. AudioContext & OfflineAudioContext 频域/时域微扰动 (消除跨账号音频指纹碰撞)；
+    14. SpeechSynthesis 语音库模拟 (补齐 Linux Headless 环境下缺失的 Windows 桌面语音库)；
+    15. MediaDevices 摄像头/麦克风设备模拟 (对齐真实物理 PC 硬件外设枚举列表)；
+    16. Battery API 与 NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
+    17. WebRTC 本地内网 IP 防泄漏保护；
+    18. Notification.permission 与 Permissions API 原生状态对齐；
+    19. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
+    20. 屏幕与视口几何参数严格一致。
     """
     brands_json = json.dumps(fp.get("brand_entries", [
         {"brand": "Chromium", "version": fp.get("major_ver", "131")},
@@ -239,12 +244,18 @@ def build_init_script(fp: dict) -> str:
     frame_h = fp.get("frame_h_diff", 88)
     hw = fp.get("hw", 8)
     dm = fp.get("dm", 8)
+    rtt = fp.get("rtt", 50)
+    dl = fp.get("dl", 25.0)
     sw = fp.get("screen_width", 1920)
     sh = fp.get("screen_height", 1080)
     saw = fp.get("screen_avail_width", 1920)
     sah = fp.get("screen_avail_height", 1040)
     loc = fp.get("locale", "en-US")
     langs_json = json.dumps(fp.get("languages", ["en-US", "en"]))
+    seed = fp.get("seed", 0.12345678)
+    audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
+    audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
+    cam_in = fp.get("cam_in", "HD WebCam")
 
     return f"""
 (() => {{
@@ -574,6 +585,11 @@ def build_init_script(fp: dict) -> str:
             const hooked = helper.createNativeMethod('getParameter', function(param) {{
                 if (param === 0x9245) return spoofVendor;      // UNMASKED_VENDOR_WEBGL
                 if (param === 0x9246) return spoofRenderer;    // UNMASKED_RENDERER_WEBGL
+                if (param === 0x1F00) return "WebKit";         // VENDOR
+                if (param === 0x1F01) return "WebKit WebGL";   // RENDERER
+                if (param === 0x0D33) return 16384;            // MAX_TEXTURE_SIZE
+                if (param === 0x84E8) return 16384;            // MAX_CUBE_MAP_TEXTURE_SIZE
+                if (param === 0x84E4) return 16384;            // MAX_RENDERBUFFER_SIZE
                 return orig.apply(this, arguments);
             }});
             proto.getParameter = hooked;
@@ -583,7 +599,133 @@ def build_init_script(fp: dict) -> str:
         if (window.WebGL2RenderingContext) hookGetParameter(WebGL2RenderingContext.prototype);
     }} catch (e) {{}}
 
-    // ── 7. Permissions API & Notification Alignment ────────────────────────
+    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise Injection ──────────────
+    try {{
+        const noiseSeed = {seed};
+        if (window.CanvasRenderingContext2D) {{
+            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = helper.createNativeMethod('getImageData', function(...args) {{
+                const res = origGetImageData.apply(this, args);
+                if (res && res.data && res.data.length >= 4) {{
+                    const d = res.data;
+                    const step = Math.max(16, Math.floor(d.length / 32));
+                    for (let i = 0; i < d.length; i += step) {{
+                        if (d[i + 3] > 0) {{
+                            const delta = ((i * noiseSeed) % 3) - 1;
+                            d[i] = Math.min(255, Math.max(0, d[i] + delta));
+                        }}
+                    }}
+                }}
+                return res;
+            }});
+
+            const origMeasureText = CanvasRenderingContext2D.prototype.measureText;
+            CanvasRenderingContext2D.prototype.measureText = helper.createNativeMethod('measureText', function(...args) {{
+                const res = origMeasureText.apply(this, args);
+                if (res && typeof res.width === 'number') {{
+                    const delta = (noiseSeed * 0.00004) - 0.00002;
+                    try {{
+                        Object.defineProperty(res, 'width', {{
+                            value: res.width + delta,
+                            configurable: true,
+                            enumerable: true
+                        }});
+                    }} catch(e) {{}}
+                }}
+                return res;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 8. AudioContext & OfflineAudioContext Fingerprint Hardening ─────────
+    try {{
+        const audioSeed = {seed};
+        if (window.AudioBuffer) {{
+            const origGetChannelData = AudioBuffer.prototype.getChannelData;
+            AudioBuffer.prototype.getChannelData = helper.createNativeMethod('getChannelData', function(channel) {{
+                const data = origGetChannelData.apply(this, arguments);
+                if (data && data.length > 0) {{
+                    const step = Math.max(20, Math.floor(data.length / 50));
+                    for (let i = 0; i < data.length; i += step) {{
+                        data[i] += (audioSeed * 0.0000001) - 0.00000005;
+                    }}
+                }}
+                return data;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 9. SpeechSynthesis Voice Library Alignment (Windows 10/11) ──────────
+    try {{
+        if (window.speechSynthesis) {{
+            const fakeVoices = [
+                {{ voiceURI: "Microsoft David - English (United States)", name: "Microsoft David - English (United States)", lang: "en-US", localService: true, default: true }},
+                {{ voiceURI: "Microsoft Zira - English (United States)", name: "Microsoft Zira - English (United States)", lang: "en-US", localService: true, default: false }},
+                {{ voiceURI: "Microsoft Mark - English (United States)", name: "Microsoft Mark - English (United States)", lang: "en-US", localService: true, default: false }},
+                {{ voiceURI: "Google US English", name: "Google US English", lang: "en-US", localService: false, default: false }}
+            ];
+            window.speechSynthesis.getVoices = helper.createNativeMethod('getVoices', function() {{
+                return fakeVoices;
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 10. MediaDevices Real Hardware Alignment ────────────────────────────
+    try {{
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {{
+            const fakeDevices = [
+                {{ deviceId: "default", kind: "audioinput", label: "{audio_in}", groupId: "group_1" }},
+                {{ deviceId: "default", kind: "audiooutput", label: "{audio_out}", groupId: "group_1" }},
+                {{ deviceId: "video_cam_1", kind: "videoinput", label: "{cam_in}", groupId: "group_2" }}
+            ];
+            navigator.mediaDevices.enumerateDevices = helper.createNativeMethod('enumerateDevices', function() {{
+                return Promise.resolve(fakeDevices);
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 11. Battery & Network Information (navigator.connection) ───────────
+    try {{
+        if (!navigator.getBattery) {{
+            const batteryObj = {{
+                charging: true,
+                chargingTime: 0,
+                dischargingTime: Infinity,
+                level: 1.0,
+                onchargingchange: null,
+                onchargingtimechange: null,
+                ondischargingtimechange: null,
+                onlevelchange: null,
+                addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+                removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+                dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }})
+            }};
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            navProto.getBattery = helper.createNativeMethod('getBattery', function() {{
+                return Promise.resolve(batteryObj);
+            }});
+        }}
+
+        const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+        const connectionObj = {{
+            effectiveType: '4g',
+            rtt: {rtt},
+            downlink: {dl},
+            saveData: false,
+            onchange: null,
+            addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+            removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+            dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }})
+        }};
+        delete navigator.connection;
+        Object.defineProperty(navProto, 'connection', {{
+            get: helper.createNativeGetter('connection', function() {{ return connectionObj; }}),
+            configurable: true,
+            enumerable: true
+        }});
+    }} catch (e) {{}}
+
+    // ── 12. Permissions API & Notification Alignment ────────────────────────
     try {{
         if (navigator.permissions && navigator.permissions.query) {{
             const origQuery = navigator.permissions.query;
@@ -600,7 +742,7 @@ def build_init_script(fp: dict) -> str:
         }}
     }} catch (e) {{}}
 
-    // ── 8. Document Visibility & Focus (Headless Neutralization) ───────────
+    // ── 13. Document Visibility & Focus (Headless Neutralization) ───────────
     try {{
         Document.prototype.hasFocus = helper.createNativeMethod('hasFocus', function() {{ return true; }});
         Object.defineProperty(Document.prototype, 'hidden', {{
@@ -615,7 +757,7 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 9. Window Geometry & Screen Consistency ────────────────────────────
+    // ── 14. Window Geometry & Screen Consistency ────────────────────────────
     try {{
         const winProto = Object.getPrototypeOf(window) || Window.prototype;
         delete window.outerWidth;
@@ -1216,68 +1358,20 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
 
-        # 1. 核心业务导航与主 HTML 文档：100% 原生直连（保证 Cookie、Session、登录跳转与 CSP 安全）
-        if r_type == "document" or request.is_navigation_request():
+        # 1. 核心业务导航、主 HTML 文档以及所有非 GET 请求 (POST/PUT/DELETE/OPTIONS)：100% 原生直连（保证 Cookie、Session、登录跳转与 API 完整性）
+        if r_type == "document" or request.is_navigation_request() or request.method != "GET":
             await route.continue_()
             return
 
-        # 2. 遥测、日志与埋点数据拦截 (无论 GET / POST / PING / XHR / Beacon)：本地 200 Mock 响应，阻断后台持续上传大体积日志
-        if any(tp in url_lower for tp in TELEMETRY_PATTERNS):
+        # 2. 拦截超大体积无用媒体与安装包文件 (.mp4, .zip, .iso, .exe, .msi 等)
+        if clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
-                stats.record_blocked(est_size=60000)
-            fulfilled_request_ids.add(id(request))
-            if "events.data.microsoft.com" in url_lower:
-                resp_body = b'{"statusCode":200,"itemsReceived":1,"itemsAccepted":1,"errors":[]}'
-            else:
-                resp_body = b'{"status":"success"}'
-            origin = request.headers.get("origin") or "*"
-            await route.fulfill(
-                body=resp_body,
-                headers={
-                    "content-type": "application/json",
-                    "access-control-allow-origin": origin,
-                    "access-control-allow-credentials": "true",
-                    "access-control-allow-methods": "GET, POST, OPTIONS, PING",
-                    "access-control-allow-headers": "*",
-                },
-                status=200
-            )
+                stats.record_blocked(est_size=5000000)
+            await route.abort()
             return
 
-        # 3. 拦截/Mock 非必要图片资产（装饰背景壁纸、Passkey GIF动画、Azure Portal 图标），人机验证/Captcha 图片严格放行
-        is_captcha_asset = any(c in url_lower for c in CAPTCHA_DOMAINS)
-        if not is_captcha_asset and (r_type == "image" or clean_url.endswith(BLOCKED_IMAGE_EXTS)):
-            if stats:
-                stats.record_blocked(est_size=80000)
-            fulfilled_request_ids.add(id(request))
-            is_svg = clean_url.endswith(".svg") or "image/svg" in (request.headers.get("accept") or "")
-            body = _DUMMY_SVG_IMAGE if is_svg else _DUMMY_PNG_IMAGE
-            c_type = "image/svg+xml" if is_svg else "image/png"
-            await route.fulfill(
-                body=body,
-                headers={
-                    "content-type": c_type,
-                    "access-control-allow-origin": "*",
-                    "cache-control": "public, max-age=31536000, immutable"
-                },
-                status=200
-            )
-            return
-
-        # 4. 非 GET 请求 (POST / PUT / DELETE / OPTIONS / PATCH 等)：100% 原生直连
-        if request.method != "GET":
-            # 严格拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2，体积高达 2.3MB 且对自动化提取毫无用处)
-            if "initializemobileapp" in url_lower and request.method == "POST":
-                try:
-                    pd = request.post_data or ""
-                    if '"securityinfotype":2' in pd.lower() or '"securityinfotype": 2' in pd.lower():
-                        log.info("[2FA] 拦截无 TOTP 密钥的 Microsoft Authenticator 推送包 (securityInfoType: 2)，节省 2.3MB 流量")
-                        if stats:
-                            stats.record_blocked(est_size=2300000)
-                        await route.abort()
-                        return
-                except Exception:
-                    pass
+        # 3. 微软 / Azure 官方域名的所有 API、XHR 与 Fetch 请求：100% 原生直连，杜绝任何遥测 mock 导致的状态机报错或风控
+        if any(d in url_lower for d in ("portal.azure.com/api", "mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "signup.azure.com/api")):
             await route.continue_()
             return
 

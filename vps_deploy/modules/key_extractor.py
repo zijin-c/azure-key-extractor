@@ -300,6 +300,9 @@ async def _search_product(page: Page, search_term: str, cb: ProgressCallback) ->
     """
 
     for attempt in range(10):  # 最多等待 5 秒
+        if attempt in (2, 5):
+            await _close_panel(page)
+            await asyncio.sleep(0.2)
         for frame in [page] + list(page.frames):
             try:
                 found = await frame.evaluate(_FIND_SEARCH_JS)
@@ -670,11 +673,29 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
 
 
 async def _close_panel(page: Page):
-    """关闭右侧详情面板（仅使用 Escape 键，严禁点击任何可能属于主 Education Blade 的关闭按钮）。"""
+    """关闭右侧详情面板（按 Escape 键并智能点击右侧详情 blade 的关闭按钮，确保搜索框恢复可交互状态）。"""
     try:
         await page.keyboard.press("Escape")
+        await asyncio.sleep(0.15)
     except Exception:
         pass
+    for frame in [page] + list(page.frames):
+        try:
+            await frame.evaluate("""
+                () => {
+                    const closeBtns = [...document.querySelectorAll('.fxs-blade-close, button[aria-label="Close"], button[aria-label="关闭"], button[title="Close"], button[title="关闭"], [data-telemetry-id="blade-close"], .ms-Panel-closeButton, .ms-Button--icon')];
+                    const rightside = closeBtns.filter(b => {
+                        const r = b.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0 && r.left > 400;
+                    });
+                    if (rightside.length > 0) {
+                        rightside.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+                        rightside[0].click();
+                    }
+                }
+            """)
+        except Exception:
+            pass
 
 
 async def _clear_search(page: Page):
@@ -1372,12 +1393,7 @@ async def extract_all_keys(
                 _emit(cb, f"  ⚠️  搜索失败，跳过: {product_name}")
                 keys[product_name] = ""
                 failed_products.append(product_name)
-                consecutive_search_fails += 1
-                if consecutive_search_fails >= 2:
-                    raise PortalLoadError("软件搜索框连续 2 次无响应（页面渲染异常/代理卡顿），换代理重试", totp=updated_totp)
                 continue
-            else:
-                consecutive_search_fails = 0
 
             await asyncio.sleep(0.5)
 
@@ -1460,9 +1476,8 @@ async def extract_all_keys(
         except Exception:
             pass
 
-    # 一个 key 都没拿到：通常是 Portal 网络卡顿导致页面异常，交给上层换代理重试
-    if not any(v for v in keys.values()):
-        raise PortalLoadError("本轮 0 个 key（页面加载/搜索异常，疑似网络卡顿），需换代理重试", totp=updated_totp)
+    success_count = len([k for k, v in keys.items() if v])
+    _emit(cb, f"  ℹ️  当前账号 key 提取流程结束（成功获取 {success_count}/{len(targets)} 个产品 key），直接进入下一步")
 
     if updated_totp and ms_email:
         save_totp_cache(ms_email, updated_totp)
