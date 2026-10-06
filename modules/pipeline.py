@@ -463,7 +463,7 @@ async def process_account(
         c_ver = fp.get('chrome_ver', fp.get('major_ver', '152'))
         vp_info = fp.get('viewport', {'width': 1920, 'height': 1080})
         tz_info = fp.get('timezone', 'UTC')
-        _emit(cb, f"  🖥️  原生浏览器: Chromium/{c_ver} | {vp_info['width']}x{vp_info['height']} | TZ={tz_info} | {fp.get('platform', 'unknown')}")
+        _emit(cb, f"  🖥️  指纹: Chrome/{c_ver} | {vp_info['width']}x{vp_info['height']} | TZ={tz_info}")
         if config.ENABLE_SAVE_DATA:
             _emit(cb, "  🚀 省流量模式已开启（公共静态资源缓存复用，媒体/安装包拦截，认证/API 放行）")
         else:
