@@ -241,12 +241,12 @@ class BatchManager:
 
     @classmethod
     @_locked_queue
-    def mark_all_done(cls):
+    def mark_all_done(cls, restarting: bool = True):
         """标记所有批次已跑完，准备执行最终重启。"""
         task = cls.get_active_task()
         if not task:
             return
-        task["status"] = "all_done_restarting"
+        task["status"] = "all_done_restarting" if restarting else "completed"
         task["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cls._save_task_data(task)
 

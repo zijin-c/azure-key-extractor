@@ -11,6 +11,8 @@ import json
 import logging
 import threading
 from typing import Optional
+from contextvars import ContextVar
+from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +23,27 @@ _LOCK = threading.Lock()
 
 _MEMORY_CACHE: dict[str, str] = {}
 _INITIALIZED = False
+_USER_SCOPE = ContextVar("totp_cache_user", default=None)
+_USER_CACHES = {}
+
+
+@contextmanager
+def totp_cache_scope(user_id):
+    """网页任务仅访问自己的密钥；CLI 保持独立的旧缓存行为。"""
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        raise ValueError("密钥缓存需要有效的用户身份")
+    token = _USER_SCOPE.set(user_id)
+    try:
+        yield
+    finally:
+        _USER_SCOPE.reset(token)
+
+
+def _current_cache():
+    scope = _USER_SCOPE.get()
+    if scope is None:
+        return _MEMORY_CACHE, _CACHE_FILE
+    return _USER_CACHES[scope], os.path.join(_DATA_DIR, "user_totp", f"{scope}.json")
 
 
 def _is_valid_secret(candidate: str | None) -> bool:
@@ -34,6 +57,22 @@ def _is_valid_secret(candidate: str | None) -> bool:
 
 def _ensure_loaded():
     global _INITIALIZED, _MEMORY_CACHE
+    scope = _USER_SCOPE.get()
+    if scope is not None:
+        with _LOCK:
+            if scope not in _USER_CACHES:
+                path = os.path.join(_DATA_DIR, "user_totp", f"{scope}.json")
+                cache = {}
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        cache = {k.lower().strip(): v.strip() for k, v in data.items()
+                                 if isinstance(k, str) and isinstance(v, str) and _is_valid_secret(v)}
+                except (OSError, ValueError, UnicodeError):
+                    pass
+                _USER_CACHES[scope] = cache
+        return
     if _INITIALIZED:
         return
     with _LOCK:
@@ -86,16 +125,31 @@ def save_totp_cache(email: str, secret: str) -> bool:
 
     _ensure_loaded()
     with _LOCK:
-        if _MEMORY_CACHE.get(clean_email) == clean_secret:
+        cache, path = _current_cache()
+        if cache.get(clean_email) == clean_secret:
             return True
-        _MEMORY_CACHE[clean_email] = clean_secret
+        previous = cache.get(clean_email)
+        cache[clean_email] = clean_secret
         try:
-            os.makedirs(_DATA_DIR, exist_ok=True)
-            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(_MEMORY_CACHE, f, ensure_ascii=False, indent=2)
+            import tempfile
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".totp-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             log.info(f"[TOTP Cache] 已持久化保存账号 {clean_email} 2FA密钥: {clean_secret[:4]}***")
             return True
         except Exception as e:
+            if previous is None:
+                cache.pop(clean_email, None)
+            else:
+                cache[clean_email] = previous
             log.warning(f"[TOTP Cache] 写入缓存文件失败: {e}")
             return False
 
@@ -107,4 +161,4 @@ def get_cached_totp(email: str) -> str:
     _ensure_loaded()
     clean_email = email.lower().strip()
     with _LOCK:
-        return _MEMORY_CACHE.get(clean_email, "")
+        return _current_cache()[0].get(clean_email, "")

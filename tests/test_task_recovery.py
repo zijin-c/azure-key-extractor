@@ -41,6 +41,9 @@ class TaskRecoveryTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         gui._sessions.clear()
+        p = patch.object(gui, "get_history", return_value=[])
+        p.start()
+        self.addCleanup(p.stop)
         gui.app.testing = True
         self.first = Account("first@example.invalid", "synthetic")
         self.second = Account("second@example.invalid", "synthetic")

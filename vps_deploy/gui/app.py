@@ -11,6 +11,8 @@ import sys
 import threading
 import uuid
 import concurrent.futures
+from functools import wraps
+from urllib.parse import urlsplit
 from dataclasses import dataclass, field
 
 from datetime import datetime
@@ -26,6 +28,7 @@ from modules.excel_export import export_to_excel, PRODUCT_COLUMNS, PRODUCT_SHORT
 from utils.xray_proxy import XrayProxyChain
 from utils.process_manager import BrowserProcessManager, release_system_memory
 from utils.session_secret import load_session_secret
+from utils.totp_cache import totp_cache_scope, get_cached_totp, save_totp_cache
 from gui.auth import (
     init_db, create_user, verify_user, login_required,
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
@@ -41,6 +44,7 @@ else:
 app = Flask(__name__, template_folder=_tmpl_dir)
 app.secret_key = load_session_secret()
 _task_start_lock = threading.Lock()
+_maintenance_pending = False
 
 # 初始化数据库
 with app.app_context():
@@ -70,8 +74,13 @@ def _startup_check_batch():
             s = _get_sess(sid)
             with _task_start_lock:
                 s.running = True
+                s.worker_active = True
                 s.results = BatchManager.get_all_results()
-                threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
+                try:
+                    threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
+                except Exception:
+                    s.running = s.worker_active = False
+                    raise
         elif status == "all_done_restarting":
             if sid:
                 _push_log(sid, f"{'═'*50}")
@@ -107,6 +116,7 @@ class _Sess:
     listeners:   list[queue.Queue] = field(default_factory=list)
     log_history: list = field(default_factory=list)
     running:     bool = False
+    worker_active: bool = False
     results:     list = field(default_factory=list)
     task_loop:   asyncio.AbstractEventLoop | None = None
     task_ref:    asyncio.Task | None = None
@@ -139,8 +149,59 @@ def _push_log(sid: str, msg: str):
 
 @app.before_request
 def _ensure_sid():
-    if "sid" not in session:
+    if "user_id" in session:
+        session["sid"] = f"user_{session['user_id']}"
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = request.headers.get("Origin")
+            if (request.headers.get("Sec-Fetch-Site") == "cross-site"
+                    or origin and urlsplit(origin).netloc.lower() != request.host.lower()):
+                return jsonify({"ok": False, "error": "拒绝跨站操作请求"}), 403
+        if request.endpoint in {"api_status", "api_start", "api_stop", "api_restart", "api_cleanup", "api_results", "api_export", "stream"}:
+            data = request.get_json(silent=True)
+            supplied = request.args.getlist("sid")
+            if isinstance(data, dict) and "sid" in data:
+                supplied.append(data["sid"])
+            if any(value is not None and value != "" and value != session["sid"] for value in supplied):
+                return jsonify({"ok": False, "error": "不能访问其他用户的任务"}), 403
+    elif "sid" not in session:
         session["sid"] = uuid.uuid4().hex
+
+
+def _owns_task(task):
+    return bool(task and task.get("user_id") == session.get("user_id") and task.get("sid") == session.get("sid"))
+
+
+def _task_busy():
+    task = BatchManager.get_active_task()
+    return (_maintenance_pending or any(s.running or s.worker_active for s in _sessions.values())
+            or bool(task and task.get("status") in ("running", "batch_restarting", "all_done_restarting")))
+
+
+def _own_results():
+    with _task_start_lock:
+        results = list(_get_sess(session["sid"]).results)
+        if not results and _owns_task(BatchManager.get_active_task()):
+            results = BatchManager.get_all_results()
+        return results
+
+
+def _control_guard(admin_only=False):
+    """全局控制与启动使用同一把锁；维护操作只有管理员可以调用。"""
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            with _task_start_lock:
+                if admin_only and not is_user_admin(session["user_id"]):
+                    return jsonify({"ok": False, "error": "仅管理员可以执行服务维护"}), 403
+                if _maintenance_pending:
+                    return jsonify({"ok": False, "error": "服务正在重启"}), 409
+                task = BatchManager.get_active_task()
+                if _task_busy() and (not _owns_task(task) or any(
+                        sid != session["sid"] and (s.running or s.worker_active) for sid, s in _sessions.items())):
+                    return jsonify({"ok": False, "error": "其他用户的任务正在运行或清理中"}), 403
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 # ── 认证路由 ─────────────────────────────────────────────────
@@ -317,10 +378,12 @@ def index():
 @app.route("/api/status")
 @login_required
 def api_status():
-    sid = request.args.get("sid") or session.get("sid", "")
+    sid = session["sid"]
     s = _get_sess(sid)
-    is_running = s.running or BatchManager.is_running()
-    results_count = len(s.results) if s.results else BatchManager.get_completed_count()
+    with _task_start_lock:
+        owned = _owns_task(BatchManager.get_active_task())
+        is_running = s.running or s.worker_active or (owned and BatchManager.is_running())
+        results_count = len(s.results) if s.results else (BatchManager.get_completed_count() if owned else 0)
     return jsonify({"running": is_running, "results": results_count})
 
 
@@ -328,11 +391,11 @@ def api_status():
 @login_required
 def api_start():
     data = request.get_json(force=True)
-    sid  = data.get("sid") or session.get("sid", "")
+    sid  = session["sid"]
     s    = _get_sess(sid)
 
     with _task_start_lock:
-        if s.running or BatchManager.is_running():
+        if _task_busy():
             return jsonify({"ok": False, "error": "已有任务在运行中或在批次重启过渡中"}), 400
 
         raw_accounts = data.get("accounts", "").strip()
@@ -357,6 +420,7 @@ def api_start():
             return jsonify({"ok": False, "error": "账号格式错误，每行: 邮箱 TAB 密码 (可选 TAB TOTP密钥)"}), 400
 
         s.running = True
+        s.worker_active = True
         s.results = []
         s.log_history.clear()
         for q in list(s.listeners):
@@ -386,6 +450,7 @@ def api_start():
             ).start()
         except Exception:
             s.running = False
+            s.worker_active = False
             BatchManager.clear_task()
             app.logger.exception("启动任务失败")
             return jsonify({"ok": False, "error": "启动任务失败，请检查服务日志"}), 500
@@ -479,10 +544,15 @@ def api_check_proxy():
 
 @app.route("/api/stop", methods=["POST"])
 @login_required
+@_control_guard()
 def api_stop():
     data = request.get_json(force=True) or {}
-    sid  = data.get("sid") or session.get("sid", "")
+    sid  = session["sid"]
     s    = _get_sess(sid)
+    if not _owns_task(BatchManager.get_active_task()):
+        return jsonify({"ok": True, "killed": 0})
+    if not s.running and not s.worker_active and not BatchManager.is_running():
+        return jsonify({"ok": True, "killed": 0})
     s.running = False
     BatchManager.stop_task()
     if s.task_loop and s.task_ref and not s.task_ref.done():
@@ -501,20 +571,35 @@ def api_stop():
 
 @app.route("/api/restart", methods=["POST"])
 @login_required
+@_control_guard(admin_only=True)
 def api_restart():
     """手动触发服务强制重启并彻底清理所有残留进程与系统内存。"""
     data = request.get_json(force=True) or {}
-    sid  = data.get("sid") or session.get("sid", "")
+    sid  = session["sid"]
     _push_log(sid, "🔄 正在手动触发服务重启以彻底清空内存与杀死全部残留进程...")
-    threading.Thread(target=BatchManager.trigger_service_restart, args=(1.0,), daemon=True).start()
+    global _maintenance_pending
+    _maintenance_pending = True
+    def restart():
+        global _maintenance_pending
+        try:
+            BatchManager.trigger_service_restart(1.0)
+        finally:
+            with _task_start_lock:
+                _maintenance_pending = False
+    try:
+        threading.Thread(target=restart, daemon=True).start()
+    except Exception:
+        _maintenance_pending = False
+        raise
     return jsonify({"ok": True, "msg": "服务正在重启释放全部内存"})
 
 
 @app.route("/api/cleanup", methods=["POST"])
 @login_required
+@_control_guard(admin_only=True)
 def api_cleanup():
     """立即深度清理所有残留浏览器与驱动进程并回收内存。"""
-    sid  = request.args.get("sid") or session.get("sid", "")
+    sid  = session["sid"]
     killed = BrowserProcessManager.cleanup_all()
     release_system_memory()
     if sid:
@@ -525,10 +610,8 @@ def api_cleanup():
 @app.route("/api/results")
 @login_required
 def api_results():
-    sid  = request.args.get("sid") or session.get("sid", "")
-    results = _get_sess(sid).results
-    if not results:
-        results = BatchManager.get_all_results()
+    sid  = session["sid"]
+    results = _own_results()
     rows = []
     for r in results:
         rows.append({
@@ -548,10 +631,10 @@ def api_results():
 def api_export():
     """导出当前 session 结果为 Excel，返回文件下载。"""
     data   = request.get_json(force=True) or {}
-    sid    = data.get("sid") or session.get("sid", "")
+    sid    = session["sid"]
     filter_type = data.get("filter", "all")  # all / success / failed
 
-    results = _get_sess(sid).results
+    results = _own_results()
     if filter_type == "success":
         results = [r for r in results if r.success]
     elif filter_type == "failed":
@@ -561,7 +644,9 @@ def api_export():
         return jsonify({"ok": False, "error": "没有可导出的数据"}), 400
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"azure_keys_{filter_type}_{ts}.xlsx"
+    if filter_type not in ("all", "success", "failed"):
+        return jsonify({"ok": False, "error": "未知导出筛选条件"}), 400
+    fname = f"azure_keys_{session['user_id']}_{filter_type}_{ts}_{uuid.uuid4().hex}.xlsx"
     fpath = export_to_excel(results, fname)
 
     return send_file(fpath, as_attachment=True, download_name=fname,
@@ -571,7 +656,7 @@ def api_export():
 @app.route("/stream")
 @login_required
 def stream():
-    sid = request.args.get("sid") or session.get("sid", "")
+    sid = session["sid"]
     s   = _get_sess(sid)
 
     # 为每台连入的终端标签页/设备创建独立的日志队列并注册，实现广播分发
@@ -705,11 +790,34 @@ def _parse_accounts(raw: str) -> list[Account]:
 
 # ── 后台任务 (多批次运行与自动重启控制) ─────────────────────────
 def _run_batch_worker(sid: str):
+    s = _get_sess(sid)
+    s.worker_active = True
+    try:
+        task = BatchManager.get_active_task()
+        if not task or task.get("sid") != sid or not task.get("user_id"):
+            s.running = False
+            return
+        with totp_cache_scope(task["user_id"]):
+            try:
+                for row in get_history(task["user_id"]):
+                    email, secret = row.get("email"), row.get("totp_secret")
+                    if email and secret and not get_cached_totp(email):
+                        save_totp_cache(email, secret)
+            except Exception:
+                app.logger.warning("用户 2FA 历史缓存补充失败，将使用用户输入及专属缓存")
+            return _run_batch_worker_impl(sid)
+    finally:
+        with _task_start_lock:
+            s.running = False
+            s.worker_active = False
+
+
+def _run_batch_worker_impl(sid: str):
     s  = _get_sess(sid)
     pl = lambda msg: _push_log(sid, msg)
 
     task = BatchManager.get_active_task()
-    if not task or task.get("status") not in ("running", "batch_restarting"):
+    if not task or task.get("sid") != sid or task.get("status") not in ("running", "batch_restarting"):
         s.running = False
         return
 
@@ -823,7 +931,7 @@ def _run_batch_worker(sid: str):
                             continue
                     else:
                         # 所有批次全部完成！
-                        BatchManager.mark_all_done()
+                        BatchManager.mark_all_done(restarting=getattr(config, "AUTO_RESTART_ON_COMPLETE", True))
                         all_results = BatchManager.get_all_results() or s.results
                         ok   = sum(1 for r in all_results if r.success)
                         fail = len(all_results) - ok
