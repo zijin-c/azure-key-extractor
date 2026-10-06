@@ -2,7 +2,9 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -10,6 +12,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlsplit
 
 _AUTO_SIZE = object()
+log = logging.getLogger(__name__)
 
 
 def transfer_body_size(headers, decoded_size=None):
@@ -50,6 +53,89 @@ class LocalHttpCache:
     _fills = {}
     _manifest_hash_to_type = {}
     _canonical_initialized = False
+    _cleanup_times = {}
+
+    @classmethod
+    def cleanup(cls, force=False):
+        """每小时按闲置时间及容量清理自身缓存文件；不递归访问其他数据目录。"""
+        def setting(name, default):
+            try:
+                value = int(os.getenv(name, default))
+                return value if value > 0 else default
+            except (TypeError, ValueError):
+                return default
+        max_bytes = setting("HTTP_CACHE_MAX_MB", 512) * 1048576
+        idle_seconds = setting("HTTP_CACHE_IDLE_DAYS", 30) * 86400
+        now = time.time()
+        root = os.path.abspath(cls.CACHE_DIR)
+        removed = reclaimed = 0
+        with cls._disk_lock:
+            previous = cls._cleanup_times.get(root)
+            if not force and previous is not None and time.monotonic() - previous < 3600:
+                return {"removed": 0, "bytes": 0}
+            cls._cleanup_times[root] = time.monotonic()
+            entries = []
+            for directory in (cls.CACHE_DIR, cls.CANONICAL_DIR):
+                # 即使目录被替换成符号链接，也不跟随它清理其他位置。
+                if os.path.islink(directory) or not os.path.isdir(directory):
+                    continue
+                for name in os.listdir(directory):
+                    path = os.path.join(directory, name)
+                    if os.path.islink(path) or not os.path.isfile(path):
+                        continue
+                    if name.startswith(".cache-"):
+                        if now - os.path.getmtime(path) > 86400:
+                            size = os.path.getsize(path)
+                            os.remove(path)
+                            removed += 1
+                            reclaimed += size
+                        continue
+                    stem, suffix = os.path.splitext(name)
+                    known = bool(re.fullmatch(r"[a-f0-9]{64}", stem)) if directory == cls.CACHE_DIR else stem in cls._TYPES
+                    if not known or suffix not in (".body", ".meta"):
+                        continue
+                    companion = os.path.join(directory, stem + (".meta" if suffix == ".body" else ".body"))
+                    if not os.path.isfile(companion) or os.path.islink(companion):
+                        # 新下载/旧版写入留出一小时保护窗口。
+                        if now - os.path.getmtime(path) > 3600:
+                            size = os.path.getsize(path)
+                            os.remove(path)
+                            removed += 1
+                            reclaimed += size
+                        continue
+                    if suffix != ".body":
+                        continue
+                    accessed = os.path.getmtime(path)
+                    size = os.path.getsize(path) + os.path.getsize(companion)
+                    invalid = False
+                    try:
+                        with open(companion, encoding="utf-8") as f:
+                            meta = json.load(f)
+                        invalid = not isinstance(meta, dict) or not isinstance(meta.get("headers"), dict) or not meta.get("url")
+                    except (OSError, ValueError, TypeError, UnicodeError):
+                        invalid = True
+                    entries.append((accessed, size, path, companion, invalid))
+            total = sum(entry[1] for entry in entries)
+            for accessed, size, body, meta, invalid in sorted(entries):
+                if not invalid and now - accessed <= idle_seconds and total <= max_bytes:
+                    continue
+                os.remove(body)
+                os.remove(meta)
+                total -= size
+                removed += 2
+                reclaimed += size
+            if removed:
+                log.info("静态缓存清理：删除 %s 个文件，回收 %.2f MB", removed, reclaimed / 1048576)
+        return {"removed": removed, "bytes": reclaimed}
+
+    @staticmethod
+    def _touch(path):
+        # 用 body 的修改时间记录最近使用，不改变资源 saved_at/版本有效期。
+        try:
+            if time.time() - os.path.getmtime(path) >= 3600:
+                os.utime(path, None)
+        except OSError:
+            pass
 
     @staticmethod
     def _identity(url):
@@ -102,6 +188,7 @@ class LocalHttpCache:
                     saved = meta.get("saved_at", os.path.getmtime(os.path.join(cls.CACHE_DIR, key + ".meta")))
                     if not versioned and time.time() - saved > 86400:
                         continue
+                    cls._touch(os.path.join(cls.CACHE_DIR, key + ".body"))
                     return body, meta
                 except (OSError, ValueError, TypeError):
                     continue
@@ -151,6 +238,10 @@ class LocalHttpCache:
         with cls._disk_lock:
             cls._atomic_write(os.path.join(cls.CACHE_DIR, key + ".body"), body)
             cls._atomic_write(os.path.join(cls.CACHE_DIR, key + ".meta"), json.dumps(meta).encode())
+        try:
+            cls.cleanup()
+        except OSError as error:
+            log.warning("静态缓存清理暂未完成，将继续使用缓存: %s", error)
 
     @classmethod
     @asynccontextmanager
@@ -204,6 +295,8 @@ class LocalHttpCache:
             return
         with cls._disk_lock:
             cls._manifest_hash_to_type[hash_name] = kind
+            while len(cls._manifest_hash_to_type) > 512:
+                cls._manifest_hash_to_type.pop(next(iter(cls._manifest_hash_to_type)))
             cls._atomic_write(cls.HASH_MAP_FILE, json.dumps(cls._manifest_hash_to_type).encode())
 
     @classmethod
@@ -230,6 +323,8 @@ class LocalHttpCache:
             if learned:
                 with cls._disk_lock:
                     cls._manifest_hash_to_type.update(learned)
+                    while len(cls._manifest_hash_to_type) > 512:
+                        cls._manifest_hash_to_type.pop(next(iter(cls._manifest_hash_to_type)))
                     cls._atomic_write(cls.HASH_MAP_FILE, json.dumps(cls._manifest_hash_to_type).encode())
         except (ValueError, TypeError, AttributeError):
             pass
@@ -264,6 +359,7 @@ class LocalHttpCache:
                     return None
                 if cls.detect_manifest_type(json.loads(body)) != kind:
                     return None
+                cls._touch(os.path.join(cls.CANONICAL_DIR, kind + ".body"))
                 return body, meta
             except (OSError, ValueError, TypeError):
                 return None

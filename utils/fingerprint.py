@@ -909,6 +909,10 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     """公共静态资源持久缓存，业务 API 放行，媒体拦截与遥测本地响应。"""
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
+    try:
+        LocalHttpCache.cleanup()
+    except OSError as error:
+        log.warning("静态缓存清理暂未完成: %s", error)
 
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",

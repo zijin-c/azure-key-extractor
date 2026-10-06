@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import json
+import os
 import tempfile
 import threading
 import time
@@ -31,6 +32,7 @@ class CacheFixture:
             "HASH_MAP_FILE": str(Path(self.temp.name) / "canonical" / "hashes.json"),
             "_canonical_initialized": True,
             "_manifest_hash_to_type": {},
+            "_cleanup_times": {},
         }.items():
             patcher = patch.object(Cache, name, value)
             patcher.start()
@@ -38,6 +40,66 @@ class CacheFixture:
 
 
 class CacheTests(CacheFixture, unittest.TestCase):
+    def test_cleanup_removes_idle_cache_but_keeps_recently_used_resource(self):
+        old, active = "https://static.test/old.12345678.js", "https://static.test/active.12345678.js"
+        for url in (old, active):
+            Cache.put(url, SCRIPT, {})
+            os.utime(Path(self.temp.name, Cache._url_to_key(url) + ".body"), (time.time() - 31 * 86400,) * 2)
+        self.assertIsNotNone(Cache.get(active))
+        summary = Cache.cleanup(force=True)
+        self.assertEqual(summary["removed"], 2)
+        self.assertIsNone(Cache.get(old))
+        self.assertIsNotNone(Cache.get(active))
+
+    def test_cleanup_capacity_evicts_least_recently_used(self):
+        urls = [f"https://static.test/app{i}.12345678.js" for i in range(3)]
+        for index, url in enumerate(urls):
+            Cache.put(url, b"x" * 450000, {})
+            os.utime(Path(self.temp.name, Cache._url_to_key(url) + ".body"), (time.time() - (3 - index) * 100,) * 2)
+        with patch.dict("os.environ", {"HTTP_CACHE_MAX_MB": "1"}):
+            Cache.cleanup(force=True)
+        self.assertIsNone(Cache.get(urls[0]))
+        self.assertIsNotNone(Cache.get(urls[1]))
+        self.assertIsNotNone(Cache.get(urls[2]))
+
+    def test_cleanup_preserves_unrelated_data_and_fresh_orphans(self):
+        unrelated = Path(self.temp.name, "totp_cache.json")
+        unrelated.write_text('{"private":"preserved"}')
+        stale = Path(self.temp.name, "a" * 64 + ".body")
+        fresh = Path(self.temp.name, "b" * 64 + ".body")
+        temporary = Path(self.temp.name, ".cache-old")
+        for path in (stale, fresh, temporary):
+            path.write_bytes(b"synthetic")
+        for path in (stale, temporary):
+            os.utime(path, (time.time() - 2 * 86400,) * 2)
+        Cache.cleanup(force=True)
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(fresh.exists())
+        self.assertFalse(stale.exists())
+        self.assertFalse(temporary.exists())
+
+    def test_cleanup_is_throttled_and_removes_corrupt_metadata(self):
+        url = "https://static.test/app.12345678.js"
+        Cache.put(url, SCRIPT, {})
+        meta = Path(self.temp.name, Cache._url_to_key(url) + ".meta")
+        meta.write_text("invalid JSON")
+        self.assertEqual(Cache.cleanup()["removed"], 0)
+        self.assertTrue(meta.exists())
+        self.assertEqual(Cache.cleanup(force=True)["removed"], 2)
+        self.assertFalse(meta.exists())
+
+    def test_cleanup_counts_canonical_copies_and_bounds_hash_index(self):
+        url = "https://portal.test/ExtensionManifest/old.json?m_type=assetTypes"
+        Cache.save_canonical_manifest(url, MANIFEST, {"etag": '"same"'})
+        for directory, name in ((self.temp.name, Cache._url_to_key(url)), (Cache.CANONICAL_DIR, "assetTypes")):
+            os.utime(Path(directory, name + ".body"), (time.time() - 31 * 86400,) * 2)
+        self.assertEqual(Cache.cleanup(force=True)["removed"], 4)
+        self.assertIsNone(Cache.get_canonical_manifest(url))
+        Cache._manifest_hash_to_type = {str(i): "assetTypes" for i in range(600)}
+        Cache.learn_hash_mapping("latest", "assetTypes")
+        self.assertEqual(len(Cache._manifest_hash_to_type), 512)
+        self.assertIn("latest", Cache._manifest_hash_to_type)
+
     def test_versions_do_not_collide(self):
         Cache.put("https://static.test/main.js?v=1", SCRIPT, {"content-type": "application/javascript"})
         self.assertIsNone(Cache.get("https://static.test/main.js?v=2"))
