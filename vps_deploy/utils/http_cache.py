@@ -38,12 +38,14 @@ class LocalHttpCache:
     DYNAMIC_SECURITY_PATTERNS = (
         "arkose", "arkoselabs", "funcaptcha", "powseq", "turnstile", "challenges.cloudflare.com",
         "challenge-platform", "hcaptcha", "recaptcha", "geetest", "/fc/", "/challenge", "/enforcement",
-        "services.sheerid.com/api/", "services.sheerid.com/rest/", "services.sheerid.com/verify/",
-        "services.sheerid.com/submission/", "services.sheerid.com/orgsearch", "sheerid.com/api/",
+        "services.sheerid.com", "sheerid.com",
         "/common/oauth2/", "/oauth20_authorize", "/login.srf", "/kmsi", "/getcredentialtype",
         "/getsessionstate", "/sas/processauth", "/ppsecure/post.srf", "/processauth",
         "/oauth2/token", "/oauth2/v2.0/token", "/reprocess", "/federal/login",
-        "/api/authenticationmethods/", "management.azure.com/", "graph.microsoft.com/",
+        "/api/authenticationmethods/", "management.azure.com", "graph.microsoft.com",
+        "main.iam.ad.ext.azure.com", "education.azure.com",
+        "/batch", "/education", "/software", "/subscriptions", "/providers",
+        "getproductkey",
         "signup.azure.com/api/", "signup.azure.com/studentverification", "signup.azure.com/signup?offer=",
         "expires=", "signature=", "key-pair-id=",
     )

@@ -1626,8 +1626,31 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
 
-        # 明确的遥测端点在 POST 放行规则之前处理。返回成功，避免客户端错误重试。
+        # 0. 优先放行所有动态安全挑战、登录认证、Azure ARM/Education 与 2FA 相关接口（100% 原生直连，绝不拦截、绝不干扰）
+        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
+            await route.continue_()
+            return
+
         parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+
+        # 核心 Azure 管理/业务 API、教育平台、批处理与身份认证域：绝不拦截，绝不进缓存
+        core_api_domains = (
+            "management.azure.com", "graph.microsoft.com", "main.iam.ad.ext.azure.com",
+            "education.azure.com", "signup.azure.com", "mysignins.microsoft.com", "login.microsoftonline.com"
+        )
+        if any(d in host for d in core_api_domains) or (
+            "portal.azure.com" in host and (
+                (parsed.path.lower().startswith("/api/") and parsed.path.rstrip("/").lower() != "/api/telemetry")
+                or any(seg in url_lower for seg in ("/batch", "/education", "/subscriptions", "/providers", "software"))
+            )
+        ):
+            # 仅当属于明确的纯静态 CSS/JS/字体等公开资源时才允许复用缓存，其他动态请求全部原生直连
+            if not LocalHttpCache.is_cacheable(url):
+                await route.continue_()
+                return
+
+        # 明确的遥测端点在 POST 放行规则之前处理。返回成功，避免客户端错误重试。
         telemetry_endpoint = (
             (parsed.hostname == "browser.events.data.microsoft.com" and parsed.path.rstrip("/").lower() == "/onecollector/1.0")
             or (parsed.hostname == "portal.azure.com" and parsed.path.rstrip("/").lower() == "/api/telemetry")
@@ -1657,18 +1680,6 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             if stats:
                 stats.record_blocked(est_size=5000000)
             await route.abort()
-            return
-
-        # 动态认证/API 放行；认证域名的公共脚本、CSS、字体可进入静态缓存。
-        parsed = urlsplit(url)
-        host = parsed.hostname or ""
-        public_auth_asset = host in ("mysignins.microsoft.com", "login.microsoftonline.com") and LocalHttpCache.is_cacheable(url)
-        core_request = (
-            host in ("mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "main.iam.ad.ext.azure.com", "portal.azure.com")
-            and (parsed.path.lower().startswith("/api/") or "/batch" in parsed.path.lower() or "subscriptions" in parsed.path.lower() or "providers" in parsed.path.lower() or "education" in parsed.path.lower())
-        ) or (host in ("signup.azure.com") and parsed.path.lower().startswith("/api/"))
-        if (core_request or "management.azure.com" in host or "graph.microsoft.com" in host) and not public_auth_asset:
-            await route.continue_()
             return
 
         if LocalHttpCache.is_cacheable(url, "GET"):

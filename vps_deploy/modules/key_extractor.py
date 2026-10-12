@@ -1299,17 +1299,49 @@ async def extract_all_keys(
                                 return { no_software: true };
                             }
 
+                            // 3. 显式检测微软账号/教育授权系统级风控与访问校验失败红条
+                            if (lower.includes('unable to validate your access') ||
+                                lower.includes('detecting a problem with your account') ||
+                                lower.includes('sorry but our systems are detecting a problem') ||
+                                lower.includes('无法验证您的访问权限') ||
+                                lower.includes('无法验证你的访问权限') ||
+                                lower.includes('检测到您的帐户存在问题') ||
+                                lower.includes('检测到你的帐户存在问题')) {
+                                const txMatch = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
+                                return {
+                                    risk_blocked: true,
+                                    tx_id: txMatch ? txMatch[1] : '',
+                                    raw_text: txt.substring(0, 180)
+                                };
+                            }
+
                             // 2. 内部软件搜索框（排除顶部全局搜索）
                             const searchInputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
                             const has_search = searchInputs.length > 0;
 
                             return {
                                 ready: has_search,
-                                no_software: false
+                                no_software: false,
+                                risk_blocked: false
                             };
                         }
                     """)
                     if isinstance(status, dict):
+                        if status.get("risk_blocked"):
+                            tx_id = status.get("tx_id", "")
+                            err_desc = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
+                            if tx_id:
+                                err_desc += f" [Transaction Id: {tx_id}]"
+                            _emit(cb, f"  ❌ {err_desc}")
+                            _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
+                            # 保存风控现场截图
+                            ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
+                            os.makedirs(ss_dir, exist_ok=True)
+                            try:
+                                await sw_page.screenshot(path=os.path.join(ss_dir, "risk_blocked.png"))
+                            except Exception:
+                                pass
+                            raise PortalLoadError(err_desc, totp=updated_totp)
                         if status.get("no_software"):
                             _emit(cb, "  ℹ️  该账号无可用 Education 软件授权，直接记录并跳过")
                             return {}, updated_totp
