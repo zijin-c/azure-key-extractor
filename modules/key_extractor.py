@@ -1291,6 +1291,13 @@ async def extract_all_keys(
                             const txt = (document.body ? document.body.innerText : '') || '';
                             const lower = txt.toLowerCase();
 
+                            // 0. 显式检测是否尚未开通学生资格（页面提示 Sign up now）
+                            if (lower.includes('sign up for azure for students') ||
+                                (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
+                                (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
+                                return { needs_signup: true };
+                            }
+
                             // 1. 显式检测是否无软件授权或无可用产品
                             if (lower.includes('no software available') || lower.includes('无可用软件') ||
                                 lower.includes('没有可用的软件') || lower.includes('no packages available') ||
@@ -1322,11 +1329,27 @@ async def extract_all_keys(
                             return {
                                 ready: has_search,
                                 no_software: false,
-                                risk_blocked: false
+                                risk_blocked: false,
+                                needs_signup: false
                             };
                         }
                     """)
                     if isinstance(status, dict):
+                        if status.get("needs_signup"):
+                            _emit(cb, "  ⚠️ 当前处于 Education 但页面提示需 [Sign up now]（该账号尚未开通学生资格）")
+                            from modules.azure_signup import fill_azure_profile_form
+                            try:
+                                _emit(cb, "  🚀 尝试自愈：正在导航至 Azure 学生认证入口执行 SheerID 资格开通...")
+                                await sw_page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=35000)
+                                verified = await fill_azure_profile_form(sw_page, ms_email, cb)
+                                if verified:
+                                    _emit(cb, "  ✅ 自愈开通学生资格成功！正在重新导航至软件列表...")
+                                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=35000)
+                                    list_deadline = loop.time() + 25
+                                    continue
+                            except Exception as ex:
+                                _emit(cb, f"  ⚠️ 自动开通学生资格失败: {ex}")
+                            raise PortalLoadError("该账号尚未开通 Azure for Students 学生资格（页面提示需点击 Sign up now 注册开通）", totp=updated_totp)
                         if status.get("risk_blocked"):
                             tx_id = status.get("tx_id", "")
                             err_desc = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
@@ -1366,13 +1389,16 @@ async def extract_all_keys(
                 except Exception:
                     pass
 
-            # 仅重新导航一次；导航结束后给完整的 25 秒加载时间。
+            # 仅重新刷新/导航一次；结束后给完整的 25 秒加载时间。
             if w == 16:
-                _emit(cb, "  🔄 软件列表 16 秒未加载，重新导航 Education Software 页面...")
+                _emit(cb, "  🔄 软件列表 16 秒未加载，刷新页面重新加载...")
                 try:
-                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
-                except Exception as e:
-                    _emit(cb, f"  ⚠️ 重新导航异常: {str(e)[:80]}")
+                    await sw_page.reload(wait_until="domcontentloaded", timeout=25000)
+                except Exception:
+                    try:
+                        await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
+                    except Exception as e:
+                        _emit(cb, f"  ⚠️ 重新加载异常: {str(e)[:80]}")
                 finally:
                     list_deadline = loop.time() + 25
 
@@ -1746,13 +1772,16 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     _emit(cb, "  ⏳ 等待微软后台确认协议生效（5s）...")
     await asyncio.sleep(5)
 
-    # 6. 重新导航回 Software 页面并校验横幅是否已消除
-    _emit(cb, "  🔄 返回 Software 页...")
+    # 6. 重新刷新 Software 页面并校验横幅是否已消除
+    _emit(cb, "  🔄 刷新 Software 页面以应用协议与加载软件列表...")
     try:
-        await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL,
-                            wait_until="domcontentloaded", timeout=60000)
+        await sw_page.reload(wait_until="domcontentloaded", timeout=30000)
     except Exception:
-        pass
+        try:
+            await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL,
+                                wait_until="domcontentloaded", timeout=45000)
+        except Exception:
+            pass
 
     for _w in range(30):
         await asyncio.sleep(0.5)

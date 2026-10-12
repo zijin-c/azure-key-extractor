@@ -202,8 +202,31 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
 
         # 1. 快速检查是否已在 Portal / 后续成功页面
         cur_url = (page.url or "").lower()
-        if "portal.azure.com" in cur_url or "education.azure.com" in cur_url or "signup?offer=" in cur_url:
-            _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
+        if "portal.azure.com" in cur_url or "education.azure.com" in cur_url:
+            is_unregistered_portal = False
+            try:
+                is_unregistered_portal = await page.evaluate("""
+                    () => {
+                        const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                        return txt.includes('sign up for azure for students') ||
+                               (txt.includes('sign up now') && txt.includes('students')) ||
+                               (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                    }
+                """)
+            except Exception:
+                pass
+            if is_unregistered_portal:
+                _emit(cb, "  ⚠️ 当前处于 Azure Portal 但尚未开通学生资格（提示需 Sign up now），继续导航至注册表单...")
+                import config
+                try:
+                    await page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+            else:
+                _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
+                return True
+        elif "signup?offer=" in cur_url:
+            _emit(cb, "  ✅ 学术认证已通过，处于 Offer 订阅开通阶段")
             return True
 
         # 2. 等待 SheerID 表单渲染。慢网络下 Angular/iframe 可能需要几十秒，
@@ -215,9 +238,25 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
         form_wait_seconds = 20
         for wait_s in range(form_wait_seconds):
             cur_url = (page.url or "").lower()
-            if "portal.azure.com" in cur_url or "education.azure.com" in cur_url or "signup?offer=" in cur_url:
+            if "signup?offer=" in cur_url:
                 _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
                 return True
+            if "portal.azure.com" in cur_url or "education.azure.com" in cur_url:
+                is_unregistered_portal = False
+                try:
+                    is_unregistered_portal = await page.evaluate("""
+                        () => {
+                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                            return txt.includes('sign up for azure for students') ||
+                                   (txt.includes('sign up now') && txt.includes('students')) ||
+                                   (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                        }
+                    """)
+                except Exception:
+                    pass
+                if not is_unregistered_portal:
+                    _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
+                    return True
 
             # 检测是否有表单字段出现
             tgt, fn_loc = await _find_visible_locator(page, _FN_SELECTORS, timeout_ms=100)

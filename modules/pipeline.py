@@ -543,11 +543,11 @@ async def process_account(
 
         # ── 步骤2: 确保主动定向到学生认证入口 ──────────────
         # 必须带上 returnUrl 到 studentverification，使微软账号上下文与学生认证严格绑定
-        if "studentverification" not in page.url.lower() and "signup?offer=" not in page.url.lower() and "portal.azure.com" not in page.url.lower():
-            target_redir = config.AZURE_SIGNUP_LOGIN_URL
+        if "studentverification" not in page.url.lower() and "signup?offer=" not in page.url.lower():
+            target_redir = config.AZURE_SIGNUP_URL
             _emit(cb, f"  🌐 主动定向至学生认证入口: {target_redir[:80]}")
             try:
-                await page.goto(target_redir, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(target_redir, wait_until="domcontentloaded", timeout=45000)
             except Exception as e:
                 _emit(cb, f"  ⚠️ 导航学生认证入口异常: {e}")
 
@@ -571,11 +571,28 @@ async def process_account(
             if is_captcha:
                 raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
 
-            # portal / education 平台直接判定为已注册
+            # portal / education 平台检测：必须排查是否需要 Sign up now
             if "portal.azure.com" in current_url or "education.azure.com" in current_url or "azureforeducation" in current_url:
-                is_already_registered = True
-                _emit(cb, f"  ✅ 检测到 Azure 业务管理平台（{poll_i+1}s）: {current_url[:60]}")
-                break
+                try:
+                    has_signup_prompt = await page.evaluate("""
+                        () => {
+                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                            return txt.includes('sign up for azure for students') ||
+                                   (txt.includes('sign up now') && txt.includes('students')) ||
+                                   (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                        }
+                    """)
+                except Exception:
+                    has_signup_prompt = False
+
+                if has_signup_prompt:
+                    _emit(cb, f"  ⚠️ 处于 Azure 平台但检测到 [Sign up now]（该账号尚未开通学生资格），转入学生认证流程...")
+                    is_unregistered = True
+                    break
+                else:
+                    is_already_registered = True
+                    _emit(cb, f"  ✅ 检测到 Azure 业务管理平台已开通就绪（{poll_i+1}s）: {current_url[:60]}")
+                    break
 
             # 优先通过 DOM 表单节点高频检测未注册 SheerID 学术表单（穿透所有 Frame）
             try:
@@ -646,15 +663,32 @@ async def process_account(
                         save_totp_cache(account.email, account.totp_secret)
                     raise LoginNetworkError("学生认证界面停滞超过 25 秒无响应（疑似网络/代理卡顿），换代理重试", totp=account.totp_secret)
 
-            # 已注册就绪标志 (必须已脱离 studentverification 注册入口，或直接在 Portal 中)
-            if "portal.azure.com" in current_url or (
+            # 已注册就绪标志 (必须已脱离 studentverification 注册入口，或直接在 Portal 中且无 Sign up now)
+            if ("portal.azure.com" in current_url or (
                 "studentverification" not in current_url and any(k in combined for k in (
                     "get started", "overview", "welcome", "概览", "欢迎", "开始使用"
                 ))
-            ):
-                is_already_registered = True
-                _emit(cb, f"  ✅ 检测到已注册就绪状态（{poll_i+1}s）")
-                break
+            )):
+                try:
+                    has_signup_prompt = await page.evaluate("""
+                        () => {
+                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                            return txt.includes('sign up for azure for students') ||
+                                   (txt.includes('sign up now') && txt.includes('students')) ||
+                                   (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                        }
+                    """)
+                except Exception:
+                    has_signup_prompt = False
+
+                if has_signup_prompt:
+                    _emit(cb, "  ⚠️ 页面提示需开通学生资格 (Sign up now)，转入 SheerID 学生认证流程...")
+                    is_unregistered = True
+                    break
+                else:
+                    is_already_registered = True
+                    _emit(cb, f"  ✅ 检测到已注册就绪状态（{poll_i+1}s）")
+                    break
 
             # 检测 SheerID 学术核验阶段 或 Your profile 个人资料阶段
             if "signup?offer=" in current_url.lower() or any(k in (page_headings + " " + page_title.lower()) for k in (
