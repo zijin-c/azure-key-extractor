@@ -13,7 +13,7 @@ Azure for Students — Academic Verification 表单填写
 
 流程:
   1. 支持最多 3 次自动刷新重试 (max_attempts = 3)
-  2. 等待 SheerID 表单渲染（#sse-vnext-fname-input 出现，最多 60s）
+  2. 等待 SheerID 表单渲染（#sse-vnext-fname-input 出现，单次最多 20s）
   3. 填 First name / Last name / Date of birth
   4. School email 已自动填好，验证一下即可，不重复填写
   5. 等待 Verify academic status 按钮变蓝（Turnstile 通过，最多 90s）
@@ -166,12 +166,14 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
             return True
 
-        # 2. 等待 SheerID 表单渲染（最多 30s，支持点击触发按钮与超时主动重载恢复）
+        # 2. 等待 SheerID 表单渲染。慢网络下 Angular/iframe 可能需要几十秒，
+        #    不在等待中途刷新，避免把正在加载的表单主动打断。
         _emit(cb, "  📝 等待 Academic Verification 表单加载...")
         form_found = False
         active_target = page
 
-        for wait_s in range(30):
+        form_wait_seconds = 20
+        for wait_s in range(form_wait_seconds):
             cur_url = (page.url or "").lower()
             if "portal.azure.com" in cur_url or "education.azure.com" in cur_url or "signup?offer=" in cur_url:
                 _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
@@ -196,18 +198,60 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
                     except Exception:
                         pass
 
-            # 若 15 秒页面仍然空白/无任何表单节点，主动刷新页面促使 Angular 重新拉取
-            if wait_s == 15 and not form_found:
-                _emit(cb, "  ⚠️ 页面加载迟缓，主动重新加载学生认证页面...")
-                try:
-                    await page.reload(wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
+            if wait_s == 10:
+                _emit(
+                    cb,
+                    f"  ⏳ SheerID 表单仍在加载（{wait_s}s/{form_wait_seconds}s），继续等待，不中途刷新...",
+                )
 
             await asyncio.sleep(1.0)
 
         if not form_found:
-            _emit(cb, "  ⚠️ 未等到表单就绪，尝试全 DOM 穿透探测...")
+            # 不能继续执行“填写”：没有表单时后续 locator 只会制造假进度。
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
+            frame_count = len(page.frames)
+            _emit(
+                cb,
+                f"  ⚠️ {form_wait_seconds} 秒内未挂载 SheerID 表单 "
+                f"(title={title[:50] or '-'}, frames={frame_count}, url={page.url[:80]})",
+            )
+
+            ss_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "screenshots",
+            )
+            os.makedirs(ss_dir, exist_ok=True)
+            try:
+                await page.screenshot(
+                    path=os.path.join(ss_dir, f"sheerid_form_missing_attempt_{attempt}.png"),
+                    full_page=True,
+                )
+            except Exception:
+                pass
+
+            if attempt < max_attempts:
+                # 刷新只放在一次完整等待失败之后，并加少量抖动，
+                # 避免多个并发账号同时重载、再次抢占网络资源。
+                delay = random.uniform(2.0, 5.0)
+                _emit(
+                    cb,
+                    f"  🔄 表单未挂载，{delay:.1f}s 后受控刷新再试 "
+                    f"({attempt + 1}/{max_attempts})...",
+                )
+                await asyncio.sleep(delay)
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    _emit(cb, f"  ⚠️ 受控刷新异常: {str(e)[:100]}")
+                await asyncio.sleep(2.0)
+                continue
+
+            raise SheerIDVerificationError(
+                "SheerID 表单连续两次未挂载，已停止假填写并转交全新浏览器重试"
+            )
 
         await asyncio.sleep(0.3)
 
