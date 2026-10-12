@@ -615,6 +615,12 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
                 "button:has-text('获取密钥')",
                 "[role='button']:has-text('View Key')",
                 "[role='button']:has-text('View key')",
+                "[role='button']:has-text('查看密钥')",
+                "a:has-text('View Key')",
+                "a:has-text('View key')",
+                "a:has-text('查看密钥')",
+                "[data-automation-id*='viewKey']",
+                "[data-telemetry-id*='view-key']",
             ]:
                 try:
                     loc = scope.locator(btn_sel).first
@@ -656,8 +662,8 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
     if not view_key_clicked:
         _emit(cb, "  ℹ️  未直接匹配到 View Key 按钮，保持面板打开并持续轮询提取...")
 
-    # ── 第三阶段：持续轮询提取 key（最多 26 次 * 0.5s = 13 秒）───
-    for attempt in range(26):
+    # ── 第三阶段：持续轮询提取 key（最多 36 次 * 0.5s = 18 秒，应对网络延迟）───
+    for attempt in range(36):
         await asyncio.sleep(0.5)
 
         # 扫描所有框架提取 key
@@ -672,7 +678,7 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
             if click_res:
                 _emit(cb, f"  🔘 延迟发现并点击 View Key 按钮: '{click_res.get('text')}'")
                 view_key_clicked = True
-        elif view_key_clicked and attempt > 0 and attempt % 8 == 0:
+        elif view_key_clicked and attempt > 0 and attempt % 6 == 0:
             # 已点击但 key 迟迟未下发，再次尝试触发点击（防止首次点击事件偶发丢失）
             re_click = await _click_view_key_in_any_frame()
             if re_click:

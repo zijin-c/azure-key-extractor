@@ -1198,39 +1198,28 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 15. ClientRects / DOMRect Sub-pixel Noise (Anti-Fingerprint) ────────
+    // ── 15. ClientRects / DOMRect Sub-pixel Noise (Anti-Fingerprint with Native Integrity) ──
     try {{
         const rectSeed = {rect_seed};
         const origGetBCR = Element.prototype.getBoundingClientRect;
         Element.prototype.getBoundingClientRect = helper.createNativeMethod('getBoundingClientRect', function() {{
             const rect = origGetBCR.apply(this, arguments);
-            const noise = (rectSeed * 0.00006) - 0.00003;
-            const domRect = new DOMRect(
+            if (!rect || (rect.width === 0 && rect.height === 0)) return rect;
+            // 极微量亚像素抖动（<= 0.00002px），维持真实 DOMRect 原型链与正交坐标关系
+            const noise = (rectSeed * 0.00004) - 0.00002;
+            return new DOMRect(
                 rect.x + noise,
-                rect.y + noise * 0.7,
-                rect.width + noise * 0.5,
-                rect.height + noise * 0.3
+                rect.y + noise,
+                rect.width + (noise * 0.1),
+                rect.height + (noise * 0.1)
             );
-            return domRect;
         }});
 
         const origGetCR = Element.prototype.getClientRects;
         Element.prototype.getClientRects = helper.createNativeMethod('getClientRects', function() {{
             const rects = origGetCR.apply(this, arguments);
-            if (!rects || rects.length === 0) return rects;
-            const noise = (rectSeed * 0.00006) - 0.00003;
-            const result = [];
-            for (let i = 0; i < rects.length; i++) {{
-                result.push(new DOMRect(
-                    rects[i].x + noise * (i + 1),
-                    rects[i].y + noise * 0.7 * (i + 1),
-                    rects[i].width + noise * 0.5,
-                    rects[i].height + noise * 0.3
-                ));
-            }}
-            // 保持 DOMRectList 类似的接口
-            result.item = function(idx) {{ return this[idx] || null; }};
-            return result;
+            // 保持原生 DOMRectList 原型链与元素内部测量绝对一致，避免破坏 Fluent UI / Fast Foundation
+            return rects;
         }});
     }} catch (e) {{}}
 
@@ -1672,10 +1661,13 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         # 动态认证/API 放行；认证域名的公共脚本、CSS、字体可进入静态缓存。
         parsed = urlsplit(url)
-        host = parsed.hostname
+        host = parsed.hostname or ""
         public_auth_asset = host in ("mysignins.microsoft.com", "login.microsoftonline.com") and LocalHttpCache.is_cacheable(url)
-        core_request = host in ("mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com") or host in ("portal.azure.com", "signup.azure.com") and parsed.path.lower().startswith("/api/")
-        if core_request and not public_auth_asset:
+        core_request = (
+            host in ("mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "main.iam.ad.ext.azure.com", "portal.azure.com")
+            and (parsed.path.lower().startswith("/api/") or "/batch" in parsed.path.lower() or "subscriptions" in parsed.path.lower() or "providers" in parsed.path.lower() or "education" in parsed.path.lower())
+        ) or (host in ("signup.azure.com") and parsed.path.lower().startswith("/api/"))
+        if (core_request or "management.azure.com" in host or "graph.microsoft.com" in host) and not public_auth_asset:
             await route.continue_()
             return
 
