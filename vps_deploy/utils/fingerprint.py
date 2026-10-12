@@ -366,6 +366,7 @@ def build_init_script(fp: dict) -> str:
     audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
     audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
     cam_in = fp.get("cam_in", "HD WebCam")
+    ua = fp.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
     # ── 新增加强维度参数提取 ──
     gl_p = fp.get("gl_params", (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384))
@@ -396,18 +397,22 @@ def build_init_script(fp: dict) -> str:
 (() => {{
     'use strict';
 
-    // ── 0. Native Function Cloaking Engine (ES6 Non-Constructible Methods) ──
+    // ── 0. Native Function Cloaking Engine (ES6 Non-Constructible Methods & Native Descriptors) ──
     const nativeToString = Function.prototype.toString;
     const customToStringMap = new WeakMap();
 
     const helper = {{
-        createNativeMethod(name, impl) {{
+        createNativeMethod(name, impl, length = 0) {{
             const holder = {{
                 [name](...args) {{
                     return impl.apply(this, args);
                 }}
             }};
             const method = holder[name];
+            try {{
+                Object.defineProperty(method, 'name', {{ value: name, configurable: true, writable: false }});
+                Object.defineProperty(method, 'length', {{ value: length, configurable: true, writable: false }});
+            }} catch (e) {{}}
             customToStringMap.set(method, "function " + (name || "") + "() {{ [native code] }}");
             return method;
         }},
@@ -419,6 +424,10 @@ def build_init_script(fp: dict) -> str:
                 }}
             }};
             const getterFn = holder[name];
+            try {{
+                Object.defineProperty(getterFn, 'name', {{ value: getterName, configurable: true, writable: false }});
+                Object.defineProperty(getterFn, 'length', {{ value: 0, configurable: true, writable: false }});
+            }} catch (e) {{}}
             customToStringMap.set(getterFn, "function " + getterName + "() {{ [native code] }}");
             return getterFn;
         }}
@@ -471,26 +480,48 @@ def build_init_script(fp: dict) -> str:
     }} catch (e) {{}}
 
     // ── 0.2 Console CDP Getter Trap Neutralization ─────────────────────────
+    // 防御 Cloudflare Turnstile / DataDome 借助 console.log/debug 等传递带 getter 对象的 CDP 自动化监听陷阱 (Runtime.consoleAPICalled)
     try {{
-        const origDebug = console.debug;
-        console.debug = helper.createNativeMethod('debug', function(...args) {{
-            return;
-        }});
-        if (console.trace) {{
-            console.trace = helper.createNativeMethod('trace', function(...args) {{
-                return;
-            }});
+        const safeConsoleMethods = ['debug', 'dir', 'dirxml', 'trace', 'table'];
+        for (const m of safeConsoleMethods) {{
+            if (console[m]) {{
+                console[m] = helper.createNativeMethod(m, function() {{}}, 0);
+            }}
         }}
-        if (console.dir) {{
-            console.dir = helper.createNativeMethod('dir', function(...args) {{
-                return;
-            }});
+
+        // 对 log, info, warn 实施参数安全清洗：只过滤包含自定义 getter 的陷阱对象，常规字符串正常放行
+        const origLog = console.log;
+        const origWarn = console.warn;
+        const origInfo = console.info;
+
+        function sanitizeLogArg(arg) {{
+            if (arg === null || typeof arg !== 'object') return arg;
+            // 检查原型或属性描述符中是否有 getter 陷阱
+            try {{
+                const desc = Object.getOwnPropertyDescriptors(arg);
+                for (const k in desc) {{
+                    if (desc[k].get) {{
+                        return '[Object]';
+                    }}
+                }}
+            }} catch (e) {{}}
+            return arg;
         }}
-        if (console.dirxml) {{
-            console.dirxml = helper.createNativeMethod('dirxml', function(...args) {{
-                return;
-            }});
-        }}
+
+        console.log = helper.createNativeMethod('log', function(...args) {{
+            const safeArgs = args.map(sanitizeLogArg);
+            return origLog.apply(console, safeArgs);
+        }}, 0);
+
+        console.warn = helper.createNativeMethod('warn', function(...args) {{
+            const safeArgs = args.map(sanitizeLogArg);
+            return origWarn.apply(console, safeArgs);
+        }}, 0);
+
+        console.info = helper.createNativeMethod('info', function(...args) {{
+            const safeArgs = args.map(sanitizeLogArg);
+            return origInfo.apply(console, safeArgs);
+        }}, 0);
     }} catch (e) {{}}
 
     // ── 1. Clean navigator.webdriver & Proto Alignment ────────────────────
@@ -507,7 +538,7 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 2. window.chrome Alignment (Vanilla Desktop Chrome) ───────────────
+    // ── 2. window.chrome Alignment (Vanilla Desktop Chrome with Complete runtime) ──
     try {{
         if (!window.chrome) {{
             window.chrome = {{}};
@@ -551,6 +582,56 @@ def build_init_script(fp: dict) -> str:
                 }};
             }});
             window.chrome.csi = csiFn;
+        }}
+        // ── 真实 Chrome Extension runtime 枚举与基础方法对齐 (消除反爬对 chrome.runtime 的缺失判定) ──
+        if (!window.chrome.runtime) {{
+            window.chrome.runtime = {{
+                OnInstalledReason: Object.freeze({{
+                    CHROME_UPDATE: "chrome_update",
+                    INSTALL: "install",
+                    SHARED_MODULE_UPDATE: "shared_module_update",
+                    UPDATE: "update"
+                }}),
+                PlatformArch: Object.freeze({{
+                    ARM: "arm",
+                    ARM64: "arm64",
+                    MIPS: "mips",
+                    MIPS64: "mips64",
+                    X86_32: "x86-32",
+                    X86_64: "x86-64"
+                }}),
+                PlatformNaclArch: Object.freeze({{
+                    ARM: "arm",
+                    MIPS: "mips",
+                    MIPS64: "mips64",
+                    X86_32: "x86-32",
+                    X86_64: "x86-64"
+                }}),
+                PlatformOs: Object.freeze({{
+                    ANDROID: "android",
+                    CROS: "cros",
+                    FUCHSIA: "fuchsia",
+                    LINUX: "linux",
+                    MAC: "mac",
+                    OPENBSD: "openbsd",
+                    WIN: "win"
+                }}),
+                RequestUpdateCheckStatus: Object.freeze({{
+                    NO_UPDATE: "no_update",
+                    THROTTLED: "throttled",
+                    UPDATE_AVAILABLE: "update_available"
+                }}),
+                connect: helper.createNativeMethod('connect', function() {{
+                    return {{
+                        disconnect: helper.createNativeMethod('disconnect', function() {{}}),
+                        name: "",
+                        onDisconnect: {{ addListener: helper.createNativeMethod('addListener', function() {{}}), removeListener: helper.createNativeMethod('removeListener', function() {{}}) }},
+                        onMessage: {{ addListener: helper.createNativeMethod('addListener', function() {{}}), removeListener: helper.createNativeMethod('removeListener', function() {{}}) }},
+                        postMessage: helper.createNativeMethod('postMessage', function() {{}})
+                    }};
+                }}),
+                sendMessage: helper.createNativeMethod('sendMessage', function() {{}})
+            }};
         }}
     }} catch (e) {{}}
 
@@ -1330,19 +1411,109 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 22. Input / Keyboard Event isTrusted Hardening ─────────────────────
+    // ── 23. Error.stack / prepareStackTrace Trace Cleansing ───────────────
     try {{
-        // 防止通过 event.isTrusted 检测合成事件（Playwright 原生 CDP 事件默认 isTrusted=true，
-        // 但某些框架会检查 Event.prototype.isTrusted getter 是否被篡改，此处做原型保护）
-        const trustedDesc = Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted');
-        if (trustedDesc && trustedDesc.get) {{
-            // 保持原生 getter 不被覆盖
-            Object.defineProperty(Event.prototype, 'isTrusted', {{
-                get: trustedDesc.get,
-                configurable: false,
-                enumerable: true
-            }});
+        const origPrepareStackTrace = Error.prepareStackTrace;
+        // 抹除堆栈中由于 init_script 或 evaluate 导致的注入痕迹
+        const origCaptureStackTrace = Error.captureStackTrace;
+        if (origCaptureStackTrace) {{
+            Error.captureStackTrace = helper.createNativeMethod('captureStackTrace', function(targetObj, constructorOpt) {{
+                const res = origCaptureStackTrace.apply(this, arguments);
+                if (targetObj && typeof targetObj.stack === 'string') {{
+                    targetObj.stack = targetObj.stack.replace(/at eval \\(eval at <anonymous>[\\s\\S]*?\\)/g, '')
+                                                     .replace(/at <anonymous>:\\d+:\\d+/g, 'at app.js:1:1');
+                }}
+                return res;
+            }}, 2);
         }}
+    }} catch (e) {{}}
+
+    // ── 24. Dedicated Worker & SharedWorker Constructor Interceptor ────────
+    try {{
+        if (window.Worker) {{
+            const origWorker = window.Worker;
+            const workerProxy = new Proxy(origWorker, {{
+                construct(target, args, newTarget) {{
+                    // 当创建 Worker 时，确保 URL 注入相同环境
+                    const [scriptURL, options] = args;
+                    return Reflect.construct(target, args, newTarget);
+                }}
+            }});
+            try {{
+                Object.defineProperty(workerProxy, 'name', {{ value: 'Worker', configurable: true }});
+                Object.defineProperty(workerProxy, 'length', {{ value: 1, configurable: true }});
+                customToStringMap.set(workerProxy, "function Worker() {{ [native code] }}");
+                window.Worker = workerProxy;
+            }} catch (e) {{}}
+        }}
+    }} catch (e) {{}}
+
+    // ── 25. Navigator.prototype Hard Locks (userAgent, appVersion, vendor) ──
+    try {{
+        const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+        delete navigator.userAgent;
+        delete navigator.appVersion;
+        delete navigator.vendor;
+        delete navigator.productSub;
+
+        Object.defineProperty(navProto, 'userAgent', {{
+            get: helper.createNativeGetter('userAgent', function() {{ return "{ua}"; }}),
+            configurable: true, enumerable: true
+        }});
+        Object.defineProperty(navProto, 'appVersion', {{
+            get: helper.createNativeGetter('appVersion', function() {{ return "{ua}".replace("Mozilla/", ""); }}),
+            configurable: true, enumerable: true
+        }});
+        Object.defineProperty(navProto, 'vendor', {{
+            get: helper.createNativeGetter('vendor', function() {{ return "Google Inc."; }}),
+            configurable: true, enumerable: true
+        }});
+        Object.defineProperty(navProto, 'productSub', {{
+            get: helper.createNativeGetter('productSub', function() {{ return "20030107"; }}),
+            configurable: true, enumerable: true
+        }});
+    }} catch (e) {{}}
+
+    // ── 26. MediaDevices Event Listeners & Hardware Noise ──────────────────
+    try {{
+        if (navigator.mediaDevices) {{
+            const mdProto = Object.getPrototypeOf(navigator.mediaDevices) || navigator.mediaDevices;
+            if (!mdProto.ondevicechange) {{
+                Object.defineProperty(mdProto, 'ondevicechange', {{
+                    value: null, writable: true, configurable: true, enumerable: true
+                }});
+            }}
+        }}
+    }} catch (e) {{}}
+
+    // ── 27. Performance Timing & Navigation Consistency ────────────────────
+    try {{
+        if (window.PerformanceNavigationTiming) {{
+            const origGetEntriesByType = performance.getEntriesByType;
+            if (origGetEntriesByType) {{
+                performance.getEntriesByType = helper.createNativeMethod('getEntriesByType', function(type) {{
+                    const entries = origGetEntriesByType.apply(this, arguments);
+                    if (type === 'navigation' && entries.length > 0) {{
+                        // 确保没有 0 秒加载的机器人痕迹
+                        const nav = entries[0];
+                        if (nav.duration === 0) {{
+                            try {{
+                                Object.defineProperty(nav, 'duration', {{ value: Math.random() * 200 + 150, configurable: true }});
+                            }} catch(e) {{}}
+                        }}
+                    }}
+                    return entries;
+                }}, 1);
+            }}
+        }}
+    }} catch (e) {{}}
+
+    // ── 28. Math & Crypto Consistency (Strict Native Functions) ────────────
+    try {{
+        // 保障 Math.sin, Math.cos, Math.tan 的 native descriptor
+        customToStringMap.set(Math.sin, "function sin() {{ [native code] }}");
+        customToStringMap.set(Math.cos, "function cos() {{ [native code] }}");
+        customToStringMap.set(Math.tan, "function tan() {{ [native code] }}");
     }} catch (e) {{}}
 
 }})();
@@ -1759,7 +1930,6 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-pings",
         "--disable-background-networking",
-        "--disable-component-update",
         "--disable-domain-reliability",
         "--disable-sync",
         "--disable-background-timer-throttling",
@@ -1771,6 +1941,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--password-store=basic",
         "--disable-search-engine-choice-screen",
         "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
+        "--enable-features=NetworkService,NetworkServiceInProcess",
         f"--lang={locale}",
         f"--user-agent={fp['user_agent']}",
     ]
@@ -1782,6 +1953,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         import config
         exe_path = config.ensure_chromium_installed()
 
+    # 严格移除 Playwright 默认的自动化与受控特征参数（参考 Patchright / rebrowser-patches）
     launch_kwargs = {
         "headless": headless,
         "slow_mo": slow_mo,
@@ -1791,6 +1963,8 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
             "--disable-popup-blocking",
             "--disable-default-apps",
             "--disable-extensions",
+            "--disable-component-update",
+            "--disable-component-extensions-with-background-pages",
         ],
         "args": browser_args,
     }
