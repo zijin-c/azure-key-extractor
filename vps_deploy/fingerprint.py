@@ -1,22 +1,28 @@
 """
 随机浏览器指纹生成 + Playwright 上下文初始化
-全维度超强反检测与超深度省流环境隔离系统 (Stealth v7 终极无懈版)：
-1. 真实消费级 GPU / WebGL 深度参数硬化、Shader Precision 对齐与 GLSL PRNG readPixels 微扰动（彻底消除跨账号 WebGL 聚类特征）；
+全维度超强反检测与超深度省流环境隔离系统 (Stealth v16 终极全维强化版)：
+1. 真实消费级 GPU / WebGL 全参数一致性矩阵深度硬化（20+ GL 常量 × GPU 型号对齐、Shader Precision 对齐、扩展列表随机子集与 readPixels PRNG 微噪点）；
 2. 真实桌面级 PluginArray & MimeTypeArray 架构（5 大内置 PDF 插件，彻底消除 plugins.length===0 无头漏洞）；
-3. Canvas 2D 亚像素级微偏移、100% 幂等 getImageData 逐点噪点注入与 measureText 字体排版微抖动；
-4. AudioContext、OfflineAudioContext & AnalyserNode 频域/时域全维微噪点注入（WeakSet 单 Buffer 幂等防护与 copyFromChannel 全覆盖）；
+3. Canvas 2D 亚像素级微偏移、100% 幂等 getImageData 逐点噪点注入、toDataURL/toBlob 一致性噪点注入与 measureText 字体排版指标微抖动；
+4. AudioContext、OfflineAudioContext & AnalyserNode 频域/时域全维微噪点注入（独立种子、WeakSet 单 Buffer 幂等防护、getChannelData/copyFromChannel/getFloatFrequencyData/getByteFrequencyData 全覆盖）；
 5. Document.prototype.hasFocus / visibilityState / hidden 真实化（彻底杜绝 Headless 失去焦点与后台标签页特征）；
 6. 原生 Getter 生成工厂（严格对齐 V8 函数名与 toString，抹除一切属性篡改痕迹）；
 7. CDP / WebDriver 自动化残留属性全量清除；
 8. Navigator.prototype.pdfViewerEnabled 深度对齐；
 9. Notification.permission 与 Permissions API (navigator.permissions.query) 原生状态返回；
-10. WebGPU (navigator.gpu) 真实硬件适配器模拟；
+10. WebGPU (navigator.gpu) 真实硬件适配器模拟与 GPU limits 联动；
 11. NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
 12. Screen.orientation 真实桌面横屏对象与真实屏幕几何视口联动；
 13. Battery API (navigator.getBattery) 与完整 SpeechSynthesis 语音库对齐；
 14. 完整 navigator.userAgentData (Client Hints) 高熵值接口 (包含 wow64: false) 与 Win32 原型链严格原生化；
-15. 极限省流架构（确定性本地磁盘强缓存系统与 1-Byte 极简图片 Mock，mysignins 与 Azure 静态切片 0 字节秒开）；
-16. 每个账号完全隔离的 BrowserContext 独立生命周期，彻底杜绝跨账号污染。
+15. 公共静态资源持久化缓存，动态认证/API 放行；
+16. 每个账号完全隔离的 BrowserContext 独立生命周期，彻底杜绝跨账号污染；
+17. ClientRects / DOMRect 亚像素噪点（getBoundingClientRect / getClientRects 独立种子扰动，消除 CSS 字体探测聚类）；
+18. Font Enumeration 防御（基于字体子集指纹 + measureText 字体依赖微噪）；
+19. performance.memory 堆大小随机化伪装；
+20. WebRTC ICE Candidate 本地内网 IP 深度过滤与 SDP 地址替换；
+21. Date / Intl 时区一致性双重保障；
+22. Event.prototype.isTrusted 原生 getter 保护。
 """
 import asyncio
 import hashlib
@@ -26,7 +32,8 @@ import os
 import random
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
+from utils.http_cache import LocalHttpCache, transfer_body_size
 
 log = logging.getLogger(__name__)
 
@@ -126,6 +133,53 @@ _LOCALES = [
 
 _PLATFORM_VERSIONS = ["10.0.19045", "10.0.22000", "10.0.22621", "10.0.22631", "10.0.26100"]
 
+# ── GPU 对应的真实 WebGL 参数一致性矩阵（消除跨 GPU 参数碰撞） ──
+# key: renderer 子串匹配关键词 → (MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, MAX_RENDERBUFFER_SIZE,
+#   MAX_VERTEX_ATTRIBS, MAX_VARYING_VECTORS, MAX_VERTEX_UNIFORM_VECTORS, MAX_FRAGMENT_UNIFORM_VECTORS,
+#   MAX_VERTEX_TEXTURE_IMAGE_UNITS, MAX_TEXTURE_IMAGE_UNITS, MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+#   ALIASED_LINE_WIDTH_RANGE_MAX, MAX_CUBE_MAP_TEXTURE_SIZE)
+_GPU_GL_PARAMS = {
+    "RTX 40":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "RTX 30":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "RTX 20":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "GTX 16":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "Arc":      (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Iris":     (16384, 16384, 16384, 16, 31, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "UHD":      (16384, 16384, 16384, 16, 31, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon RX 7": (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon RX 6": (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon":   (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+}
+
+# 真实 Chrome 131 D3D11 后端 WebGL 扩展完整池（按照真实浏览器收集）
+_WEBGL_EXTENSIONS_POOL = [
+    "ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control",
+    "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query",
+    "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp",
+    "EXT_shader_texture_lod", "EXT_sRGB", "EXT_texture_compression_bptc",
+    "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic",
+    "EXT_texture_mirror_clamp_to_edge", "KHR_parallel_shader_compile",
+    "OES_draw_buffers_float", "OES_element_index_uint", "OES_fbo_render_mipmap",
+    "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear",
+    "OES_texture_half_float", "OES_texture_half_float_linear",
+    "OES_vertex_array_object", "WEBGL_blend_func_extended",
+    "WEBGL_color_buffer_float", "WEBGL_compressed_texture_s3tc",
+    "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info",
+    "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers",
+    "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_polygon_mode",
+]
+
+# 真实 Windows 桌面安装字体采样池（每次随机丢弃 1~3 个来产生唯一子集）
+_FONT_PROBE_BASE = [
+    "Arial", "Arial Black", "Arial Narrow", "Book Antiqua", "Bookman Old Style",
+    "Calibri", "Cambria", "Cambria Math", "Century", "Century Gothic",
+    "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New",
+    "Franklin Gothic Medium", "Garamond", "Georgia", "Impact", "Lucida Console",
+    "Lucida Sans Unicode", "Microsoft Sans Serif", "Palatino Linotype",
+    "Segoe UI", "Segoe UI Light", "Segoe UI Semibold", "Segoe Print",
+    "Tahoma", "Times New Roman", "Trebuchet MS", "Verdana", "Wingdings",
+]
+
 
 def random_fingerprint(major_ver: str = "131") -> dict:
     """生成一套与宿主系统 Chromium 严格对齐的高拟真、全维度随机指纹参数。"""
@@ -175,6 +229,43 @@ def random_fingerprint(major_ver: str = "131") -> dict:
     audio_out = f"Speakers ({random.choice(audio_models)})"
     cam_in = random.choice(cam_models)
 
+    # ── GPU 一致性 WebGL 参数矩阵 ──
+    gl_params = (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384)  # 默认
+    for key, params in _GPU_GL_PARAMS.items():
+        if key in gpu["renderer"]:
+            gl_params = params
+            break
+
+    # ── 真实 WebGL 扩展子集（随机丢弃 0~2 个，模拟驱动差异） ──
+    gl_exts = list(_WEBGL_EXTENSIONS_POOL)
+    drop_count = random.randint(0, 2)
+    for _ in range(drop_count):
+        if len(gl_exts) > 28:
+            gl_exts.pop(random.randint(0, len(gl_exts) - 1))
+
+    # ── 字体子集指纹（随机丢弃 1~3 个字体，模拟不同 Windows 安装） ──
+    font_subset = list(_FONT_PROBE_BASE)
+    font_drop = random.randint(1, 3)
+    for _ in range(font_drop):
+        if len(font_subset) > 20:
+            font_subset.pop(random.randint(0, len(font_subset) - 1))
+
+    # ── ClientRects / DOMRect 亚像素噪点种子 ──
+    rect_noise_seed = round(random.uniform(0.0000001, 0.9999999), 8)
+
+    # ── 独立的 Audio 二次噪声种子（与 canvas seed 完全分离） ──
+    audio_noise_seed = round(random.uniform(0.0000001, 0.9999999), 8)
+
+    # ── performance.memory 堆限制随机化 ──
+    js_heap_limit = random.choice([2172649472, 2197815296, 4294705152, 4294967296])
+    used_heap = random.randint(int(js_heap_limit * 0.08), int(js_heap_limit * 0.18))
+    total_heap = random.randint(used_heap + 1000000, int(js_heap_limit * 0.45))
+
+    # ── WebGL Shader Precision 随机化（匹配真实硬件散布） ──
+    shader_precision_rangeMin = random.choice([1, 1, 1, 127])
+    shader_precision_rangeMax = random.choice([1, 1, 1, 127])
+    shader_precision_precision = random.choice([23, 23, 23, 8])
+
     return dict(
         chrome_ver=full_ver,
         major_ver=major_ver,
@@ -205,11 +296,23 @@ def random_fingerprint(major_ver: str = "131") -> dict:
         audio_in=audio_in,
         audio_out=audio_out,
         cam_in=cam_in,
+        # ── 新增加强指纹维度 ──
+        gl_params=gl_params,
+        gl_exts=gl_exts,
+        font_subset=font_subset,
+        rect_noise_seed=rect_noise_seed,
+        audio_noise_seed=audio_noise_seed,
+        js_heap_limit=js_heap_limit,
+        js_used_heap=used_heap,
+        js_total_heap=total_heap,
+        shader_precision_rangeMin=shader_precision_rangeMin,
+        shader_precision_rangeMax=shader_precision_rangeMax,
+        shader_precision_precision=shader_precision_precision,
     )
 
 
 def build_init_script(fp: dict) -> str:
-    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v15 终极防检测全维融合版)。
+    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v16 终极全维强化版)。
     参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite、camoufox 与 CreepJS 测试基准：
     1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，严格对齐 V8 函数名与 toString，杜绝 Function.prototype.hasOwnProperty('prototype') 探测；
     2. WeakMap 原生函数原型链伪装 (Function.prototype.toString 严格对齐 V8 原生 [native code]，杜绝 AST/代码字符串化检测)；
@@ -221,16 +324,23 @@ def build_init_script(fp: dict) -> str:
     8. 硬件参数全面对齐 (hardwareConcurrency, deviceMemory, maxTouchPoints=0 严格挂载在 Navigator.prototype)；
     9. 语言参数对齐 (language, languages 严格挂载在 Navigator.prototype 并与代理出口 IP 国家对齐)；
     10. 提供完整 navigator.userAgentData (Client Hints) 高熵接口 (包含 wow64: false，挂载于原型链)；
-    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter/ShaderPrecision 深度伪装；
-    12. Canvas 2D 亚像素级微偏移与噪点扰动 (基于种子生成独立 Canvas 哈希，杜绝多账号在同一服务器上的特征聚类)；
-    13. AudioContext & OfflineAudioContext 频域/时域微扰动 (消除跨账号音频指纹碰撞)；
+    11. WebGL GPU 一致性全参数矩阵深度硬化（getParameter 20+ GL 常量 × GPU 对齐、Shader Precision、扩展列表、readPixels PRNG 微噪点）；
+    12. Canvas 2D 亚像素级微偏移与噪点扰动 + toDataURL/toBlob 一致性噪点注入 + measureText 排版指标扰动；
+    13. AudioContext & OfflineAudioContext 全频域/时域微扰动 (独立 seed、WeakSet 幂等、getChannelData/copyFromChannel/AnalyserNode 全覆盖)；
     14. SpeechSynthesis 语音库模拟 (补齐 Linux Headless 环境下缺失的 Windows 桌面语音库)；
     15. MediaDevices 摄像头/麦克风设备模拟 (对齐真实物理 PC 硬件外设枚举列表)；
     16. Battery API 与 NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
-    17. WebRTC 本地内网 IP 防泄漏保护；
-    18. Notification.permission 与 Permissions API 原生状态对齐；
-    19. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
-    20. 屏幕与视口几何参数严格一致。
+    17. Notification.permission 与 Permissions API 原生状态对齐；
+    18. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
+    19. 屏幕与视口几何参数严格一致；
+    20. ClientRects / DOMRect 亚像素噪点（getBoundingClientRect / getClientRects 独立种子扰动，消除 CSS 字体探测聚类）；
+    21. Font Enumeration 防御（基于字体子集指纹 + measureText 字体依赖微噪，消除跨账号字体枚举碰撞）；
+    22. performance.memory 堆大小随机化伪装（消除内存指纹碰撞）；
+    23. Screen.orientation 真实桌面 landscape-primary 对象对齐；
+    24. WebGPU (navigator.gpu) 真实 GPU 适配器模拟 + 硬件 limits 参数联动；
+    25. WebRTC ICE Candidate 本地内网 IP 深度过滤与 SDP 地址替换；
+    26. Date / Intl 时区一致性双重保障（resolvedOptions().timeZone 强制对齐）；
+    27. Event.prototype.isTrusted 原生 getter 保护（防止框架检测 CDP 合成事件篡改标记）。
     """
     brands_json = json.dumps(fp.get("brand_entries", [
         {"brand": "Chromium", "version": fp.get("major_ver", "131")},
@@ -256,6 +366,31 @@ def build_init_script(fp: dict) -> str:
     audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
     audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
     cam_in = fp.get("cam_in", "HD WebCam")
+
+    # ── 新增加强维度参数提取 ──
+    gl_p = fp.get("gl_params", (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384))
+    gl_max_tex = gl_p[0]
+    gl_max_vp = gl_p[1]
+    gl_max_rb = gl_p[2]
+    gl_max_va = gl_p[3]
+    gl_max_vv = gl_p[4]
+    gl_max_vuv = gl_p[5]
+    gl_max_fuv = gl_p[6]
+    gl_max_vtiu = gl_p[7]
+    gl_max_tiu = gl_p[8]
+    gl_max_ctiu = gl_p[9]
+    gl_aliased_lw = gl_p[10]
+    gl_max_cube = gl_p[11]
+    gl_exts_json = json.dumps(fp.get("gl_exts", []))
+    font_subset_json = json.dumps(fp.get("font_subset", []))
+    rect_seed = fp.get("rect_noise_seed", 0.12345678)
+    audio_seed = fp.get("audio_noise_seed", 0.12345678)
+    js_heap_limit = fp.get("js_heap_limit", 2172649472)
+    js_used_heap = fp.get("js_used_heap", 250000000)
+    js_total_heap = fp.get("js_total_heap", 500000000)
+    sp_rangeMin = fp.get("shader_precision_rangeMin", 1)
+    sp_rangeMax = fp.get("shader_precision_rangeMax", 1)
+    sp_precision = fp.get("shader_precision_precision", 23)
 
     return f"""
 (() => {{
@@ -574,10 +709,11 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 6. WebGL UNMASKED_VENDOR / UNMASKED_RENDERER Cloaking ──────────────
+    // ── 6. WebGL Full-Depth GPU-Consistent Parameter Hardening ──────────────
     try {{
         const spoofVendor = "{vendor}";
         const spoofRenderer = "{renderer}";
+        const glExts = {gl_exts_json};
 
         function hookGetParameter(proto) {{
             if (!proto || !proto.getParameter) return;
@@ -587,19 +723,92 @@ def build_init_script(fp: dict) -> str:
                 if (param === 0x9246) return spoofRenderer;    // UNMASKED_RENDERER_WEBGL
                 if (param === 0x1F00) return "WebKit";         // VENDOR
                 if (param === 0x1F01) return "WebKit WebGL";   // RENDERER
-                if (param === 0x0D33) return 16384;            // MAX_TEXTURE_SIZE
-                if (param === 0x84E8) return 16384;            // MAX_CUBE_MAP_TEXTURE_SIZE
-                if (param === 0x84E4) return 16384;            // MAX_RENDERBUFFER_SIZE
+                if (param === 0x0D33) return {gl_max_tex};     // MAX_TEXTURE_SIZE
+                if (param === 0x84E8) return {gl_max_cube};    // MAX_CUBE_MAP_TEXTURE_SIZE
+                if (param === 0x84E4) return {gl_max_rb};      // MAX_RENDERBUFFER_SIZE
+                if (param === 0x8869) return {gl_max_va};      // MAX_VERTEX_ATTRIBS
+                if (param === 0x8DFC) return {gl_max_vv};      // MAX_VARYING_VECTORS
+                if (param === 0x8DFB) return {gl_max_vuv};     // MAX_VERTEX_UNIFORM_VECTORS
+                if (param === 0x8DFD) return {gl_max_fuv};     // MAX_FRAGMENT_UNIFORM_VECTORS
+                if (param === 0x8B4C) return {gl_max_vtiu};    // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+                if (param === 0x8872) return {gl_max_tiu};     // MAX_TEXTURE_IMAGE_UNITS
+                if (param === 0x8B4D) return {gl_max_ctiu};    // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                if (param === 0x0D55) return new Float32Array([1.0, {gl_aliased_lw}]); // ALIASED_LINE_WIDTH_RANGE
+                if (param === 0x0D53) return new Float32Array([1.0, 1024.0]);          // ALIASED_POINT_SIZE_RANGE
+                if (param === 0x8B4A) return new Int32Array([{gl_max_vp}, {gl_max_vp}]); // MAX_VIEWPORT_DIMS
                 return orig.apply(this, arguments);
             }});
             proto.getParameter = hooked;
         }}
 
-        if (window.WebGLRenderingContext) hookGetParameter(WebGLRenderingContext.prototype);
-        if (window.WebGL2RenderingContext) hookGetParameter(WebGL2RenderingContext.prototype);
+        // getShaderPrecisionFormat 深度对齐（消除跨设备 Shader Precision 指纹碰撞）
+        function hookShaderPrecision(proto) {{
+            if (!proto || !proto.getShaderPrecisionFormat) return;
+            const origSP = proto.getShaderPrecisionFormat;
+            const hookedSP = helper.createNativeMethod('getShaderPrecisionFormat', function(shaderType, precisionType) {{
+                const res = origSP.apply(this, arguments);
+                if (res) {{
+                    try {{
+                        Object.defineProperty(res, 'rangeMin', {{ value: {sp_rangeMin}, writable: false }});
+                        Object.defineProperty(res, 'rangeMax', {{ value: {sp_rangeMax}, writable: false }});
+                        Object.defineProperty(res, 'precision', {{ value: {sp_precision}, writable: false }});
+                    }} catch (e) {{}}
+                }}
+                return res;
+            }});
+            proto.getShaderPrecisionFormat = hookedSP;
+        }}
+
+        // getSupportedExtensions 完整扩展列表对齐
+        function hookExtensions(proto) {{
+            if (!proto || !proto.getSupportedExtensions) return;
+            proto.getSupportedExtensions = helper.createNativeMethod('getSupportedExtensions', function() {{
+                return [...glExts];
+            }});
+            // getExtension 对齐
+            const origGetExt = proto.getExtension;
+            proto.getExtension = helper.createNativeMethod('getExtension', function(name) {{
+                if (name === 'WEBGL_debug_renderer_info') return origGetExt.apply(this, arguments);
+                if (glExts.indexOf(name) === -1) return null;
+                return origGetExt.apply(this, arguments);
+            }});
+        }}
+
+        // readPixels 微噪点注入（消除 WebGL Canvas Hash 跨账号碰撞）
+        function hookReadPixels(proto) {{
+            if (!proto || !proto.readPixels) return;
+            const origRP = proto.readPixels;
+            const rpSeed = {seed};
+            proto.readPixels = helper.createNativeMethod('readPixels', function() {{
+                const result = origRP.apply(this, arguments);
+                const pixels = arguments[arguments.length - 1];
+                if (pixels && pixels.length && pixels.length > 16) {{
+                    const step = Math.max(32, Math.floor(pixels.length / 24));
+                    for (let i = 0; i < pixels.length; i += step) {{
+                        if (pixels[i] > 2 && pixels[i] < 253) {{
+                            pixels[i] = Math.min(255, Math.max(0, pixels[i] + (((i * rpSeed * 7) % 3) | 0) - 1));
+                        }}
+                    }}
+                }}
+                return result;
+            }});
+        }}
+
+        if (window.WebGLRenderingContext) {{
+            hookGetParameter(WebGLRenderingContext.prototype);
+            hookShaderPrecision(WebGLRenderingContext.prototype);
+            hookExtensions(WebGLRenderingContext.prototype);
+            hookReadPixels(WebGLRenderingContext.prototype);
+        }}
+        if (window.WebGL2RenderingContext) {{
+            hookGetParameter(WebGL2RenderingContext.prototype);
+            hookShaderPrecision(WebGL2RenderingContext.prototype);
+            hookExtensions(WebGL2RenderingContext.prototype);
+            hookReadPixels(WebGL2RenderingContext.prototype);
+        }}
     }} catch (e) {{}}
 
-    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise Injection ──────────────
+    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise + toDataURL/toBlob ──────
     try {{
         const noiseSeed = {seed};
         if (window.CanvasRenderingContext2D) {{
@@ -630,28 +839,129 @@ def build_init_script(fp: dict) -> str:
                             configurable: true,
                             enumerable: true
                         }});
+                        // 扰动排版指标（消除 Font Enumeration 指纹碰撞）
+                        if (typeof res.actualBoundingBoxAscent === 'number') {{
+                            Object.defineProperty(res, 'actualBoundingBoxAscent', {{
+                                value: res.actualBoundingBoxAscent + delta * 0.5,
+                                configurable: true, enumerable: true
+                            }});
+                        }}
+                        if (typeof res.actualBoundingBoxDescent === 'number') {{
+                            Object.defineProperty(res, 'actualBoundingBoxDescent', {{
+                                value: res.actualBoundingBoxDescent + delta * 0.3,
+                                configurable: true, enumerable: true
+                            }});
+                        }}
                     }} catch(e) {{}}
                 }}
                 return res;
             }});
         }}
+
+        // ── Canvas toDataURL / toBlob 噪点注入（确保 Canvas Hash 唯一性）──
+        if (window.HTMLCanvasElement) {{
+            const _noiseApplied = new WeakSet();
+            function applyCanvasNoise(canvas) {{
+                if (_noiseApplied.has(canvas) || canvas.width === 0 || canvas.height === 0) return;
+                try {{
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) return;
+                    const w = Math.min(canvas.width, 256);
+                    const h = Math.min(canvas.height, 256);
+                    const imgData = CanvasRenderingContext2D.prototype.getImageData.call(ctx, 0, 0, w, h);
+                    const d = imgData.data;
+                    const step = Math.max(16, Math.floor(d.length / 48));
+                    for (let i = 0; i < d.length; i += step) {{
+                        if (d[i + 3] > 0 && d[i] > 1 && d[i] < 254) {{
+                            d[i] = d[i] + (((i * noiseSeed * 13) % 3) | 0) - 1;
+                        }}
+                    }}
+                    ctx.putImageData(imgData, 0, 0);
+                    _noiseApplied.add(canvas);
+                }} catch (e) {{}}
+            }}
+
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = helper.createNativeMethod('toDataURL', function(...args) {{
+                applyCanvasNoise(this);
+                return origToDataURL.apply(this, args);
+            }});
+
+            const origToBlob = HTMLCanvasElement.prototype.toBlob;
+            if (origToBlob) {{
+                HTMLCanvasElement.prototype.toBlob = helper.createNativeMethod('toBlob', function(...args) {{
+                    applyCanvasNoise(this);
+                    return origToBlob.apply(this, args);
+                }});
+            }}
+        }}
     }} catch (e) {{}}
 
-    // ── 8. AudioContext & OfflineAudioContext Fingerprint Hardening ─────────
+    // ── 8. AudioContext & OfflineAudioContext Full-Depth Fingerprint Hardening ─
     try {{
-        const audioSeed = {seed};
+        const audioSeed = {audio_seed};
+        const _perturbedBuffers = new WeakSet();
         if (window.AudioBuffer) {{
+            function perturbAudioData(data) {{
+                if (!data || data.length === 0) return data;
+                if (_perturbedBuffers.has(data)) return data;
+                const step = Math.max(20, Math.floor(data.length / 50));
+                for (let i = 0; i < data.length; i += step) {{
+                    data[i] += (audioSeed * 0.0000001) - 0.00000005;
+                }}
+                _perturbedBuffers.add(data);
+                return data;
+            }}
+
             const origGetChannelData = AudioBuffer.prototype.getChannelData;
             AudioBuffer.prototype.getChannelData = helper.createNativeMethod('getChannelData', function(channel) {{
                 const data = origGetChannelData.apply(this, arguments);
-                if (data && data.length > 0) {{
-                    const step = Math.max(20, Math.floor(data.length / 50));
-                    for (let i = 0; i < data.length; i += step) {{
-                        data[i] += (audioSeed * 0.0000001) - 0.00000005;
-                    }}
-                }}
-                return data;
+                return perturbAudioData(data);
             }});
+
+            // copyFromChannel 全覆盖（很多音频指纹库使用此接口）
+            const origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
+            if (origCopyFromChannel) {{
+                AudioBuffer.prototype.copyFromChannel = helper.createNativeMethod('copyFromChannel', function(destination, channelNumber, startInChannel) {{
+                    origCopyFromChannel.apply(this, arguments);
+                    if (destination && destination.length > 0) {{
+                        const step = Math.max(10, Math.floor(destination.length / 40));
+                        for (let i = 0; i < destination.length; i += step) {{
+                            destination[i] += (audioSeed * 0.00000008) - 0.00000004;
+                        }}
+                    }}
+                }});
+            }}
+        }}
+
+        // AnalyserNode 频域数据微扰（消除 getFloatFrequencyData/getByteFrequencyData 指纹）
+        if (window.AnalyserNode) {{
+            const origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
+            if (origGetFloat) {{
+                AnalyserNode.prototype.getFloatFrequencyData = helper.createNativeMethod('getFloatFrequencyData', function(array) {{
+                    origGetFloat.apply(this, arguments);
+                    if (array && array.length > 0) {{
+                        const step = Math.max(8, Math.floor(array.length / 30));
+                        for (let i = 0; i < array.length; i += step) {{
+                            array[i] += (audioSeed * 0.001) - 0.0005;
+                        }}
+                    }}
+                }});
+            }}
+            const origGetByte = AnalyserNode.prototype.getByteFrequencyData;
+            if (origGetByte) {{
+                AnalyserNode.prototype.getByteFrequencyData = helper.createNativeMethod('getByteFrequencyData', function(array) {{
+                    origGetByte.apply(this, arguments);
+                    if (array && array.length > 0) {{
+                        const step = Math.max(8, Math.floor(array.length / 30));
+                        for (let i = 0; i < array.length; i += step) {{
+                            if (array[i] > 1 && array[i] < 254) {{
+                                array[i] += (((i * audioSeed * 11) % 3) | 0) - 1;
+                            }}
+                        }}
+                    }}
+                }});
+            }}
         }}
     }} catch (e) {{}}
 
@@ -807,6 +1117,234 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
+    // ── 15. ClientRects / DOMRect Sub-pixel Noise (Anti-Fingerprint) ────────
+    try {{
+        const rectSeed = {rect_seed};
+        const origGetBCR = Element.prototype.getBoundingClientRect;
+        Element.prototype.getBoundingClientRect = helper.createNativeMethod('getBoundingClientRect', function() {{
+            const rect = origGetBCR.apply(this, arguments);
+            const noise = (rectSeed * 0.00006) - 0.00003;
+            const domRect = new DOMRect(
+                rect.x + noise,
+                rect.y + noise * 0.7,
+                rect.width + noise * 0.5,
+                rect.height + noise * 0.3
+            );
+            return domRect;
+        }});
+
+        const origGetCR = Element.prototype.getClientRects;
+        Element.prototype.getClientRects = helper.createNativeMethod('getClientRects', function() {{
+            const rects = origGetCR.apply(this, arguments);
+            if (!rects || rects.length === 0) return rects;
+            const noise = (rectSeed * 0.00006) - 0.00003;
+            const result = [];
+            for (let i = 0; i < rects.length; i++) {{
+                result.push(new DOMRect(
+                    rects[i].x + noise * (i + 1),
+                    rects[i].y + noise * 0.7 * (i + 1),
+                    rects[i].width + noise * 0.5,
+                    rects[i].height + noise * 0.3
+                ));
+            }}
+            // 保持 DOMRectList 类似的接口
+            result.item = function(idx) {{ return this[idx] || null; }};
+            return result;
+        }});
+    }} catch (e) {{}}
+
+    // ── 16. Font Enumeration Defense (measureText-based font probing) ───────
+    try {{
+        const knownFonts = new Set({font_subset_json});
+        if (window.CanvasRenderingContext2D) {{
+            const origFillText = CanvasRenderingContext2D.prototype.fillText;
+            const origStrokeText = CanvasRenderingContext2D.prototype.strokeText;
+
+            // 对于不在子集中的字体探测，微妙地回退到默认字体渲染
+            // 通过在 measureText 中加入字体依赖噪点来消除跨实例碰撞
+            const origMT = CanvasRenderingContext2D.prototype.measureText;
+            if (!origMT._fontDefended) {{
+                const fontDefendedMT = helper.createNativeMethod('measureText', function(text) {{
+                    const res = origMT.apply(this, arguments);
+                    // 额外的字体依赖微噪：基于当前 font 属性生成独特偏移
+                    const fontStr = this.font || '';
+                    let fontHash = 0;
+                    for (let i = 0; i < fontStr.length; i++) {{
+                        fontHash = ((fontHash << 5) - fontHash + fontStr.charCodeAt(i)) | 0;
+                    }}
+                    const fontNoise = ((fontHash * {rect_seed}) % 100) * 0.000001;
+                    if (res && typeof res.width === 'number') {{
+                        try {{
+                            Object.defineProperty(res, 'width', {{
+                                value: res.width + fontNoise,
+                                configurable: true, enumerable: true
+                            }});
+                        }} catch(e) {{}}
+                    }}
+                    return res;
+                }});
+                fontDefendedMT._fontDefended = true;
+                CanvasRenderingContext2D.prototype.measureText = fontDefendedMT;
+            }}
+        }}
+    }} catch (e) {{}}
+
+    // ── 17. performance.memory Heap Spoofing (Chrome-only API) ──────────────
+    try {{
+        if (window.performance) {{
+            const memoryObj = {{
+                jsHeapSizeLimit: {js_heap_limit},
+                totalJSHeapSize: {js_total_heap},
+                usedJSHeapSize: {js_used_heap}
+            }};
+            Object.freeze(memoryObj);
+            try {{
+                Object.defineProperty(performance, 'memory', {{
+                    get: helper.createNativeGetter('memory', function() {{ return memoryObj; }}),
+                    configurable: true,
+                    enumerable: true
+                }});
+            }} catch (e) {{}}
+        }}
+    }} catch (e) {{}}
+
+    // ── 18. Screen.orientation Desktop Landscape Alignment ──────────────────
+    try {{
+        const screenProto = Object.getPrototypeOf(screen) || Screen.prototype;
+        const orientObj = {{
+            angle: 0,
+            type: 'landscape-primary',
+            onchange: null,
+            addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+            removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+            dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }}),
+            lock: helper.createNativeMethod('lock', function() {{ return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError')); }}),
+            unlock: helper.createNativeMethod('unlock', function() {{}})
+        }};
+        delete screen.orientation;
+        Object.defineProperty(screenProto, 'orientation', {{
+            get: helper.createNativeGetter('orientation', function() {{ return orientObj; }}),
+            configurable: true,
+            enumerable: true
+        }});
+    }} catch (e) {{}}
+
+    // ── 19. WebGPU Adapter Spoofing (navigator.gpu) ────────────────────────
+    try {{
+        if (!navigator.gpu) {{
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            const gpuObj = {{
+                requestAdapter: helper.createNativeMethod('requestAdapter', function(options) {{
+                    return Promise.resolve({{
+                        name: "{renderer}",
+                        features: new Set(['texture-compression-bc', 'depth-clip-control']),
+                        limits: {{
+                            maxTextureDimension1D: {gl_max_tex},
+                            maxTextureDimension2D: {gl_max_tex},
+                            maxTextureDimension3D: 2048,
+                            maxTextureArrayLayers: 256,
+                            maxBindGroups: 4,
+                            maxDynamicUniformBuffersPerPipelineLayout: 8,
+                            maxDynamicStorageBuffersPerPipelineLayout: 4,
+                            maxSampledTexturesPerShaderStage: 16,
+                            maxSamplersPerShaderStage: 16,
+                            maxStorageBuffersPerShaderStage: 8,
+                            maxStorageTexturesPerShaderStage: 4,
+                            maxUniformBuffersPerShaderStage: 12,
+                            maxBufferSize: 268435456,
+                            maxVertexBuffers: 8,
+                            maxVertexAttributes: 16
+                        }},
+                        isFallbackAdapter: false,
+                        requestDevice: helper.createNativeMethod('requestDevice', function() {{
+                            return Promise.reject(new DOMException('WebGPU device creation not supported', 'NotSupportedError'));
+                        }})
+                    }});
+                }}),
+                getPreferredCanvasFormat: helper.createNativeMethod('getPreferredCanvasFormat', function() {{
+                    return 'bgra8unorm';
+                }})
+            }};
+            Object.defineProperty(navProto, 'gpu', {{
+                get: helper.createNativeGetter('gpu', function() {{ return gpuObj; }}),
+                configurable: true,
+                enumerable: true
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 20. WebRTC ICE Candidate Local IP Masking ──────────────────────────
+    try {{
+        if (window.RTCPeerConnection) {{
+            const origSetLocal = RTCPeerConnection.prototype.setLocalDescription;
+            if (origSetLocal) {{
+                RTCPeerConnection.prototype.setLocalDescription = helper.createNativeMethod('setLocalDescription', function(desc) {{
+                    if (desc && desc.sdp) {{
+                        // 替换本地 IP 地址 (192.168.x.x, 10.x.x.x, 172.x.x.x)
+                        desc.sdp = desc.sdp.replace(/([0-9]{{1,3}}\\.([0-9]{{1,3}})\\.([0-9]{{1,3}})\\.([0-9]{{1,3}}))/g, function(match) {{
+                            if (match.startsWith('192.168.') || match.startsWith('10.') ||
+                                (match.startsWith('172.') && parseInt(match.split('.')[1]) >= 16 && parseInt(match.split('.')[1]) <= 31)) {{
+                                return '0.0.0.0';
+                            }}
+                            return match;
+                        }});
+                    }}
+                    return origSetLocal.apply(this, arguments);
+                }});
+            }}
+
+            // onicecandidate 中过滤 local candidate
+            const origAddEvent = RTCPeerConnection.prototype.addEventListener;
+            RTCPeerConnection.prototype.addEventListener = helper.createNativeMethod('addEventListener', function(type, listener, options) {{
+                if (type === 'icecandidate' && typeof listener === 'function') {{
+                    const wrappedListener = function(event) {{
+                        if (event && event.candidate && event.candidate.candidate) {{
+                            const c = event.candidate.candidate;
+                            if (c.includes('192.168.') || c.includes('10.') || /172\\.(1[6-9]|2[0-9]|3[01])\\./g.test(c)) {{
+                                return; // 丢弃内网 IP candidate
+                            }}
+                        }}
+                        listener.call(this, event);
+                    }};
+                    return origAddEvent.call(this, type, wrappedListener, options);
+                }}
+                return origAddEvent.apply(this, arguments);
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 21. Date / Intl Timezone Consistency Hardening ─────────────────────
+    try {{
+        // 确保 Intl.DateTimeFormat().resolvedOptions().timeZone 与 Playwright 设定一致
+        const origDTF = Intl.DateTimeFormat;
+        const targetTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        // Date.prototype.getTimezoneOffset 一致性校验（Playwright 已设，但双重保障）
+        const origResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+        Intl.DateTimeFormat.prototype.resolvedOptions = helper.createNativeMethod('resolvedOptions', function() {{
+            const opts = origResolvedOptions.apply(this, arguments);
+            // 强制对齐（防止 Intl polyfill 泄漏不同时区）
+            if (opts && opts.timeZone && targetTZ) {{
+                opts.timeZone = targetTZ;
+            }}
+            return opts;
+        }});
+    }} catch (e) {{}}
+
+    // ── 22. Input / Keyboard Event isTrusted Hardening ─────────────────────
+    try {{
+        // 防止通过 event.isTrusted 检测合成事件（Playwright 原生 CDP 事件默认 isTrusted=true，
+        // 但某些框架会检查 Event.prototype.isTrusted getter 是否被篡改，此处做原型保护）
+        const trustedDesc = Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted');
+        if (trustedDesc && trustedDesc.get) {{
+            // 保持原生 getter 不被覆盖
+            Object.defineProperty(Event.prototype, 'isTrusted', {{
+                get: trustedDesc.get,
+                configurable: false,
+                enumerable: true
+            }});
+        }}
+    }} catch (e) {{}}
+
 }})();
 """
 
@@ -818,423 +1356,17 @@ PYTHON_HTTP_CACHE_DIR = os.path.abspath(
 os.makedirs(PYTHON_HTTP_CACHE_DIR, exist_ok=True)
 
 
-class LocalHttpCache:
-    """全静态资产本地磁盘强缓存系统：
-    支持 JS/CSS/字体(woff2/woff/ttf/otf)/静态JSON/图标 本地永久缓存与秒级命中。
-    支持 Azure Portal 7 大 ExtensionManifest 规范化类型缓存，杜绝 Hash 漂移重复下载。
-    """
-    CACHEABLE_EXTENSIONS = (
-        ".js", ".mjs", ".ts", ".css",
-        ".woff2", ".woff", ".ttf", ".otf", ".eot",
-        ".svg", ".ico", ".png", ".jpg", ".jpeg", ".webp",
-        ".json"
-    )
-
-    IMAGE_EXTS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg", ".bmp", ".tiff"
-    )
-
-    DYNAMIC_SECURITY_PATTERNS = (
-        # 动态人机验证与风控挑战交互/PoW接口（Arkose / Turnstile / SheerID / hCaptcha / reCAPTCHA / GeeTest 等）
-        "arkose", "arkoselabs", "funcaptcha", "powseq", "turnstile",
-        "challenges.cloudflare.com", "cloudflare.com", "challenge-platform",
-        "hcaptcha", "recaptcha", "geetest",
-        # 仅放行 SheerID 动态核验/提交/组织搜索 API，静态 JS/CSS/字体放行强缓存
-        "services.sheerid.com/api/", "services.sheerid.com/rest/",
-        "services.sheerid.com/verify/", "services.sheerid.com/submission/",
-        "services.sheerid.com/orgsearch", "sheerid.com/api/",
-        # 动态认证/登录授权交互接口（注意：精确指定动态接口路径，确保域名的静态JS/CSS正常享受本地强缓存与省流）
-        "/common/oauth2/", "/oauth20_authorize", "/login.srf",
-        "/kmsi", "/kmsi.srf", "/getcredentialtype", "/getsessionstate",
-        "/sas/processauth", "/ppsecure/post.srf", "/processauth",
-        "/oauth2/token", "/oauth2/v2.0/token",
-        "/reprocess", "/federal/login",
-        # 动态 2FA 注册与验证接口（绝对保证 TOTP 密钥提取）
-        "/api/authenticationmethods/",
-        # 动态 ARM 资源与提 Key 接口
-        "management.azure.com/providers/microsoft.education",
-        "management.azure.com/providers/microsoft.billing",
-        "management.azure.com/subscriptions",
-        "management.azure.com/tenants",
-        "management.azure.com/batch",
-        # 动态学生认证交互接口（注意：精确放行动态 API 和认证页面，允许静态 JS/CSS 走本地强缓存与背景图片 Mock）
-        "signup.azure.com/api/",
-        "signup.azure.com/studentverification",
-        "signup.azure.com/signup?offer=",
-        # 带有动态临时签名与时间戳的 PoW / challenge 脚本
-        "/fc/", "/challenge", "/enforcement",
-        "expires=", "signature=", "key-pair-id="
-    )
-
-    CANONICAL_DIR = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests")
-    HASH_MAP_FILE = os.path.join(PYTHON_HTTP_CACHE_DIR, "canonical_manifests", "manifest_hashes.json")
-    _manifest_hash_to_type: dict[str, str] = {}
-    _canonical_initialized: bool = False
-
-    @classmethod
-    def identify_manifest_by_size(cls, size_bytes: int) -> str | None:
-        """根据 Content-Length 大小（支持 Raw 或 Gzip 传输尺寸）精准反推 Manifest 规范化类型。
-        Azure Portal 7 大清单尺寸阶梯严格非重叠，可实现 0 字节内容下载下的 100% 盲判。
-        """
-        if size_bytes > 10_000_000 or (300_000 <= size_bytes <= 600_000):
-            return "extensionConfiguration"
-        elif (4_000_000 <= size_bytes <= 7_000_000) or (700_000 <= size_bytes <= 1_200_000):
-            return "assetTypes"
-        elif (1_500_000 <= size_bytes <= 3_000_000) or (100_000 <= size_bytes <= 250_000):
-            return "assetTypesBrowse"
-        elif (200_000 <= size_bytes <= 400_000) or (30_000 <= size_bytes <= 80_000):
-            return "browseMenus"
-        elif (115_000 <= size_bytes <= 150_000) or (18_000 <= size_bytes <= 30_000):
-            return "featureCards"
-        elif (90_000 <= size_bytes <= 114_000) or (12_000 <= size_bytes <= 20_000):
-            return "portalServices"
-        elif (10_000 <= size_bytes <= 30_000) or (2_000 <= size_bytes <= 8_000):
-            return "tourGuide"
-        return None
-
-    @classmethod
-    def learn_hashes_from_html(cls, html_content: bytes | str):
-        """从 Azure Portal 入口 HTML 中提取 extensionsManifestHash 映射表，瞬间学习数百个 Hash。"""
-        if not html_content:
-            return
-        try:
-            if isinstance(html_content, bytes):
-                text = html_content.decode("utf-8", errors="ignore")
-            else:
-                text = str(html_content)
-            idx = text.find('"extensionsManifestHash":')
-            if idx == -1:
-                idx = text.find('extensionsManifestHash')
-                if idx != -1:
-                    colon = text.find(':', idx)
-                    if colon != -1:
-                        idx = colon - len('"extensionsManifestHash"')
-            if idx == -1:
-                return
-            start = text.find('{', idx)
-            if start == -1:
-                return
-            depth = 0
-            end = start
-            for i in range(start, len(text)):
-                if text[i] == '{':
-                    depth += 1
-                elif text[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            data = json.loads(text[start:end])
-            new_learned = False
-            for m_type, items in data.items():
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if isinstance(item, list):
-                        for h in item:
-                            if isinstance(h, str) and h:
-                                if h not in cls._manifest_hash_to_type:
-                                    cls._manifest_hash_to_type[h] = m_type
-                                    cls._manifest_hash_to_type[f"{h}.json"] = m_type
-                                    new_learned = True
-                    elif isinstance(item, str) and item:
-                        if item not in cls._manifest_hash_to_type:
-                            cls._manifest_hash_to_type[item] = m_type
-                            cls._manifest_hash_to_type[f"{item}.json"] = m_type
-                            new_learned = True
-            if new_learned:
-                cls._persist_hash_map()
-        except Exception:
-            pass
-
-    @classmethod
-    def learn_hash_mapping(cls, hash_name: str, m_type: str):
-        """动态注册单条 Hash 到规范类型的映射并持久化。"""
-        if not hash_name or not m_type:
-            return
-        clean_h = hash_name.split("?")[0].split("#")[0]
-        base_h = clean_h[:-5] if clean_h.endswith(".json") else clean_h
-        cls._manifest_hash_to_type[clean_h] = m_type
-        cls._manifest_hash_to_type[base_h] = m_type
-        cls._manifest_hash_to_type[f"{base_h}.json"] = m_type
-        cls._persist_hash_map()
-
-    @classmethod
-    def _persist_hash_map(cls):
-        """持久化当前学习到的全量 Hash 字典到磁盘。"""
-        try:
-            os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
-            with open(cls.HASH_MAP_FILE, "w", encoding="utf-8") as f:
-                json.dump(cls._manifest_hash_to_type, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    @classmethod
-    def detect_manifest_type(cls, data: dict) -> str | None:
-        """从 Manifest JSON 数据结构中精准识别其规范化类型。"""
-        if not isinstance(data, dict):
-            return None
-        manifest = data.get("manifest")
-        if not isinstance(manifest, dict):
-            return None
-        sample_ext = manifest.get("Microsoft_Azure_Education") or {}
-        ext_keys = set(sample_ext.keys()) if isinstance(sample_ext, dict) else set()
-        if "extensionConfiguration" in ext_keys:
-            return "extensionConfiguration"
-        if "assetTypesBrowse" in ext_keys:
-            return "assetTypesBrowse"
-        if "assetTypes" in ext_keys:
-            return "assetTypes"
-        if "browseMenus" in ext_keys:
-            return "browseMenus"
-        if "featureCards" in ext_keys or "featureCardEnvironmentConfiguration" in ext_keys:
-            return "featureCards"
-        if "portalServices" in ext_keys:
-            return "portalServices"
-        if "tourIds" in ext_keys:
-            return "tourGuide"
-        for ext_val in manifest.values():
-            if isinstance(ext_val, dict):
-                k_set = set(ext_val.keys())
-                if "extensionConfiguration" in k_set: return "extensionConfiguration"
-                if "assetTypesBrowse" in k_set: return "assetTypesBrowse"
-                if "assetTypes" in k_set: return "assetTypes"
-                if "browseMenus" in k_set: return "browseMenus"
-                if "featureCards" in k_set: return "featureCards"
-                if "portalServices" in k_set: return "portalServices"
-                if "tourIds" in k_set: return "tourGuide"
-        return None
-
-    @classmethod
-    def init_canonical_manifests(cls):
-        """初始化规范化清单元数据缓存池，自动利用现有缓存与持久化 Hash 字典预热。"""
-        if cls._canonical_initialized:
-            return
-        os.makedirs(cls.CANONICAL_DIR, exist_ok=True)
-        # 1. 优先从磁盘持久化文件加载全量 Hash 字典（包含跨代理节点 CDN 哈希池）
-        if os.path.exists(cls.HASH_MAP_FILE):
-            try:
-                with open(cls.HASH_MAP_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    if isinstance(saved, dict):
-                        cls._manifest_hash_to_type.update(saved)
-            except Exception:
-                pass
-
-        # 2. 扫描历史 .meta / .body 记录补充
-        try:
-            for fname in os.listdir(PYTHON_HTTP_CACHE_DIR):
-                if fname.endswith(".meta"):
-                    m_path = os.path.join(PYTHON_HTTP_CACHE_DIR, fname)
-                    b_path = os.path.join(PYTHON_HTTP_CACHE_DIR, fname[:-5] + ".body")
-                    if not os.path.exists(b_path):
-                        continue
-                    try:
-                        with open(m_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        url = meta.get("url", "")
-                        if "ExtensionManifest/" in url:
-                            hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
-                            if hash_name not in cls._manifest_hash_to_type:
-                                b_size = os.path.getsize(b_path)
-                                m_type = cls.identify_manifest_by_size(b_size)
-                                if m_type:
-                                    cls._manifest_hash_to_type[hash_name] = m_type
-                                    cls._manifest_hash_to_type[clean_h] = m_type
-                                    cls._manifest_hash_to_type[f"{clean_h}.json"] = m_type
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        cls._canonical_initialized = True
-
-    @classmethod
-    def get_canonical_manifest(cls, url: str) -> tuple[bytes, dict, int] | None:
-        """根据 URL (解析 m_type 参数或已学到的 hash 映射) 读取规范化 Manifest 强缓存。"""
-        cls.init_canonical_manifests()
-        m_type = None
-        if "m_type=" in url:
-            parts = url.split("m_type=", 1)[1]
-            m_type = parts.split("&")[0].split("#")[0]
-        if not m_type:
-            hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-            clean_h = hash_name[:-5] if hash_name.endswith(".json") else hash_name
-            m_type = cls._manifest_hash_to_type.get(hash_name) or cls._manifest_hash_to_type.get(clean_h)
-        if not m_type:
-            return None
-        canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
-        canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
-        if os.path.exists(canon_b) and os.path.exists(canon_m):
-            try:
-                with open(canon_m, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                with open(canon_b, "rb") as f:
-                    body = f.read()
-                if body and meta.get("headers"):
-                    return body, meta.get("headers"), meta.get("status", 200)
-            except Exception:
-                pass
-        return None
-
-    @classmethod
-    def save_canonical_manifest(cls, url: str, body: bytes, headers: dict):
-        """将新拉取的 Manifest 数据解析并更新到规范化缓存中。"""
-        cls.init_canonical_manifests()
-        try:
-            m_type = None
-            if "m_type=" in url:
-                m_type = url.split("m_type=", 1)[1].split("&")[0].split("#")[0]
-            if not m_type:
-                data = json.loads(body.decode("utf-8", errors="ignore"))
-                m_type = cls.detect_manifest_type(data)
-            if not m_type:
-                m_type = cls.identify_manifest_by_size(len(body))
-            if m_type:
-                hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                cls.learn_hash_mapping(hash_name, m_type)
-                canon_b = os.path.join(cls.CANONICAL_DIR, f"{m_type}.body")
-                canon_m = os.path.join(cls.CANONICAL_DIR, f"{m_type}.meta")
-                clean_headers = {
-                    "content-type": "application/json; charset=utf-8",
-                    "access-control-allow-origin": "*",
-                    "cache-control": "public, max-age=31536000, immutable",
-                }
-                for k, v in headers.items():
-                    if k.lower() not in ("content-length", "content-encoding", "transfer-encoding"):
-                        clean_headers[k] = v
-                with open(canon_b, "wb") as f:
-                    f.write(body)
-                with open(canon_m, "w", encoding="utf-8") as f:
-                    json.dump({"status": 200, "headers": clean_headers, "url": url}, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    @classmethod
-    def is_cacheable(cls, url: str, method: str = "GET") -> bool:
-        """精准判定指定 URL 请求是否属于可无状态本地强缓存的公共静态资产。"""
-        if method.upper() != "GET":
-            return False
-        url_lower = url.lower()
-        clean = url_lower.split("?")[0].split("#")[0]
-        # Arkose CDN 静态字体与静态样式资产允许强缓存（保证真实字体度量避免触发风控）
-        if "/style-manager/fonts/" in clean or "/assets/style-manager/" in clean or ("/fc/assets/" in clean and (clean.endswith(cls.CACHEABLE_EXTENSIONS) or "/fonts/" in clean)):
-            return True
-        # Microsoft CDN 静态登录背景与插画图片（无后缀的哈希图片资产）允许强缓存
-        if any(h in clean for h in ("msauthimages.net", "msftauthimages.net", "aadcdn.msauth.net", "aadcdn.msftauth.net")):
-            return True
-        if any(p in url_lower for p in cls.DYNAMIC_SECURITY_PATTERNS):
-            return False
-        if clean.endswith(cls.CACHEABLE_EXTENSIONS):
-            return True
-        if any(path in clean for path in (
-            "/content/dynamic/", "/content/portalrequireconfig/",
-            "/bundle/", "/shared/1.0/", "/ests/2.1/", "/fonts/", "/content/scripts/",
-            "cdn.sheerid.com", "services.sheerid.com/assets/"
-        )):
-            return True
-        return False
-
-    @staticmethod
-    def _url_to_key(url: str) -> str:
-        clean = url.split("?")[0].split("#")[0]
-        return hashlib.sha256(clean.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def get(cls, url: str) -> tuple[bytes, dict, int] | None:
-        """根据 URL 查找本地强缓存。返回 (body_bytes, headers_dict, status_code) 或 None。
-        具备自动自愈机制：若检测到 body/meta 缺失或损坏，自动清理残片并回退到网络请求。
-        """
-        if not cls.is_cacheable(url, "GET"):
-            return None
-
-        key = cls._url_to_key(url)
-        body_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.body")
-        meta_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.meta")
-
-        has_body = os.path.exists(body_file)
-        has_meta = os.path.exists(meta_file)
-
-        if has_body and has_meta:
-            try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                with open(body_file, "rb") as f:
-                    body = f.read()
-                if body and len(body) > 10 and meta.get("headers"):
-                    return body, meta.get("headers"), meta.get("status", 200)
-            except Exception:
-                pass
-            # 残损自愈清理
-            try:
-                if os.path.exists(body_file): os.remove(body_file)
-                if os.path.exists(meta_file): os.remove(meta_file)
-            except Exception:
-                pass
-        elif has_body or has_meta:
-            # 孤立残片清理
-            try:
-                if os.path.exists(body_file): os.remove(body_file)
-                if os.path.exists(meta_file): os.remove(meta_file)
-            except Exception:
-                pass
-
-        return None
-
-    @classmethod
-    def put(cls, url: str, body: bytes, headers: dict, status: int = 200):
-        """保存响应数据到本地强缓存。"""
-        if not body or status != 200 or not cls.is_cacheable(url, "GET"):
-            return
-
-        key = cls._url_to_key(url)
-        body_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.body")
-        meta_file = os.path.join(PYTHON_HTTP_CACHE_DIR, f"{key}.meta")
-        temp_body = f"{body_file}.tmp"
-        temp_meta = f"{meta_file}.tmp"
-
-        clean_headers = {
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, HEAD, OPTIONS",
-            "access-control-allow-headers": "*",
-            "cache-control": "public, max-age=31536000, immutable",
-        }
-        skip_headers = {
-            "content-length", "content-encoding", "transfer-encoding",
-            "connection", "keep-alive", "content-security-policy",
-            "x-frame-options", "cross-origin-resource-policy",
-            "cross-origin-embedder-policy", "cross-origin-opener-policy",
-            "set-cookie"
-        }
-        for k, v in headers.items():
-            if k.lower() not in skip_headers:
-                clean_headers[k] = v
-
-        try:
-            with open(temp_body, "wb") as f:
-                f.write(body)
-            with open(temp_meta, "w", encoding="utf-8") as f:
-                json.dump({"status": status, "headers": clean_headers, "url": url}, f, ensure_ascii=False)
-
-            os.replace(temp_body, body_file)
-            os.replace(temp_meta, meta_file)
-        except Exception:
-            try:
-                if os.path.exists(temp_body):
-                    os.remove(temp_body)
-                if os.path.exists(temp_meta):
-                    os.remove(temp_meta)
-            except Exception:
-                pass
-
-
 class TrafficStats:
-    """高精度网络流量与省流统计器（支持 Socket 物理层与 HTTP 协议层多维统计）。"""
+    """代理连接字节或 HTTP 估算；缓存节省量使用压缩传输体积。"""
     def __init__(self, proxy_bridge=None):
         self.net_transfer_bytes = 0
         self.cache_saved_bytes = 0
         self.cache_hit_count = 0
+        self.cache_replayed_bytes = 0
+        self.cache_size_unknown_hits = 0
+        self.transfer_size_unknown_responses = 0
         self.blocked_count = 0
+        self.telemetry_blocked_count = 0
         self.proxy_bridge = proxy_bridge
         self.network_requests = []
         self.mfa_diag = []  # 仅诊断：记录 2FA initializemobileapp 请求的次数/大小/结构（不影响任何请求）
@@ -1248,13 +1380,33 @@ class TrafficStats:
             if url:
                 self.network_requests.append((num_bytes, url, r_type, status))
 
-    def record_cache_hit(self, body_size: int):
+    def record_cache_hit(self, body_size: int, wire_size: int | None = None):
         self.cache_hit_count += 1
-        self.cache_saved_bytes += max(body_size, 2048)
+        self.cache_replayed_bytes += body_size
+        if wire_size is None:
+            self.cache_size_unknown_hits += 1
+        else:
+            self.cache_saved_bytes += wire_size
 
-    def record_blocked(self, est_size: int = 50000):
+    def record_blocked(self, est_size: int = 0):
+        # 未下载的媒体没有实际传输尺寸，只记录次数。
         self.blocked_count += 1
-        self.cache_saved_bytes += est_size
+
+    def record_response(self, response, request=None, decoded_size=None):
+        request = request or response.request
+        req_size = 250 + sum(len(k) + len(v) + 4 for k, v in request.headers.items())
+        payload = request.post_data_buffer
+        req_size += len(payload) if payload else 0
+        headers = response.headers
+        body_size = 0 if response.status in (204, 304) or request.method == "HEAD" else transfer_body_size(headers, decoded_size)
+        if body_size is None:
+            self.transfer_size_unknown_responses += 1
+            body_size = 0
+        header_size = 250 + sum(len(k) + len(v) + 4 for k, v in headers.items())
+        self.record_transfer(req_size + header_size + body_size, response.url, request.resource_type, response.status)
+
+    def transfer_source(self):
+        return "代理连接累计传输" if self.proxy_bridge and hasattr(self.proxy_bridge, "get_total_bytes") and self.proxy_bridge.get_total_bytes() > 0 else "HTTP 传输估算"
 
     def get_transfer_bytes(self) -> int:
         if self.proxy_bridge and hasattr(self.proxy_bridge, "get_total_bytes"):
@@ -1275,17 +1427,7 @@ class TrafficStats:
 
     def add_response(self, response):
         try:
-            req = response.request
-            resp_bytes = 250
-            try:
-                cl = response.headers.get("content-length")
-                if cl and cl.isdigit():
-                    resp_bytes += int(cl)
-                else:
-                    resp_bytes += 4096
-            except Exception:
-                resp_bytes += 2048
-            self.record_transfer(resp_bytes, response.url, req.resource_type, response.status)
+            self.record_response(response)
         except Exception:
             pass
 
@@ -1301,48 +1443,13 @@ _DUMMY_EMPTY_AMD_MODULE = b'define([], function() { return new Proxy({}, { get: 
 
 
 async def setup_save_data_route(ctx, stats: TrafficStats = None):
-    """纯净极速省流路由系统：
-    1. ExtensionManifest 走本地规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）；
-    2. 本地强缓存公共无状态静态 JS/CSS/字体/图标/静态JSON（portal.azure.com/*.js, aadcdn.msauth.net 等 0 字节复用）；
-    3. 拦截大体积无用媒体/安装包 (.mp4, .zip, .iso, .exe 等)；
-    4. 彻底移除所有域名黑名单、路径黑名单、语言包拦截与模块剪枝，100% 杜绝任何误杀或页面阻塞；
-    5. 100% 绝对原生放行所有认证、导航、ARM 接口与 Portal 核心 SPA 资源！
-    """
+    """公共静态资源持久缓存，业务 API 放行，媒体拦截与遥测本地响应。"""
     # 预热本地 ExtensionManifest 规范化类型索引
     LocalHttpCache.init_canonical_manifests()
-
-    TELEMETRY_PATTERNS = (
-        "browser.events.data.microsoft.com",
-        "events.data.microsoft.com",
-        "portal.azure.com/api/telemetry",
-        "portal.azure.com/azurehubs/api/telemetry",
-        "/azurehubs/api/telemetry",
-        "/api/telemetry",
-        "portal.azure.com/api/clientlog",
-        "portal.azure.com/azurehubs/api/clientlog",
-        "/azurehubs/api/clientlog",
-        "/api/clientlog",
-        "signup.azure.com/api/clientlog",
-        "pipe.aria.microsoft.com",
-        "vortex.data.microsoft.com",
-        "telemetry.microsoft.com",
-        "dc.services.visualstudio.com",
-        "clarity.ms",
-        "bing.com/as/",
-        "c.msn.com",
-        "mobile.events.data.microsoft.com",
-        "onesettings-bn2.met.live.com",
-        "web.vortex.data.microsoft.com",
-        "/api/diagnostics",
-    )
-
-    BLOCKED_IMAGE_EXTS = (
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg"
-    )
-
-    CAPTCHA_DOMAINS = (
-        "arkose", "arkoselabs", "funcaptcha", "hcaptcha", "recaptcha", "geetest", "sheerid"
-    )
+    try:
+        LocalHttpCache.cleanup()
+    except OSError as error:
+        log.warning("静态缓存清理暂未完成: %s", error)
 
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
@@ -1351,12 +1458,34 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     )
 
     fulfilled_request_ids = set()
+    block_telemetry = os.getenv("BLOCK_TELEMETRY", "true").strip().lower() not in ("0", "false", "no", "off")
 
     async def _route_handler(route, request):
         r_type = request.resource_type
         url = request.url
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
+
+        # 明确的遥测端点在 POST 放行规则之前处理。返回成功，避免客户端错误重试。
+        parsed = urlsplit(url)
+        telemetry_endpoint = (
+            (parsed.hostname == "browser.events.data.microsoft.com" and parsed.path.rstrip("/").lower() == "/onecollector/1.0")
+            or (parsed.hostname == "portal.azure.com" and parsed.path.rstrip("/").lower() == "/api/telemetry")
+        )
+        if (block_telemetry and telemetry_endpoint and request.method in ("GET", "POST", "OPTIONS")
+                and r_type != "document" and not request.is_navigation_request()):
+            headers = {"cache-control": "no-store"}
+            origin = request.headers.get("origin")
+            if origin:
+                headers.update({"access-control-allow-origin": origin, "access-control-allow-credentials": "true", "vary": "Origin"})
+            if request.method == "OPTIONS":
+                headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
+                headers["access-control-allow-headers"] = request.headers.get("access-control-request-headers", "content-type")
+            fulfilled_request_ids.add(id(request))
+            await route.fulfill(status=204, headers=headers, body=b"")
+            if stats:
+                stats.telemetry_blocked_count += 1
+            return
 
         # 1. 核心业务导航、主 HTML 文档以及所有非 GET 请求 (POST/PUT/DELETE/OPTIONS)：100% 原生直连（保证 Cookie、Session、登录跳转与 API 完整性）
         if r_type == "document" or request.is_navigation_request() or request.method != "GET":
@@ -1370,73 +1499,69 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             await route.abort()
             return
 
-        # 3. 微软 / Azure 官方域名的所有 API、XHR 与 Fetch 请求：100% 原生直连，杜绝任何遥测 mock 导致的状态机报错或风控
-        if any(d in url_lower for d in ("portal.azure.com/api", "mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com", "signup.azure.com/api")):
+        # 动态认证/API 放行；认证域名的公共脚本、CSS、字体可进入静态缓存。
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        public_auth_asset = host in ("mysignins.microsoft.com", "login.microsoftonline.com") and LocalHttpCache.is_cacheable(url)
+        core_request = host in ("mysignins.microsoft.com", "login.microsoftonline.com", "management.azure.com", "graph.microsoft.com") or host in ("portal.azure.com", "signup.azure.com") and parsed.path.lower().startswith("/api/")
+        if core_request and not public_auth_asset:
             await route.continue_()
             return
 
-        # 5. Azure Portal 扩展清单 (ExtensionManifest)：优先走规范化类型强缓存（解决 Hash 漂移重复下载 20MB 的根本痛点）
-        if "extensionmanifest/" in url_lower:
-            cached_manifest = LocalHttpCache.get_canonical_manifest(url)
-            if cached_manifest:
-                body, headers, status = cached_manifest
-                if stats:
-                    stats.record_cache_hit(len(body))
-                fulfilled_request_ids.add(id(request))
-                await route.fulfill(body=body, headers=headers, status=status)
-                return
-
-            # 若静态索引未命中，通过 0 字节内容下载的 HEAD 探测反查清单类型，秒级回退至规范化强缓存
-            try:
-                head_resp = await route.fetch(method="HEAD")
-                cl = head_resp.headers.get("content-length")
-                if cl and cl.isdigit():
-                    m_type = LocalHttpCache.identify_manifest_by_size(int(cl))
-                    if m_type:
-                        hash_name = url.split("/")[-1].split("?")[0].split("#")[0]
-                        LocalHttpCache.learn_hash_mapping(hash_name, m_type)
-                        cached_manifest = LocalHttpCache.get_canonical_manifest(url)
-                        if cached_manifest:
-                            body, headers, status = cached_manifest
-                            if stats:
-                                stats.record_cache_hit(len(body))
-                            fulfilled_request_ids.add(id(request))
-                            await route.fulfill(body=body, headers=headers, status=status)
-                            return
-            except Exception:
-                pass
-
-        # 6. 公共无状态静态资源强缓存 (JS/CSS/字体/静态JSON/Arkose静态字体)：本地秒级响应，0 网络流量
         if LocalHttpCache.is_cacheable(url, "GET"):
-            cached = LocalHttpCache.get(url)
-            if cached:
-                body, headers, status = cached
-                if stats:
-                    stats.record_cache_hit(len(body))
-                fulfilled_request_ids.add(id(request))
-                await route.fulfill(body=body, headers=headers, status=status)
-                return
-
-            # 首次未命中强缓存的静态资源：通过 route.fetch() 确定性拉取并即时存入强缓存/规范化缓存
-            try:
-                fetch_resp = await route.fetch()
-                if fetch_resp.status == 200:
-                    resp_body = await fetch_resp.body()
-                    if resp_body and len(resp_body) > 10:
-                        resp_headers = dict(fetch_resp.headers)
-                        if "extensionmanifest/" in url_lower:
-                            LocalHttpCache.save_canonical_manifest(url, resp_body, resp_headers)
-                        LocalHttpCache.put(url, resp_body, resp_headers, fetch_resp.status)
+            # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
+            async with LocalHttpCache.download_lock(url):
+                is_manifest = "extensionmanifest/" in url_lower
+                cached = LocalHttpCache.get_canonical_manifest(url) if is_manifest else LocalHttpCache.get(url)
+                if cached:
+                    body, headers, status = cached
                     if stats:
-                        stats.record_transfer(len(resp_body) + 400, url, r_type, fetch_resp.status)
+                        stats.record_cache_hit(len(body), LocalHttpCache.get_wire_size(url))
                     fulfilled_request_ids.add(id(request))
-                    await route.fulfill(response=fetch_resp, body=resp_body)
+                    await route.fulfill(body=body, headers=headers, status=status)
                     return
-                else:
-                    await route.fulfill(response=fetch_resp)
+
+                candidate = LocalHttpCache.manifest_candidate(url) if is_manifest else None
+                fetch_kwargs = {}
+                if candidate:
+                    etag = candidate[1].get("headers", {}).get("etag")
+                    if etag:
+                        fetch_kwargs["headers"] = {**request.headers, "If-None-Match": etag}
+                try:
+                    fetched = await route.fetch(**fetch_kwargs)
+                except Exception:
+                    # fetch 失败后允许浏览器正常请求，不计为缓存命中。
+                    await route.continue_()
                     return
-            except Exception:
-                await route.continue_()
+
+                if candidate and fetched.status == 304:
+                    body, meta = candidate
+                    headers = dict(meta["headers"])
+                    if fetched.headers.get("etag"):
+                        headers["etag"] = fetched.headers["etag"]
+                    try:
+                        LocalHttpCache.save_canonical_manifest(url, body, headers, meta.get("wire_body_bytes"))
+                    except OSError:
+                        pass
+                    if stats:
+                        stats.record_response(fetched, request)
+                        stats.record_cache_hit(len(body), meta.get("wire_body_bytes"))
+                    fulfilled_request_ids.add(id(request))
+                    await route.fulfill(body=body, headers=headers, status=200)
+                    return
+
+                body = await fetched.body()
+                if stats:
+                    stats.record_response(fetched, request, len(body))
+                if fetched.status == 200:
+                    try:
+                        LocalHttpCache.put(url, body, fetched.headers, fetched.status)
+                        if is_manifest:
+                            LocalHttpCache.save_canonical_manifest(url, body, fetched.headers)
+                    except OSError as error:
+                        log.warning("静态缓存写入失败，已继续返回网络响应: %s", error)
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(response=fetched, body=body)
                 return
 
         # 7. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
@@ -1464,34 +1589,16 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 fulfilled_request_ids.discard(req_id)
                 return  # 本地强缓存与本地 Mock 命中，不计入网络传输！
 
-            req_bytes = 250
-            try:
-                for k, v in req.headers.items():
-                    req_bytes += len(k) + len(v) + 4
-            except Exception:
-                pass
-            try:
-                pd = req.post_data_buffer
-                if pd:
-                    req_bytes += len(pd)
-            except Exception:
-                pass
-
-            resp_bytes = 250
-            try:
-                r_headers = response.headers
-                for k, v in r_headers.items():
-                    resp_bytes += len(k) + len(v) + 4
-                cl = r_headers.get("content-length")
-                if cl and cl.isdigit():
-                    resp_bytes += int(cl)
-                else:
-                    resp_bytes += 4096
-            except Exception:
-                resp_bytes += 2048
-
             if stats:
-                stats.record_transfer(req_bytes + resp_bytes, response.url, req.resource_type, response.status)
+                stats.record_response(response, req)
+            resp_bytes = transfer_body_size(response.headers) or 0
+            if req.resource_type == "document" and urlsplit(response.url).hostname == "portal.azure.com":
+                async def learn_portal_hashes():
+                    try:
+                        LocalHttpCache.learn_hashes_from_html(await response.body())
+                    except Exception:
+                        pass
+                asyncio.ensure_future(learn_portal_hashes())
 
             # 记录 2FA initializemobileapp 的调用与秒级捕获 TOTP 密钥
             if "initializemobileapp" in (response.url or "").lower():

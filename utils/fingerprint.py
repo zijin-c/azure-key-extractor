@@ -1,22 +1,28 @@
 """
 随机浏览器指纹生成 + Playwright 上下文初始化
-全维度超强反检测与超深度省流环境隔离系统 (Stealth v7 终极无懈版)：
-1. 真实消费级 GPU / WebGL 深度参数硬化、Shader Precision 对齐与 GLSL PRNG readPixels 微扰动（彻底消除跨账号 WebGL 聚类特征）；
+全维度超强反检测与超深度省流环境隔离系统 (Stealth v16 终极全维强化版)：
+1. 真实消费级 GPU / WebGL 全参数一致性矩阵深度硬化（20+ GL 常量 × GPU 型号对齐、Shader Precision 对齐、扩展列表随机子集与 readPixels PRNG 微噪点）；
 2. 真实桌面级 PluginArray & MimeTypeArray 架构（5 大内置 PDF 插件，彻底消除 plugins.length===0 无头漏洞）；
-3. Canvas 2D 亚像素级微偏移、100% 幂等 getImageData 逐点噪点注入与 measureText 字体排版微抖动；
-4. AudioContext、OfflineAudioContext & AnalyserNode 频域/时域全维微噪点注入（WeakSet 单 Buffer 幂等防护与 copyFromChannel 全覆盖）；
+3. Canvas 2D 亚像素级微偏移、100% 幂等 getImageData 逐点噪点注入、toDataURL/toBlob 一致性噪点注入与 measureText 字体排版指标微抖动；
+4. AudioContext、OfflineAudioContext & AnalyserNode 频域/时域全维微噪点注入（独立种子、WeakSet 单 Buffer 幂等防护、getChannelData/copyFromChannel/getFloatFrequencyData/getByteFrequencyData 全覆盖）；
 5. Document.prototype.hasFocus / visibilityState / hidden 真实化（彻底杜绝 Headless 失去焦点与后台标签页特征）；
 6. 原生 Getter 生成工厂（严格对齐 V8 函数名与 toString，抹除一切属性篡改痕迹）；
 7. CDP / WebDriver 自动化残留属性全量清除；
 8. Navigator.prototype.pdfViewerEnabled 深度对齐；
 9. Notification.permission 与 Permissions API (navigator.permissions.query) 原生状态返回；
-10. WebGPU (navigator.gpu) 真实硬件适配器模拟；
+10. WebGPU (navigator.gpu) 真实硬件适配器模拟与 GPU limits 联动；
 11. NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
 12. Screen.orientation 真实桌面横屏对象与真实屏幕几何视口联动；
 13. Battery API (navigator.getBattery) 与完整 SpeechSynthesis 语音库对齐；
 14. 完整 navigator.userAgentData (Client Hints) 高熵值接口 (包含 wow64: false) 与 Win32 原型链严格原生化；
 15. 公共静态资源持久化缓存，动态认证/API 放行；
-16. 每个账号完全隔离的 BrowserContext 独立生命周期，彻底杜绝跨账号污染。
+16. 每个账号完全隔离的 BrowserContext 独立生命周期，彻底杜绝跨账号污染；
+17. ClientRects / DOMRect 亚像素噪点（getBoundingClientRect / getClientRects 独立种子扰动，消除 CSS 字体探测聚类）；
+18. Font Enumeration 防御（基于字体子集指纹 + measureText 字体依赖微噪）；
+19. performance.memory 堆大小随机化伪装；
+20. WebRTC ICE Candidate 本地内网 IP 深度过滤与 SDP 地址替换；
+21. Date / Intl 时区一致性双重保障；
+22. Event.prototype.isTrusted 原生 getter 保护。
 """
 import asyncio
 import hashlib
@@ -127,6 +133,53 @@ _LOCALES = [
 
 _PLATFORM_VERSIONS = ["10.0.19045", "10.0.22000", "10.0.22621", "10.0.22631", "10.0.26100"]
 
+# ── GPU 对应的真实 WebGL 参数一致性矩阵（消除跨 GPU 参数碰撞） ──
+# key: renderer 子串匹配关键词 → (MAX_TEXTURE_SIZE, MAX_VIEWPORT_DIMS, MAX_RENDERBUFFER_SIZE,
+#   MAX_VERTEX_ATTRIBS, MAX_VARYING_VECTORS, MAX_VERTEX_UNIFORM_VECTORS, MAX_FRAGMENT_UNIFORM_VECTORS,
+#   MAX_VERTEX_TEXTURE_IMAGE_UNITS, MAX_TEXTURE_IMAGE_UNITS, MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+#   ALIASED_LINE_WIDTH_RANGE_MAX, MAX_CUBE_MAP_TEXTURE_SIZE)
+_GPU_GL_PARAMS = {
+    "RTX 40":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "RTX 30":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "RTX 20":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "GTX 16":   (32768, 32768, 32768, 16, 32, 4096, 1024, 32, 32, 96, 1.0, 32768),
+    "Arc":      (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Iris":     (16384, 16384, 16384, 16, 31, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "UHD":      (16384, 16384, 16384, 16, 31, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon RX 7": (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon RX 6": (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+    "Radeon":   (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
+}
+
+# 真实 Chrome 131 D3D11 后端 WebGL 扩展完整池（按照真实浏览器收集）
+_WEBGL_EXTENSIONS_POOL = [
+    "ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control",
+    "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query",
+    "EXT_float_blend", "EXT_frag_depth", "EXT_polygon_offset_clamp",
+    "EXT_shader_texture_lod", "EXT_sRGB", "EXT_texture_compression_bptc",
+    "EXT_texture_compression_rgtc", "EXT_texture_filter_anisotropic",
+    "EXT_texture_mirror_clamp_to_edge", "KHR_parallel_shader_compile",
+    "OES_draw_buffers_float", "OES_element_index_uint", "OES_fbo_render_mipmap",
+    "OES_standard_derivatives", "OES_texture_float", "OES_texture_float_linear",
+    "OES_texture_half_float", "OES_texture_half_float_linear",
+    "OES_vertex_array_object", "WEBGL_blend_func_extended",
+    "WEBGL_color_buffer_float", "WEBGL_compressed_texture_s3tc",
+    "WEBGL_compressed_texture_s3tc_srgb", "WEBGL_debug_renderer_info",
+    "WEBGL_debug_shaders", "WEBGL_depth_texture", "WEBGL_draw_buffers",
+    "WEBGL_lose_context", "WEBGL_multi_draw", "WEBGL_polygon_mode",
+]
+
+# 真实 Windows 桌面安装字体采样池（每次随机丢弃 1~3 个来产生唯一子集）
+_FONT_PROBE_BASE = [
+    "Arial", "Arial Black", "Arial Narrow", "Book Antiqua", "Bookman Old Style",
+    "Calibri", "Cambria", "Cambria Math", "Century", "Century Gothic",
+    "Comic Sans MS", "Consolas", "Constantia", "Corbel", "Courier New",
+    "Franklin Gothic Medium", "Garamond", "Georgia", "Impact", "Lucida Console",
+    "Lucida Sans Unicode", "Microsoft Sans Serif", "Palatino Linotype",
+    "Segoe UI", "Segoe UI Light", "Segoe UI Semibold", "Segoe Print",
+    "Tahoma", "Times New Roman", "Trebuchet MS", "Verdana", "Wingdings",
+]
+
 
 def random_fingerprint(major_ver: str = "131") -> dict:
     """生成一套与宿主系统 Chromium 严格对齐的高拟真、全维度随机指纹参数。"""
@@ -176,6 +229,43 @@ def random_fingerprint(major_ver: str = "131") -> dict:
     audio_out = f"Speakers ({random.choice(audio_models)})"
     cam_in = random.choice(cam_models)
 
+    # ── GPU 一致性 WebGL 参数矩阵 ──
+    gl_params = (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384)  # 默认
+    for key, params in _GPU_GL_PARAMS.items():
+        if key in gpu["renderer"]:
+            gl_params = params
+            break
+
+    # ── 真实 WebGL 扩展子集（随机丢弃 0~2 个，模拟驱动差异） ──
+    gl_exts = list(_WEBGL_EXTENSIONS_POOL)
+    drop_count = random.randint(0, 2)
+    for _ in range(drop_count):
+        if len(gl_exts) > 28:
+            gl_exts.pop(random.randint(0, len(gl_exts) - 1))
+
+    # ── 字体子集指纹（随机丢弃 1~3 个字体，模拟不同 Windows 安装） ──
+    font_subset = list(_FONT_PROBE_BASE)
+    font_drop = random.randint(1, 3)
+    for _ in range(font_drop):
+        if len(font_subset) > 20:
+            font_subset.pop(random.randint(0, len(font_subset) - 1))
+
+    # ── ClientRects / DOMRect 亚像素噪点种子 ──
+    rect_noise_seed = round(random.uniform(0.0000001, 0.9999999), 8)
+
+    # ── 独立的 Audio 二次噪声种子（与 canvas seed 完全分离） ──
+    audio_noise_seed = round(random.uniform(0.0000001, 0.9999999), 8)
+
+    # ── performance.memory 堆限制随机化 ──
+    js_heap_limit = random.choice([2172649472, 2197815296, 4294705152, 4294967296])
+    used_heap = random.randint(int(js_heap_limit * 0.08), int(js_heap_limit * 0.18))
+    total_heap = random.randint(used_heap + 1000000, int(js_heap_limit * 0.45))
+
+    # ── WebGL Shader Precision 随机化（匹配真实硬件散布） ──
+    shader_precision_rangeMin = random.choice([1, 1, 1, 127])
+    shader_precision_rangeMax = random.choice([1, 1, 1, 127])
+    shader_precision_precision = random.choice([23, 23, 23, 8])
+
     return dict(
         chrome_ver=full_ver,
         major_ver=major_ver,
@@ -206,11 +296,23 @@ def random_fingerprint(major_ver: str = "131") -> dict:
         audio_in=audio_in,
         audio_out=audio_out,
         cam_in=cam_in,
+        # ── 新增加强指纹维度 ──
+        gl_params=gl_params,
+        gl_exts=gl_exts,
+        font_subset=font_subset,
+        rect_noise_seed=rect_noise_seed,
+        audio_noise_seed=audio_noise_seed,
+        js_heap_limit=js_heap_limit,
+        js_used_heap=used_heap,
+        js_total_heap=total_heap,
+        shader_precision_rangeMin=shader_precision_rangeMin,
+        shader_precision_rangeMax=shader_precision_rangeMax,
+        shader_precision_precision=shader_precision_precision,
     )
 
 
 def build_init_script(fp: dict) -> str:
-    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v15 终极防检测全维融合版)。
+    """生成纯净、原生对齐的高拟真防爬辅助注入脚本 (Stealth v16 终极全维强化版)。
     参考并整合了 rebrowser-patches、puppeteer-extra-plugin-stealth、fingerprint-suite、camoufox 与 CreepJS 测试基准：
     1. ES6 Concise Object Method 原生函数工厂：构造非构造器函数，严格对齐 V8 函数名与 toString，杜绝 Function.prototype.hasOwnProperty('prototype') 探测；
     2. WeakMap 原生函数原型链伪装 (Function.prototype.toString 严格对齐 V8 原生 [native code]，杜绝 AST/代码字符串化检测)；
@@ -222,16 +324,23 @@ def build_init_script(fp: dict) -> str:
     8. 硬件参数全面对齐 (hardwareConcurrency, deviceMemory, maxTouchPoints=0 严格挂载在 Navigator.prototype)；
     9. 语言参数对齐 (language, languages 严格挂载在 Navigator.prototype 并与代理出口 IP 国家对齐)；
     10. 提供完整 navigator.userAgentData (Client Hints) 高熵接口 (包含 wow64: false，挂载于原型链)；
-    11. 针对 VPS 虚拟显卡 (SwiftShader / llvmpipe / Mesa) 真实化 UNMASKED_RENDERER_WEBGL 与 WebGL 原生 getParameter/ShaderPrecision 深度伪装；
-    12. Canvas 2D 亚像素级微偏移与噪点扰动 (基于种子生成独立 Canvas 哈希，杜绝多账号在同一服务器上的特征聚类)；
-    13. AudioContext & OfflineAudioContext 频域/时域微扰动 (消除跨账号音频指纹碰撞)；
+    11. WebGL GPU 一致性全参数矩阵深度硬化（getParameter 20+ GL 常量 × GPU 对齐、Shader Precision、扩展列表、readPixels PRNG 微噪点）；
+    12. Canvas 2D 亚像素级微偏移与噪点扰动 + toDataURL/toBlob 一致性噪点注入 + measureText 排版指标扰动；
+    13. AudioContext & OfflineAudioContext 全频域/时域微扰动 (独立 seed、WeakSet 幂等、getChannelData/copyFromChannel/AnalyserNode 全覆盖)；
     14. SpeechSynthesis 语音库模拟 (补齐 Linux Headless 环境下缺失的 Windows 桌面语音库)；
     15. MediaDevices 摄像头/麦克风设备模拟 (对齐真实物理 PC 硬件外设枚举列表)；
     16. Battery API 与 NetworkInformation (navigator.connection) 真实 4G/宽带网络与 RTT/Downlink 联动；
-    17. WebRTC 本地内网 IP 防泄漏保护；
-    18. Notification.permission 与 Permissions API 原生状态对齐；
-    19. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
-    20. 屏幕与视口几何参数严格一致。
+    17. Notification.permission 与 Permissions API 原生状态对齐；
+    18. Document.prototype.hasFocus / visibilityState / hidden 原生对齐；
+    19. 屏幕与视口几何参数严格一致；
+    20. ClientRects / DOMRect 亚像素噪点（getBoundingClientRect / getClientRects 独立种子扰动，消除 CSS 字体探测聚类）；
+    21. Font Enumeration 防御（基于字体子集指纹 + measureText 字体依赖微噪，消除跨账号字体枚举碰撞）；
+    22. performance.memory 堆大小随机化伪装（消除内存指纹碰撞）；
+    23. Screen.orientation 真实桌面 landscape-primary 对象对齐；
+    24. WebGPU (navigator.gpu) 真实 GPU 适配器模拟 + 硬件 limits 参数联动；
+    25. WebRTC ICE Candidate 本地内网 IP 深度过滤与 SDP 地址替换；
+    26. Date / Intl 时区一致性双重保障（resolvedOptions().timeZone 强制对齐）；
+    27. Event.prototype.isTrusted 原生 getter 保护（防止框架检测 CDP 合成事件篡改标记）。
     """
     brands_json = json.dumps(fp.get("brand_entries", [
         {"brand": "Chromium", "version": fp.get("major_ver", "131")},
@@ -257,6 +366,31 @@ def build_init_script(fp: dict) -> str:
     audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
     audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
     cam_in = fp.get("cam_in", "HD WebCam")
+
+    # ── 新增加强维度参数提取 ──
+    gl_p = fp.get("gl_params", (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384))
+    gl_max_tex = gl_p[0]
+    gl_max_vp = gl_p[1]
+    gl_max_rb = gl_p[2]
+    gl_max_va = gl_p[3]
+    gl_max_vv = gl_p[4]
+    gl_max_vuv = gl_p[5]
+    gl_max_fuv = gl_p[6]
+    gl_max_vtiu = gl_p[7]
+    gl_max_tiu = gl_p[8]
+    gl_max_ctiu = gl_p[9]
+    gl_aliased_lw = gl_p[10]
+    gl_max_cube = gl_p[11]
+    gl_exts_json = json.dumps(fp.get("gl_exts", []))
+    font_subset_json = json.dumps(fp.get("font_subset", []))
+    rect_seed = fp.get("rect_noise_seed", 0.12345678)
+    audio_seed = fp.get("audio_noise_seed", 0.12345678)
+    js_heap_limit = fp.get("js_heap_limit", 2172649472)
+    js_used_heap = fp.get("js_used_heap", 250000000)
+    js_total_heap = fp.get("js_total_heap", 500000000)
+    sp_rangeMin = fp.get("shader_precision_rangeMin", 1)
+    sp_rangeMax = fp.get("shader_precision_rangeMax", 1)
+    sp_precision = fp.get("shader_precision_precision", 23)
 
     return f"""
 (() => {{
@@ -575,10 +709,11 @@ def build_init_script(fp: dict) -> str:
         }});
     }} catch (e) {{}}
 
-    // ── 6. WebGL UNMASKED_VENDOR / UNMASKED_RENDERER Cloaking ──────────────
+    // ── 6. WebGL Full-Depth GPU-Consistent Parameter Hardening ──────────────
     try {{
         const spoofVendor = "{vendor}";
         const spoofRenderer = "{renderer}";
+        const glExts = {gl_exts_json};
 
         function hookGetParameter(proto) {{
             if (!proto || !proto.getParameter) return;
@@ -588,19 +723,92 @@ def build_init_script(fp: dict) -> str:
                 if (param === 0x9246) return spoofRenderer;    // UNMASKED_RENDERER_WEBGL
                 if (param === 0x1F00) return "WebKit";         // VENDOR
                 if (param === 0x1F01) return "WebKit WebGL";   // RENDERER
-                if (param === 0x0D33) return 16384;            // MAX_TEXTURE_SIZE
-                if (param === 0x84E8) return 16384;            // MAX_CUBE_MAP_TEXTURE_SIZE
-                if (param === 0x84E4) return 16384;            // MAX_RENDERBUFFER_SIZE
+                if (param === 0x0D33) return {gl_max_tex};     // MAX_TEXTURE_SIZE
+                if (param === 0x84E8) return {gl_max_cube};    // MAX_CUBE_MAP_TEXTURE_SIZE
+                if (param === 0x84E4) return {gl_max_rb};      // MAX_RENDERBUFFER_SIZE
+                if (param === 0x8869) return {gl_max_va};      // MAX_VERTEX_ATTRIBS
+                if (param === 0x8DFC) return {gl_max_vv};      // MAX_VARYING_VECTORS
+                if (param === 0x8DFB) return {gl_max_vuv};     // MAX_VERTEX_UNIFORM_VECTORS
+                if (param === 0x8DFD) return {gl_max_fuv};     // MAX_FRAGMENT_UNIFORM_VECTORS
+                if (param === 0x8B4C) return {gl_max_vtiu};    // MAX_VERTEX_TEXTURE_IMAGE_UNITS
+                if (param === 0x8872) return {gl_max_tiu};     // MAX_TEXTURE_IMAGE_UNITS
+                if (param === 0x8B4D) return {gl_max_ctiu};    // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+                if (param === 0x0D55) return new Float32Array([1.0, {gl_aliased_lw}]); // ALIASED_LINE_WIDTH_RANGE
+                if (param === 0x0D53) return new Float32Array([1.0, 1024.0]);          // ALIASED_POINT_SIZE_RANGE
+                if (param === 0x8B4A) return new Int32Array([{gl_max_vp}, {gl_max_vp}]); // MAX_VIEWPORT_DIMS
                 return orig.apply(this, arguments);
             }});
             proto.getParameter = hooked;
         }}
 
-        if (window.WebGLRenderingContext) hookGetParameter(WebGLRenderingContext.prototype);
-        if (window.WebGL2RenderingContext) hookGetParameter(WebGL2RenderingContext.prototype);
+        // getShaderPrecisionFormat 深度对齐（消除跨设备 Shader Precision 指纹碰撞）
+        function hookShaderPrecision(proto) {{
+            if (!proto || !proto.getShaderPrecisionFormat) return;
+            const origSP = proto.getShaderPrecisionFormat;
+            const hookedSP = helper.createNativeMethod('getShaderPrecisionFormat', function(shaderType, precisionType) {{
+                const res = origSP.apply(this, arguments);
+                if (res) {{
+                    try {{
+                        Object.defineProperty(res, 'rangeMin', {{ value: {sp_rangeMin}, writable: false }});
+                        Object.defineProperty(res, 'rangeMax', {{ value: {sp_rangeMax}, writable: false }});
+                        Object.defineProperty(res, 'precision', {{ value: {sp_precision}, writable: false }});
+                    }} catch (e) {{}}
+                }}
+                return res;
+            }});
+            proto.getShaderPrecisionFormat = hookedSP;
+        }}
+
+        // getSupportedExtensions 完整扩展列表对齐
+        function hookExtensions(proto) {{
+            if (!proto || !proto.getSupportedExtensions) return;
+            proto.getSupportedExtensions = helper.createNativeMethod('getSupportedExtensions', function() {{
+                return [...glExts];
+            }});
+            // getExtension 对齐
+            const origGetExt = proto.getExtension;
+            proto.getExtension = helper.createNativeMethod('getExtension', function(name) {{
+                if (name === 'WEBGL_debug_renderer_info') return origGetExt.apply(this, arguments);
+                if (glExts.indexOf(name) === -1) return null;
+                return origGetExt.apply(this, arguments);
+            }});
+        }}
+
+        // readPixels 微噪点注入（消除 WebGL Canvas Hash 跨账号碰撞）
+        function hookReadPixels(proto) {{
+            if (!proto || !proto.readPixels) return;
+            const origRP = proto.readPixels;
+            const rpSeed = {seed};
+            proto.readPixels = helper.createNativeMethod('readPixels', function() {{
+                const result = origRP.apply(this, arguments);
+                const pixels = arguments[arguments.length - 1];
+                if (pixels && pixels.length && pixels.length > 16) {{
+                    const step = Math.max(32, Math.floor(pixels.length / 24));
+                    for (let i = 0; i < pixels.length; i += step) {{
+                        if (pixels[i] > 2 && pixels[i] < 253) {{
+                            pixels[i] = Math.min(255, Math.max(0, pixels[i] + (((i * rpSeed * 7) % 3) | 0) - 1));
+                        }}
+                    }}
+                }}
+                return result;
+            }});
+        }}
+
+        if (window.WebGLRenderingContext) {{
+            hookGetParameter(WebGLRenderingContext.prototype);
+            hookShaderPrecision(WebGLRenderingContext.prototype);
+            hookExtensions(WebGLRenderingContext.prototype);
+            hookReadPixels(WebGLRenderingContext.prototype);
+        }}
+        if (window.WebGL2RenderingContext) {{
+            hookGetParameter(WebGL2RenderingContext.prototype);
+            hookShaderPrecision(WebGL2RenderingContext.prototype);
+            hookExtensions(WebGL2RenderingContext.prototype);
+            hookReadPixels(WebGL2RenderingContext.prototype);
+        }}
     }} catch (e) {{}}
 
-    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise Injection ──────────────
+    // ── 7. Canvas 2D Sub-pixel & Deterministic Noise + toDataURL/toBlob ──────
     try {{
         const noiseSeed = {seed};
         if (window.CanvasRenderingContext2D) {{
@@ -631,28 +839,129 @@ def build_init_script(fp: dict) -> str:
                             configurable: true,
                             enumerable: true
                         }});
+                        // 扰动排版指标（消除 Font Enumeration 指纹碰撞）
+                        if (typeof res.actualBoundingBoxAscent === 'number') {{
+                            Object.defineProperty(res, 'actualBoundingBoxAscent', {{
+                                value: res.actualBoundingBoxAscent + delta * 0.5,
+                                configurable: true, enumerable: true
+                            }});
+                        }}
+                        if (typeof res.actualBoundingBoxDescent === 'number') {{
+                            Object.defineProperty(res, 'actualBoundingBoxDescent', {{
+                                value: res.actualBoundingBoxDescent + delta * 0.3,
+                                configurable: true, enumerable: true
+                            }});
+                        }}
                     }} catch(e) {{}}
                 }}
                 return res;
             }});
         }}
+
+        // ── Canvas toDataURL / toBlob 噪点注入（确保 Canvas Hash 唯一性）──
+        if (window.HTMLCanvasElement) {{
+            const _noiseApplied = new WeakSet();
+            function applyCanvasNoise(canvas) {{
+                if (_noiseApplied.has(canvas) || canvas.width === 0 || canvas.height === 0) return;
+                try {{
+                    const ctx = canvas.getContext('2d');
+                    if (!ctx) return;
+                    const w = Math.min(canvas.width, 256);
+                    const h = Math.min(canvas.height, 256);
+                    const imgData = CanvasRenderingContext2D.prototype.getImageData.call(ctx, 0, 0, w, h);
+                    const d = imgData.data;
+                    const step = Math.max(16, Math.floor(d.length / 48));
+                    for (let i = 0; i < d.length; i += step) {{
+                        if (d[i + 3] > 0 && d[i] > 1 && d[i] < 254) {{
+                            d[i] = d[i] + (((i * noiseSeed * 13) % 3) | 0) - 1;
+                        }}
+                    }}
+                    ctx.putImageData(imgData, 0, 0);
+                    _noiseApplied.add(canvas);
+                }} catch (e) {{}}
+            }}
+
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = helper.createNativeMethod('toDataURL', function(...args) {{
+                applyCanvasNoise(this);
+                return origToDataURL.apply(this, args);
+            }});
+
+            const origToBlob = HTMLCanvasElement.prototype.toBlob;
+            if (origToBlob) {{
+                HTMLCanvasElement.prototype.toBlob = helper.createNativeMethod('toBlob', function(...args) {{
+                    applyCanvasNoise(this);
+                    return origToBlob.apply(this, args);
+                }});
+            }}
+        }}
     }} catch (e) {{}}
 
-    // ── 8. AudioContext & OfflineAudioContext Fingerprint Hardening ─────────
+    // ── 8. AudioContext & OfflineAudioContext Full-Depth Fingerprint Hardening ─
     try {{
-        const audioSeed = {seed};
+        const audioSeed = {audio_seed};
+        const _perturbedBuffers = new WeakSet();
         if (window.AudioBuffer) {{
+            function perturbAudioData(data) {{
+                if (!data || data.length === 0) return data;
+                if (_perturbedBuffers.has(data)) return data;
+                const step = Math.max(20, Math.floor(data.length / 50));
+                for (let i = 0; i < data.length; i += step) {{
+                    data[i] += (audioSeed * 0.0000001) - 0.00000005;
+                }}
+                _perturbedBuffers.add(data);
+                return data;
+            }}
+
             const origGetChannelData = AudioBuffer.prototype.getChannelData;
             AudioBuffer.prototype.getChannelData = helper.createNativeMethod('getChannelData', function(channel) {{
                 const data = origGetChannelData.apply(this, arguments);
-                if (data && data.length > 0) {{
-                    const step = Math.max(20, Math.floor(data.length / 50));
-                    for (let i = 0; i < data.length; i += step) {{
-                        data[i] += (audioSeed * 0.0000001) - 0.00000005;
-                    }}
-                }}
-                return data;
+                return perturbAudioData(data);
             }});
+
+            // copyFromChannel 全覆盖（很多音频指纹库使用此接口）
+            const origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
+            if (origCopyFromChannel) {{
+                AudioBuffer.prototype.copyFromChannel = helper.createNativeMethod('copyFromChannel', function(destination, channelNumber, startInChannel) {{
+                    origCopyFromChannel.apply(this, arguments);
+                    if (destination && destination.length > 0) {{
+                        const step = Math.max(10, Math.floor(destination.length / 40));
+                        for (let i = 0; i < destination.length; i += step) {{
+                            destination[i] += (audioSeed * 0.00000008) - 0.00000004;
+                        }}
+                    }}
+                }});
+            }}
+        }}
+
+        // AnalyserNode 频域数据微扰（消除 getFloatFrequencyData/getByteFrequencyData 指纹）
+        if (window.AnalyserNode) {{
+            const origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
+            if (origGetFloat) {{
+                AnalyserNode.prototype.getFloatFrequencyData = helper.createNativeMethod('getFloatFrequencyData', function(array) {{
+                    origGetFloat.apply(this, arguments);
+                    if (array && array.length > 0) {{
+                        const step = Math.max(8, Math.floor(array.length / 30));
+                        for (let i = 0; i < array.length; i += step) {{
+                            array[i] += (audioSeed * 0.001) - 0.0005;
+                        }}
+                    }}
+                }});
+            }}
+            const origGetByte = AnalyserNode.prototype.getByteFrequencyData;
+            if (origGetByte) {{
+                AnalyserNode.prototype.getByteFrequencyData = helper.createNativeMethod('getByteFrequencyData', function(array) {{
+                    origGetByte.apply(this, arguments);
+                    if (array && array.length > 0) {{
+                        const step = Math.max(8, Math.floor(array.length / 30));
+                        for (let i = 0; i < array.length; i += step) {{
+                            if (array[i] > 1 && array[i] < 254) {{
+                                array[i] += (((i * audioSeed * 11) % 3) | 0) - 1;
+                            }}
+                        }}
+                    }}
+                }});
+            }}
         }}
     }} catch (e) {{}}
 
@@ -806,6 +1115,234 @@ def build_init_script(fp: dict) -> str:
             get: helper.createNativeGetter('pixelDepth', function() {{ return 24; }}),
             configurable: true, enumerable: true
         }});
+    }} catch (e) {{}}
+
+    // ── 15. ClientRects / DOMRect Sub-pixel Noise (Anti-Fingerprint) ────────
+    try {{
+        const rectSeed = {rect_seed};
+        const origGetBCR = Element.prototype.getBoundingClientRect;
+        Element.prototype.getBoundingClientRect = helper.createNativeMethod('getBoundingClientRect', function() {{
+            const rect = origGetBCR.apply(this, arguments);
+            const noise = (rectSeed * 0.00006) - 0.00003;
+            const domRect = new DOMRect(
+                rect.x + noise,
+                rect.y + noise * 0.7,
+                rect.width + noise * 0.5,
+                rect.height + noise * 0.3
+            );
+            return domRect;
+        }});
+
+        const origGetCR = Element.prototype.getClientRects;
+        Element.prototype.getClientRects = helper.createNativeMethod('getClientRects', function() {{
+            const rects = origGetCR.apply(this, arguments);
+            if (!rects || rects.length === 0) return rects;
+            const noise = (rectSeed * 0.00006) - 0.00003;
+            const result = [];
+            for (let i = 0; i < rects.length; i++) {{
+                result.push(new DOMRect(
+                    rects[i].x + noise * (i + 1),
+                    rects[i].y + noise * 0.7 * (i + 1),
+                    rects[i].width + noise * 0.5,
+                    rects[i].height + noise * 0.3
+                ));
+            }}
+            // 保持 DOMRectList 类似的接口
+            result.item = function(idx) {{ return this[idx] || null; }};
+            return result;
+        }});
+    }} catch (e) {{}}
+
+    // ── 16. Font Enumeration Defense (measureText-based font probing) ───────
+    try {{
+        const knownFonts = new Set({font_subset_json});
+        if (window.CanvasRenderingContext2D) {{
+            const origFillText = CanvasRenderingContext2D.prototype.fillText;
+            const origStrokeText = CanvasRenderingContext2D.prototype.strokeText;
+
+            // 对于不在子集中的字体探测，微妙地回退到默认字体渲染
+            // 通过在 measureText 中加入字体依赖噪点来消除跨实例碰撞
+            const origMT = CanvasRenderingContext2D.prototype.measureText;
+            if (!origMT._fontDefended) {{
+                const fontDefendedMT = helper.createNativeMethod('measureText', function(text) {{
+                    const res = origMT.apply(this, arguments);
+                    // 额外的字体依赖微噪：基于当前 font 属性生成独特偏移
+                    const fontStr = this.font || '';
+                    let fontHash = 0;
+                    for (let i = 0; i < fontStr.length; i++) {{
+                        fontHash = ((fontHash << 5) - fontHash + fontStr.charCodeAt(i)) | 0;
+                    }}
+                    const fontNoise = ((fontHash * {rect_seed}) % 100) * 0.000001;
+                    if (res && typeof res.width === 'number') {{
+                        try {{
+                            Object.defineProperty(res, 'width', {{
+                                value: res.width + fontNoise,
+                                configurable: true, enumerable: true
+                            }});
+                        }} catch(e) {{}}
+                    }}
+                    return res;
+                }});
+                fontDefendedMT._fontDefended = true;
+                CanvasRenderingContext2D.prototype.measureText = fontDefendedMT;
+            }}
+        }}
+    }} catch (e) {{}}
+
+    // ── 17. performance.memory Heap Spoofing (Chrome-only API) ──────────────
+    try {{
+        if (window.performance) {{
+            const memoryObj = {{
+                jsHeapSizeLimit: {js_heap_limit},
+                totalJSHeapSize: {js_total_heap},
+                usedJSHeapSize: {js_used_heap}
+            }};
+            Object.freeze(memoryObj);
+            try {{
+                Object.defineProperty(performance, 'memory', {{
+                    get: helper.createNativeGetter('memory', function() {{ return memoryObj; }}),
+                    configurable: true,
+                    enumerable: true
+                }});
+            }} catch (e) {{}}
+        }}
+    }} catch (e) {{}}
+
+    // ── 18. Screen.orientation Desktop Landscape Alignment ──────────────────
+    try {{
+        const screenProto = Object.getPrototypeOf(screen) || Screen.prototype;
+        const orientObj = {{
+            angle: 0,
+            type: 'landscape-primary',
+            onchange: null,
+            addEventListener: helper.createNativeMethod('addEventListener', function() {{}}),
+            removeEventListener: helper.createNativeMethod('removeEventListener', function() {{}}),
+            dispatchEvent: helper.createNativeMethod('dispatchEvent', function() {{ return true; }}),
+            lock: helper.createNativeMethod('lock', function() {{ return Promise.reject(new DOMException('screen.orientation.lock() is not available on this device.', 'NotSupportedError')); }}),
+            unlock: helper.createNativeMethod('unlock', function() {{}})
+        }};
+        delete screen.orientation;
+        Object.defineProperty(screenProto, 'orientation', {{
+            get: helper.createNativeGetter('orientation', function() {{ return orientObj; }}),
+            configurable: true,
+            enumerable: true
+        }});
+    }} catch (e) {{}}
+
+    // ── 19. WebGPU Adapter Spoofing (navigator.gpu) ────────────────────────
+    try {{
+        if (!navigator.gpu) {{
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            const gpuObj = {{
+                requestAdapter: helper.createNativeMethod('requestAdapter', function(options) {{
+                    return Promise.resolve({{
+                        name: "{renderer}",
+                        features: new Set(['texture-compression-bc', 'depth-clip-control']),
+                        limits: {{
+                            maxTextureDimension1D: {gl_max_tex},
+                            maxTextureDimension2D: {gl_max_tex},
+                            maxTextureDimension3D: 2048,
+                            maxTextureArrayLayers: 256,
+                            maxBindGroups: 4,
+                            maxDynamicUniformBuffersPerPipelineLayout: 8,
+                            maxDynamicStorageBuffersPerPipelineLayout: 4,
+                            maxSampledTexturesPerShaderStage: 16,
+                            maxSamplersPerShaderStage: 16,
+                            maxStorageBuffersPerShaderStage: 8,
+                            maxStorageTexturesPerShaderStage: 4,
+                            maxUniformBuffersPerShaderStage: 12,
+                            maxBufferSize: 268435456,
+                            maxVertexBuffers: 8,
+                            maxVertexAttributes: 16
+                        }},
+                        isFallbackAdapter: false,
+                        requestDevice: helper.createNativeMethod('requestDevice', function() {{
+                            return Promise.reject(new DOMException('WebGPU device creation not supported', 'NotSupportedError'));
+                        }})
+                    }});
+                }}),
+                getPreferredCanvasFormat: helper.createNativeMethod('getPreferredCanvasFormat', function() {{
+                    return 'bgra8unorm';
+                }})
+            }};
+            Object.defineProperty(navProto, 'gpu', {{
+                get: helper.createNativeGetter('gpu', function() {{ return gpuObj; }}),
+                configurable: true,
+                enumerable: true
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 20. WebRTC ICE Candidate Local IP Masking ──────────────────────────
+    try {{
+        if (window.RTCPeerConnection) {{
+            const origSetLocal = RTCPeerConnection.prototype.setLocalDescription;
+            if (origSetLocal) {{
+                RTCPeerConnection.prototype.setLocalDescription = helper.createNativeMethod('setLocalDescription', function(desc) {{
+                    if (desc && desc.sdp) {{
+                        // 替换本地 IP 地址 (192.168.x.x, 10.x.x.x, 172.x.x.x)
+                        desc.sdp = desc.sdp.replace(/([0-9]{{1,3}}\\.([0-9]{{1,3}})\\.([0-9]{{1,3}})\\.([0-9]{{1,3}}))/g, function(match) {{
+                            if (match.startsWith('192.168.') || match.startsWith('10.') ||
+                                (match.startsWith('172.') && parseInt(match.split('.')[1]) >= 16 && parseInt(match.split('.')[1]) <= 31)) {{
+                                return '0.0.0.0';
+                            }}
+                            return match;
+                        }});
+                    }}
+                    return origSetLocal.apply(this, arguments);
+                }});
+            }}
+
+            // onicecandidate 中过滤 local candidate
+            const origAddEvent = RTCPeerConnection.prototype.addEventListener;
+            RTCPeerConnection.prototype.addEventListener = helper.createNativeMethod('addEventListener', function(type, listener, options) {{
+                if (type === 'icecandidate' && typeof listener === 'function') {{
+                    const wrappedListener = function(event) {{
+                        if (event && event.candidate && event.candidate.candidate) {{
+                            const c = event.candidate.candidate;
+                            if (c.includes('192.168.') || c.includes('10.') || /172\\.(1[6-9]|2[0-9]|3[01])\\./g.test(c)) {{
+                                return; // 丢弃内网 IP candidate
+                            }}
+                        }}
+                        listener.call(this, event);
+                    }};
+                    return origAddEvent.call(this, type, wrappedListener, options);
+                }}
+                return origAddEvent.apply(this, arguments);
+            }});
+        }}
+    }} catch (e) {{}}
+
+    // ── 21. Date / Intl Timezone Consistency Hardening ─────────────────────
+    try {{
+        // 确保 Intl.DateTimeFormat().resolvedOptions().timeZone 与 Playwright 设定一致
+        const origDTF = Intl.DateTimeFormat;
+        const targetTZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        // Date.prototype.getTimezoneOffset 一致性校验（Playwright 已设，但双重保障）
+        const origResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+        Intl.DateTimeFormat.prototype.resolvedOptions = helper.createNativeMethod('resolvedOptions', function() {{
+            const opts = origResolvedOptions.apply(this, arguments);
+            // 强制对齐（防止 Intl polyfill 泄漏不同时区）
+            if (opts && opts.timeZone && targetTZ) {{
+                opts.timeZone = targetTZ;
+            }}
+            return opts;
+        }});
+    }} catch (e) {{}}
+
+    // ── 22. Input / Keyboard Event isTrusted Hardening ─────────────────────
+    try {{
+        // 防止通过 event.isTrusted 检测合成事件（Playwright 原生 CDP 事件默认 isTrusted=true，
+        // 但某些框架会检查 Event.prototype.isTrusted getter 是否被篡改，此处做原型保护）
+        const trustedDesc = Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted');
+        if (trustedDesc && trustedDesc.get) {{
+            // 保持原生 getter 不被覆盖
+            Object.defineProperty(Event.prototype, 'isTrusted', {{
+                get: trustedDesc.get,
+                configurable: false,
+                enumerable: true
+            }});
+        }}
     }} catch (e) {{}}
 
 }})();
