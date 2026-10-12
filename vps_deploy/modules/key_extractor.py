@@ -1257,7 +1257,12 @@ async def extract_all_keys(
         # ── 等待软件列表加载（支持侧边栏自动点击切换与秒级就绪）─────────────
         _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")
         list_ready = False
-        for w in range(25):
+        loop = asyncio.get_running_loop()
+        list_deadline = loop.time() + 25
+        list_started = loop.time()
+        w = -1
+        while loop.time() < list_deadline:
+            w += 1
             await asyncio.sleep(1)
 
             # 在第 1, 4, 8, 14 秒主动尝试点击左侧 Education 菜单中的「Software / 软件」
@@ -1300,7 +1305,7 @@ async def extract_all_keys(
                     pass
 
             if list_ready:
-                _emit(cb, f"  ✅ 软件列表/搜索框已就绪（{w+1}s）")
+                _emit(cb, f"  ✅ 软件列表/搜索框已就绪（{loop.time() - list_started:.0f}s）")
                 break
 
             # 如果 8 秒后仍未就绪且出现红条横幅，自动重试一次条款接受
@@ -1310,19 +1315,22 @@ async def extract_all_keys(
                     if has_red:
                         _emit(cb, "  ⚠️ 检测到条款横幅依然存在，重新触发条款接受...")
                         await _handle_terms_flow(sw_page, cb)
+                        list_deadline = loop.time() + 25
                 except Exception:
                     pass
 
-            # 16 秒仍未就绪：重新导航软件页再给一次机会
+            # 仅重新导航一次；导航结束后给完整的 25 秒加载时间。
             if w == 16:
                 _emit(cb, "  🔄 软件列表 16 秒未加载，重新导航 Education Software 页面...")
                 try:
                     await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=20000)
                 except Exception as e:
                     _emit(cb, f"  ⚠️ 重新导航异常: {str(e)[:80]}")
+                finally:
+                    list_deadline = loop.time() + 25
 
         if not list_ready:
-            raise PortalLoadError("软件列表超过 25 秒未加载（Portal 网络/代理卡顿），需换代理重试", totp=updated_totp)
+            raise PortalLoadError("软件列表等待超时（重新导航后仍未就绪；尚不能确定是否代理故障）", totp=updated_totp)
 
         await asyncio.sleep(0.5)
 

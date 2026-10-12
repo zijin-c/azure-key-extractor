@@ -164,14 +164,21 @@ class DynamicProxyBridge:
     def switch_upstream(self, new_proxy: str | None):
         """热切换上游代理并主动断开旧连接。"""
         with self._lock:
+            if new_proxy == self._raw_proxy:
+                return False
             self._set_upstream_locked(new_proxy)
             sockets_to_close = list(self._active_sockets)
         
         for s in sockets_to_close:
             try:
+                s.shutdown(self._socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 s.close()
             except Exception:
                 pass
+        return True
 
     def get_current_proxy(self) -> str | None:
         with self._lock:
@@ -261,6 +268,10 @@ class DynamicProxyBridge:
                     with bridge._lock:
                         bridge._active_sockets.add(upstream_sock)
 
+                    # 建连超时只约束握手，不能变成 HTTPS 隧道的空闲读取超时。
+                    # Azure 请求及 HTTP/2 长连接可能超过 15 秒没有返回数据。
+                    upstream_sock.settimeout(None)
+
                     if method == "CONNECT":
                         client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
                     else:
@@ -274,8 +285,11 @@ class DynamicProxyBridge:
                                     break
                                 bridge.record_bytes(len(data))
                                 dst.sendall(data)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.debug(
+                                "Proxy relay to %s:%s ended (%s)",
+                                t_host, t_port, type(exc).__name__,
+                            )
                         try:
                             dst.shutdown(socket.SHUT_WR)
                         except Exception:
@@ -324,6 +338,10 @@ class DynamicProxyBridge:
             active = list(self._active_sockets)
         for s in active:
             try:
+                s.shutdown(self._socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 s.close()
             except Exception:
                 pass
@@ -354,8 +372,8 @@ class ProxyController:
             return None
         next_proxy, _ = await self.rotator.get_next_proxy()
         if next_proxy:
-            self.bridge.switch_upstream(next_proxy)
-            return next_proxy
+            if self.bridge.switch_upstream(next_proxy):
+                return next_proxy
         return None
 
 
