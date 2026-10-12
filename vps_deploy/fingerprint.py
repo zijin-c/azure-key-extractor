@@ -151,7 +151,7 @@ _GPU_GL_PARAMS = {
     "Radeon":   (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384),
 }
 
-# 真实 Chrome 131 D3D11 后端 WebGL 扩展完整池（按照真实浏览器收集）
+# 真实 Chromium D3D11 后端 WebGL 扩展完整池（按照真实浏览器收集）
 _WEBGL_EXTENSIONS_POOL = [
     "ANGLE_instanced_arrays", "EXT_blend_minmax", "EXT_clip_control",
     "EXT_color_buffer_half_float", "EXT_depth_clamp", "EXT_disjoint_timer_query",
@@ -181,7 +181,7 @@ _FONT_PROBE_BASE = [
 ]
 
 
-def random_fingerprint(major_ver: str = "131") -> dict:
+def random_fingerprint(major_ver: str = "151", full_ver: str | None = None) -> dict:
     """生成一套与宿主系统 Chromium 严格对齐的高拟真、全维度随机指纹参数。"""
     res = random.choice(_SCREEN_RESOLUTIONS)
     gpu = random.choice(_GPU_PROFILES)
@@ -197,9 +197,10 @@ def random_fingerprint(major_ver: str = "131") -> dict:
     vp_w = res["width"]
     vp_h = res["avail_height"]
 
-    # 拟真微版本号
-    build_patch = random.choice(["0.6778.86", "0.6778.108", "0.6778.140", "0.6778.205", "0.6723.116", "0.6834.110"])
-    full_ver = f"{major_ver}.{build_patch.split('.', 1)[1]}" if "." in build_patch else f"{major_ver}.0.0.0"
+    # 拟真微版本号或严格对齐真实版本号
+    if not full_ver:
+        build_patch = random.choice(["0.7922.34", "0.7922.50", "0.7922.65", "0.7900.100"])
+        full_ver = f"{major_ver}.{build_patch.split('.', 1)[1]}" if "." in build_patch else f"{major_ver}.0.0.0"
 
     ua = f'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major_ver}.0.0.0 Safari/537.36'
     
@@ -343,8 +344,8 @@ def build_init_script(fp: dict) -> str:
     27. Event.prototype.isTrusted 原生 getter 保护（防止框架检测 CDP 合成事件篡改标记）。
     """
     brands_json = json.dumps(fp.get("brand_entries", [
-        {"brand": "Chromium", "version": fp.get("major_ver", "131")},
-        {"brand": "Google Chrome", "version": fp.get("major_ver", "131")},
+        {"brand": "Chromium", "version": fp.get("major_ver", "151")},
+        {"brand": "Google Chrome", "version": fp.get("major_ver", "151")},
         {"brand": "Not_A Brand", "version": "24"}
     ]), ensure_ascii=False)
 
@@ -366,7 +367,7 @@ def build_init_script(fp: dict) -> str:
     audio_in = fp.get("audio_in", "Microphone (Realtek High Definition Audio)")
     audio_out = fp.get("audio_out", "Speakers (Realtek High Definition Audio)")
     cam_in = fp.get("cam_in", "HD WebCam")
-    ua = fp.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    ua = fp.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
     # ── 新增加强维度参数提取 ──
     gl_p = fp.get("gl_params", (16384, 16384, 16384, 16, 32, 4096, 1024, 32, 32, 80, 1.0, 16384))
@@ -480,68 +481,85 @@ def build_init_script(fp: dict) -> str:
     }} catch (e) {{}}
 
     // ── 0.2 Console CDP Getter Trap Neutralization ─────────────────────────
-    // 防御 Cloudflare Turnstile / DataDome 借助 console.log/debug 等传递带 getter 对象的 CDP 自动化监听陷阱 (Runtime.consoleAPICalled)
+    // 防御 Cloudflare Turnstile / DataDome / Arkose 借助 console 传递带 getter / Proxy 对象的 CDP 自动化监听陷阱
     try {{
-        const safeConsoleMethods = ['debug', 'dir', 'dirxml', 'trace', 'table'];
-        for (const m of safeConsoleMethods) {{
+        const noopConsoleMethods = [
+            'debug', 'dir', 'dirxml', 'trace', 'table',
+            'group', 'groupCollapsed', 'groupEnd',
+            'count', 'countReset', 'time', 'timeEnd', 'timeLog', 'assert'
+        ];
+        for (const m of noopConsoleMethods) {{
             if (console[m]) {{
                 console[m] = helper.createNativeMethod(m, function() {{}}, 0);
             }}
         }}
 
-        // 对 log, info, warn 实施参数安全清洗：只过滤包含自定义 getter 的陷阱对象，常规字符串正常放行
+        // 对 log, info, warn, error 实施参数零泄露安全净化：
+        // 遇到非原始类型（对象、函数、Symbol）直接返回安全占位符，绝不访问属性或描述符，彻底避免触发 Proxy 陷阱与 CDP 序列化
         const origLog = console.log;
         const origWarn = console.warn;
         const origInfo = console.info;
+        const origError = console.error;
 
         function sanitizeLogArg(arg) {{
-            if (arg === null || typeof arg !== 'object') return arg;
-            // 检查原型或属性描述符中是否有 getter 陷阱
-            try {{
-                const desc = Object.getOwnPropertyDescriptors(arg);
-                for (const k in desc) {{
-                    if (desc[k].get) {{
-                        return '[Object]';
-                    }}
-                }}
-            }} catch (e) {{}}
+            if (arg !== null && (typeof arg === 'object' || typeof arg === 'function' || typeof arg === 'symbol')) {{
+                return '[Object]';
+            }}
             return arg;
         }}
 
-        console.log = helper.createNativeMethod('log', function(...args) {{
-            const safeArgs = args.map(sanitizeLogArg);
-            return origLog.apply(console, safeArgs);
-        }}, 0);
-
-        console.warn = helper.createNativeMethod('warn', function(...args) {{
-            const safeArgs = args.map(sanitizeLogArg);
-            return origWarn.apply(console, safeArgs);
-        }}, 0);
-
-        console.info = helper.createNativeMethod('info', function(...args) {{
-            const safeArgs = args.map(sanitizeLogArg);
-            return origInfo.apply(console, safeArgs);
-        }}, 0);
+        if (origLog) {{
+            console.log = helper.createNativeMethod('log', function(...args) {{
+                const safeArgs = args.map(sanitizeLogArg);
+                return origLog.apply(console, safeArgs);
+            }}, 0);
+        }}
+        if (origWarn) {{
+            console.warn = helper.createNativeMethod('warn', function(...args) {{
+                const safeArgs = args.map(sanitizeLogArg);
+                return origWarn.apply(console, safeArgs);
+            }}, 0);
+        }}
+        if (origInfo) {{
+            console.info = helper.createNativeMethod('info', function(...args) {{
+                const safeArgs = args.map(sanitizeLogArg);
+                return origInfo.apply(console, safeArgs);
+            }}, 0);
+        }}
+        if (origError) {{
+            console.error = helper.createNativeMethod('error', function(...args) {{
+                const safeArgs = args.map(sanitizeLogArg);
+                return origError.apply(console, safeArgs);
+            }}, 0);
+        }}
     }} catch (e) {{}}
 
     // ── 1. Clean navigator.webdriver & Proto Alignment ────────────────────
     try {{
-        const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
-        delete navProto.webdriver;
-        delete navigator.webdriver;
-        const getWebdriver = helper.createNativeGetter('webdriver', function() {{ return false; }});
-        Object.defineProperty(navProto, 'webdriver', {{
-            get: getWebdriver,
-            set: undefined,
-            enumerable: true,
-            configurable: true
-        }});
+        if (navigator.hasOwnProperty('webdriver')) {{
+            delete navigator.webdriver;
+        }}
+        if (navigator.webdriver !== false) {{
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            try {{ delete navProto.webdriver; }} catch(e) {{}}
+            try {{ delete navigator.webdriver; }} catch(e) {{}}
+            const getWebdriver = helper.createNativeGetter('webdriver', function() {{ return false; }});
+            Object.defineProperty(navProto, 'webdriver', {{
+                get: getWebdriver,
+                set: undefined,
+                enumerable: true,
+                configurable: true
+            }});
+        }}
     }} catch (e) {{}}
 
-    // ── 2. window.chrome Alignment (Vanilla Desktop Chrome with Complete runtime) ──
+    // ── 2. window.chrome Alignment (Vanilla Desktop Chrome) ──
     try {{
         if (!window.chrome) {{
             window.chrome = {{}};
+        }}
+        if (window.chrome.runtime) {{
+            try {{ delete window.chrome.runtime; }} catch (e) {{}}
         }}
         if (!window.chrome.app) {{
             window.chrome.app = {{
@@ -583,136 +601,90 @@ def build_init_script(fp: dict) -> str:
             }});
             window.chrome.csi = csiFn;
         }}
-        // ── 真实 Chrome Extension runtime 枚举与基础方法对齐 (消除反爬对 chrome.runtime 的缺失判定) ──
-        if (!window.chrome.runtime) {{
-            window.chrome.runtime = {{
-                OnInstalledReason: Object.freeze({{
-                    CHROME_UPDATE: "chrome_update",
-                    INSTALL: "install",
-                    SHARED_MODULE_UPDATE: "shared_module_update",
-                    UPDATE: "update"
-                }}),
-                PlatformArch: Object.freeze({{
-                    ARM: "arm",
-                    ARM64: "arm64",
-                    MIPS: "mips",
-                    MIPS64: "mips64",
-                    X86_32: "x86-32",
-                    X86_64: "x86-64"
-                }}),
-                PlatformNaclArch: Object.freeze({{
-                    ARM: "arm",
-                    MIPS: "mips",
-                    MIPS64: "mips64",
-                    X86_32: "x86-32",
-                    X86_64: "x86-64"
-                }}),
-                PlatformOs: Object.freeze({{
-                    ANDROID: "android",
-                    CROS: "cros",
-                    FUCHSIA: "fuchsia",
-                    LINUX: "linux",
-                    MAC: "mac",
-                    OPENBSD: "openbsd",
-                    WIN: "win"
-                }}),
-                RequestUpdateCheckStatus: Object.freeze({{
-                    NO_UPDATE: "no_update",
-                    THROTTLED: "throttled",
-                    UPDATE_AVAILABLE: "update_available"
-                }}),
-                connect: helper.createNativeMethod('connect', function() {{
-                    return {{
-                        disconnect: helper.createNativeMethod('disconnect', function() {{}}),
-                        name: "",
-                        onDisconnect: {{ addListener: helper.createNativeMethod('addListener', function() {{}}), removeListener: helper.createNativeMethod('removeListener', function() {{}}) }},
-                        onMessage: {{ addListener: helper.createNativeMethod('addListener', function() {{}}), removeListener: helper.createNativeMethod('removeListener', function() {{}}) }},
-                        postMessage: helper.createNativeMethod('postMessage', function() {{}})
-                    }};
-                }}),
-                sendMessage: helper.createNativeMethod('sendMessage', function() {{}})
-            }};
-        }}
     }} catch (e) {{}}
 
     // ── 3. navigator.plugins & navigator.mimeTypes (5 PDF Plugins on Proto) ───
     try {{
-        const pluginData = [
-            {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
-            {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
-            {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
-            {{ name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
-            {{ name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }}
-        ];
+        // 只有当 plugins 为空（例如无头 Linux 环境缺失内置 PDF 插件）才进行补齐；
+        // 如果宿主 Chromium 已具备原生 5 大内置 PDF 插件，绝不破坏其原生 C++ 结构与内部插槽
+        if (!navigator.plugins || navigator.plugins.length === 0) {{
+            const pluginData = [
+                {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
+                {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
+                {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
+                {{ name: "Microsoft Edge PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }},
+                {{ name: "WebKit built-in PDF", filename: "internal-pdf-viewer", description: "Portable Document Format", mimeTypes: ["application/pdf", "text/pdf"] }}
+            ];
 
-        const fakePlugins = [];
-        const fakeMimes = [];
+            const fakePlugins = [];
+            const fakeMimes = [];
 
-        for (const p of pluginData) {{
-            const pluginObj = Object.create(Plugin.prototype);
-            Object.defineProperties(pluginObj, {{
-                name: {{ value: p.name, enumerable: true }},
-                filename: {{ value: p.filename, enumerable: true }},
-                description: {{ value: p.description, enumerable: true }},
-                length: {{ value: p.mimeTypes.length, enumerable: true }}
-            }});
-            for (let i = 0; i < p.mimeTypes.length; i++) {{
-                const mimeType = p.mimeTypes[i];
-                const mimeObj = Object.create(MimeType.prototype);
-                Object.defineProperties(mimeObj, {{
-                    type: {{ value: mimeType, enumerable: true }},
-                    suffixes: {{ value: "pdf", enumerable: true }},
-                    description: {{ value: "Portable Document Format", enumerable: true }},
-                    enabledPlugin: {{ value: pluginObj, enumerable: true }}
+            for (const p of pluginData) {{
+                const pluginObj = Object.create(Plugin.prototype);
+                Object.defineProperties(pluginObj, {{
+                    name: {{ value: p.name, enumerable: true }},
+                    filename: {{ value: p.filename, enumerable: true }},
+                    description: {{ value: p.description, enumerable: true }},
+                    length: {{ value: p.mimeTypes.length, enumerable: true }}
                 }});
-                pluginObj[i] = mimeObj;
-                pluginObj[mimeType] = mimeObj;
-                if (!fakeMimes.some(m => m.type === mimeType)) {{
-                    fakeMimes.push(mimeObj);
+                for (let i = 0; i < p.mimeTypes.length; i++) {{
+                    const mimeType = p.mimeTypes[i];
+                    const mimeObj = Object.create(MimeType.prototype);
+                    Object.defineProperties(mimeObj, {{
+                        type: {{ value: mimeType, enumerable: true }},
+                        suffixes: {{ value: "pdf", enumerable: true }},
+                        description: {{ value: "Portable Document Format", enumerable: true }},
+                        enabledPlugin: {{ value: pluginObj, enumerable: true }}
+                    }});
+                    pluginObj[i] = mimeObj;
+                    pluginObj[mimeType] = mimeObj;
+                    if (!fakeMimes.some(m => m.type === mimeType)) {{
+                        fakeMimes.push(mimeObj);
+                    }}
                 }}
+                fakePlugins.push(pluginObj);
             }}
-            fakePlugins.push(pluginObj);
+
+            const pluginArray = Object.create(PluginArray.prototype);
+            Object.defineProperty(pluginArray, "length", {{ value: fakePlugins.length, enumerable: true }});
+            for (let i = 0; i < fakePlugins.length; i++) {{
+                pluginArray[i] = fakePlugins[i];
+                pluginArray[fakePlugins[i].name] = fakePlugins[i];
+            }}
+            pluginArray.item = helper.createNativeMethod('item', function(idx) {{ return this[idx] || null; }});
+            pluginArray.namedItem = helper.createNativeMethod('namedItem', function(name) {{ return this[name] || null; }});
+            pluginArray.refresh = helper.createNativeMethod('refresh', function() {{}});
+
+            const mimeArray = Object.create(MimeTypeArray.prototype);
+            Object.defineProperty(mimeArray, "length", {{ value: fakeMimes.length, enumerable: true }});
+            for (let i = 0; i < fakeMimes.length; i++) {{
+                mimeArray[i] = fakeMimes[i];
+                mimeArray[fakeMimes[i].type] = fakeMimes[i];
+            }}
+            mimeArray.item = helper.createNativeMethod('item', function(idx) {{ return this[idx] || null; }});
+            mimeArray.namedItem = helper.createNativeMethod('namedItem', function(name) {{ return this[name] || null; }});
+
+            const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
+            delete navigator.plugins;
+            delete navigator.mimeTypes;
+            delete navigator.pdfViewerEnabled;
+
+            Object.defineProperty(navProto, "plugins", {{
+                get: helper.createNativeGetter('plugins', function() {{ return pluginArray; }}),
+                configurable: true,
+                enumerable: true
+            }});
+            Object.defineProperty(navProto, "mimeTypes", {{
+                get: helper.createNativeGetter('mimeTypes', function() {{ return mimeArray; }}),
+                configurable: true,
+                enumerable: true
+            }});
+            Object.defineProperty(navProto, "pdfViewerEnabled", {{
+                get: helper.createNativeGetter('pdfViewerEnabled', function() {{ return true; }}),
+                configurable: true,
+                enumerable: true
+            }});
         }}
-
-        const pluginArray = Object.create(PluginArray.prototype);
-        Object.defineProperty(pluginArray, "length", {{ value: fakePlugins.length, enumerable: true }});
-        for (let i = 0; i < fakePlugins.length; i++) {{
-            pluginArray[i] = fakePlugins[i];
-            pluginArray[fakePlugins[i].name] = fakePlugins[i];
-        }}
-        pluginArray.item = helper.createNativeMethod('item', function(idx) {{ return this[idx] || null; }});
-        pluginArray.namedItem = helper.createNativeMethod('namedItem', function(name) {{ return this[name] || null; }});
-        pluginArray.refresh = helper.createNativeMethod('refresh', function() {{}});
-
-        const mimeArray = Object.create(MimeTypeArray.prototype);
-        Object.defineProperty(mimeArray, "length", {{ value: fakeMimes.length, enumerable: true }});
-        for (let i = 0; i < fakeMimes.length; i++) {{
-            mimeArray[i] = fakeMimes[i];
-            mimeArray[fakeMimes[i].type] = fakeMimes[i];
-        }}
-        mimeArray.item = helper.createNativeMethod('item', function(idx) {{ return this[idx] || null; }});
-        mimeArray.namedItem = helper.createNativeMethod('namedItem', function(name) {{ return this[name] || null; }});
-
-        const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
-        delete navigator.plugins;
-        delete navigator.mimeTypes;
-        delete navigator.pdfViewerEnabled;
-
-        Object.defineProperty(navProto, "plugins", {{
-            get: helper.createNativeGetter('plugins', function() {{ return pluginArray; }}),
-            configurable: true,
-            enumerable: true
-        }});
-        Object.defineProperty(navProto, "mimeTypes", {{
-            get: helper.createNativeGetter('mimeTypes', function() {{ return mimeArray; }}),
-            configurable: true,
-            enumerable: true
-        }});
-        Object.defineProperty(navProto, "pdfViewerEnabled", {{
-            get: helper.createNativeGetter('pdfViewerEnabled', function() {{ return true; }}),
-            configurable: true,
-            enumerable: true
-        }});
     }} catch (e) {{}}
 
     // ── 4. Hardware Concurrency, Device Memory & Languages ─────────────────
@@ -1437,30 +1409,31 @@ def build_init_script(fp: dict) -> str:
         }}
     }} catch (e) {{}}
 
-    // ── 25. Navigator.prototype Hard Locks (userAgent, appVersion, vendor) ──
+    // ── 25. Navigator.prototype Properties Verification ────────────────────
     try {{
         const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
-        delete navigator.userAgent;
-        delete navigator.appVersion;
-        delete navigator.vendor;
-        delete navigator.productSub;
-
-        Object.defineProperty(navProto, 'userAgent', {{
-            get: helper.createNativeGetter('userAgent', function() {{ return "{ua}"; }}),
-            configurable: true, enumerable: true
-        }});
-        Object.defineProperty(navProto, 'appVersion', {{
-            get: helper.createNativeGetter('appVersion', function() {{ return "{ua}".replace("Mozilla/", ""); }}),
-            configurable: true, enumerable: true
-        }});
-        Object.defineProperty(navProto, 'vendor', {{
-            get: helper.createNativeGetter('vendor', function() {{ return "Google Inc."; }}),
-            configurable: true, enumerable: true
-        }});
-        Object.defineProperty(navProto, 'productSub', {{
-            get: helper.createNativeGetter('productSub', function() {{ return "20030107"; }}),
-            configurable: true, enumerable: true
-        }});
+        if (navigator.hasOwnProperty('userAgent')) {{
+            try {{ delete navigator.userAgent; }} catch(e) {{}}
+        }}
+        if (navigator.hasOwnProperty('appVersion')) {{
+            try {{ delete navigator.appVersion; }} catch(e) {{}}
+        }}
+        if (navigator.vendor !== "Google Inc.") {{
+            try {{ delete navProto.vendor; }} catch(e) {{}}
+            try {{ delete navigator.vendor; }} catch(e) {{}}
+            Object.defineProperty(navProto, 'vendor', {{
+                get: helper.createNativeGetter('vendor', function() {{ return "Google Inc."; }}),
+                configurable: true, enumerable: true
+            }});
+        }}
+        if (navigator.productSub !== "20030107") {{
+            try {{ delete navProto.productSub; }} catch(e) {{}}
+            try {{ delete navigator.productSub; }} catch(e) {{}}
+            Object.defineProperty(navProto, 'productSub', {{
+                get: helper.createNativeGetter('productSub', function() {{ return "20030107"; }}),
+                configurable: true, enumerable: true
+            }});
+        }}
     }} catch (e) {{}}
 
     // ── 26. MediaDevices Event Listeners & Hardware Noise ──────────────────
@@ -1911,11 +1884,8 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
             log.info("[提示] 检测到 Linux 纯终端环境 (无 XServer/DISPLAY)，全自动强制开启无头模式 (headless=True)")
             headless = True
 
-    fp = random_fingerprint(major_ver="131")
-
     # 动态探测动态代理出口 IP 物理信息（时区、国家、经纬度），与主进程/子进程严格对齐
     geo = _get_proxy_geo(proxy_config)
-    timezone = geo.get("timezone") or fp["timezone"]
 
     country = (geo.get("country") or "").upper()
     if country == "US":
@@ -1940,12 +1910,8 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         locale = "ja-JP"
         languages = ["ja-JP", "ja", "en-US", "en"]
     else:
-        locale = fp["locale"]
-        languages = fp["languages"]
-
-    fp["timezone"] = timezone
-    fp["locale"] = locale
-    fp["languages"] = languages
+        loc_item = random.choice(_LOCALES)
+        locale, languages = loc_item[0], loc_item[1]
 
     browser_args = [
         "--disable-blink-features=AutomationControlled",
@@ -1970,7 +1936,6 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
         "--enable-features=NetworkService,NetworkServiceInProcess",
         f"--lang={locale}",
-        f"--user-agent={fp['user_agent']}",
     ]
 
     if sys.platform != "win32":
@@ -2014,10 +1979,16 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
             else:
                 raise e2
 
-    real_ver = getattr(browser, "version", "") or "131.0.0.0"
-    major_ver = real_ver.split(".")[0] if "." in real_ver else "131"
-    fp["major_ver"] = major_ver
-    fp["chrome_ver"] = real_ver
+    # 动态且精确对齐宿主 Chromium 的真实主版本与完整版本（杜绝版本与 JS 特性冲突导致的 Bot 判定）
+    real_ver = getattr(browser, "version", "") or "151.0.7922.34"
+    major_ver = real_ver.split(".")[0] if "." in real_ver else "151"
+
+    # 生成与宿主 Chromium 版本 100% 对齐的指纹
+    fp = random_fingerprint(major_ver=major_ver, full_ver=real_ver)
+    timezone = geo.get("timezone") or fp["timezone"]
+    fp["timezone"] = timezone
+    fp["locale"] = locale
+    fp["languages"] = languages
 
     headers = {
         "Accept-Language": ",".join(
