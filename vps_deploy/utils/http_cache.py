@@ -179,6 +179,8 @@ class LocalHttpCache:
                         body = f.read()
                     if not body or not meta.get("headers"):
                         continue
+                    if not cls.valid_asset_body(url, body, meta["headers"]):
+                        continue
                     digest = meta.get("body_sha256")
                     if digest and hashlib.sha256(body).hexdigest() != digest:
                         continue
@@ -223,6 +225,8 @@ class LocalHttpCache:
         if not body or status != 200 or not cls.is_cacheable(url):
             return
         lowered = {k.lower(): v for k, v in headers.items()}
+        if not cls.valid_asset_body(url, body, lowered):
+            return
         if "set-cookie" in lowered or "no-store" in lowered.get("cache-control", "").lower():
             return
         if any(word in lowered.get("vary", "").lower() for word in ("cookie", "authorization", "accept-language", "*")):
@@ -245,16 +249,23 @@ class LocalHttpCache:
 
     @classmethod
     @asynccontextmanager
-    async def download_lock(cls, url):
+    async def download_lock(cls, url, timeout=None):
         key = (asyncio.get_running_loop(), cls._identity(url))
         with cls._fill_guard:
             entry = cls._fills.setdefault(key, [asyncio.Lock(), 0])
             entry[1] += 1
         acquired = False
         try:
-            await entry[0].acquire()
+            try:
+                if timeout is None:
+                    await entry[0].acquire()
+                else:
+                    await asyncio.wait_for(entry[0].acquire(), timeout=timeout)
+            except asyncio.TimeoutError:
+                yield False
+                return
             acquired = True
-            yield
+            yield True
         finally:
             if acquired:
                 entry[0].release()
@@ -262,6 +273,15 @@ class LocalHttpCache:
                 entry[1] -= 1
                 if not entry[1]:
                     cls._fills.pop(key, None)
+
+    @staticmethod
+    def valid_asset_body(url, body, headers):
+        """脚本/CSS 地址返回登录或拦截 HTML 时，不能作为公共资源缓存。"""
+        if not urlsplit(url).path.lower().endswith(('.js', '.mjs', '.css')):
+            return True
+        content_type = next((v for k, v in headers.items() if k.lower() == 'content-type'), '').lower()
+        prefix = body.lstrip()[:64].lower()
+        return 'text/html' not in content_type and not prefix.startswith((b'<!doctype html', b'<html'))
 
     @classmethod
     def detect_manifest_type(cls, data):

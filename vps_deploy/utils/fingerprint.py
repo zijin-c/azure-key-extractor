@@ -1681,7 +1681,11 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         if LocalHttpCache.is_cacheable(url, "GET"):
             # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
-            async with LocalHttpCache.download_lock(url):
+            async with LocalHttpCache.download_lock(url, timeout=3) as acquired:
+                if not acquired:
+                    # 其他账号下载卡住时，当前账号原生加载；正常快速下载仍共享缓存。
+                    await route.continue_()
+                    return
                 is_manifest = "extensionmanifest/" in url_lower
                 cached = LocalHttpCache.get_canonical_manifest(url) if is_manifest else LocalHttpCache.get(url)
                 if cached:
@@ -1699,7 +1703,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                     if etag:
                         fetch_kwargs["headers"] = {**request.headers, "If-None-Match": etag}
                 try:
-                    fetched = await route.fetch(**fetch_kwargs)
+                    fetched = await route.fetch(timeout=10000, max_retries=0, **fetch_kwargs)
                 except Exception:
                     # fetch 失败后允许浏览器正常请求，不计为缓存命中。
                     await route.continue_()

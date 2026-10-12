@@ -26,6 +26,8 @@ import logging
 import os
 import random
 import sys
+import uuid
+from urllib.parse import urlsplit
 from typing import Callable, Optional
 
 from playwright.async_api import Page
@@ -139,19 +141,57 @@ def _emit(cb: ProgressCallback, msg: str):
 
 async def _find_visible_locator(page: Page, selectors: list[str], timeout_ms: int = 150):
     """穿透页面及所有子 iframe，查找第一个可见的目标元素。"""
-    targets = [page] + list(page.frames)
+    targets = list(page.frames)
+    if page.main_frame not in targets:
+        targets.insert(0, page.main_frame)
     sel_query = ", ".join(selectors)
     for tgt in targets:
         try:
-            loc = tgt.locator(sel_query).first
-            if await loc.is_visible(timeout=timeout_ms):
-                return tgt, loc
+            matches = tgt.locator(sel_query)
+            for index in range(await matches.count()):
+                loc = matches.nth(index)
+                if await loc.is_visible(timeout=timeout_ms):
+                    return tgt, loc
         except Exception:
             pass
     return None, None
 
 
 async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallback = None) -> bool:
+    """保留有界加载诊断，结束时移除监听，避免长时间运行积累回调。"""
+    diagnostics = []
+
+    def record(kind, request, detail):
+        if len(diagnostics) >= 12 or request.resource_type not in ('document', 'script', 'xhr', 'fetch'):
+            return
+        parsed = urlsplit(request.url)
+        # 只保留主机与路径，不记录 query、请求体、Cookie 或 token。
+        entry = f"{kind} {detail} {parsed.hostname or '-'}{parsed.path[:140]}"
+        if entry not in diagnostics:
+            diagnostics.append(entry)
+
+    def failed(request):
+        record('requestfailed', request, request.failure or 'unknown')
+
+    def response_received(response):
+        if response.status >= 400:
+            record('HTTP', response.request, str(response.status))
+
+    def page_error(error):
+        if len(diagnostics) < 12:
+            diagnostics.append(f"pageerror {getattr(error, 'name', type(error).__name__)}")
+
+    listeners = [('requestfailed', failed), ('response', response_received), ('pageerror', page_error)]
+    for event, callback in listeners:
+        page.on(event, callback)
+    try:
+        return await _fill_azure_profile_form(page, ms_email, cb, diagnostics)
+    finally:
+        for event, callback in listeners:
+            page.remove_listener(event, callback)
+
+
+async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -> bool:
     """
     填写 Academic Verification 表单并提交，支持单浏览器内 1 次刷新重试机制 (max_attempts = 2)。
     必须确凿确认认证成功后才返回 True；若尝试均超时则抛出 SheerIDVerificationError 触发新开浏览器重试。
@@ -218,6 +258,10 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
                 f"  ⚠️ {form_wait_seconds} 秒内未挂载 SheerID 表单 "
                 f"(title={title[:50] or '-'}, frames={frame_count}, url={page.url[:80]})",
             )
+            for entry in diagnostics:
+                _emit(cb, f"  🔬 表单加载诊断: {entry}")
+            if not diagnostics:
+                _emit(cb, "  🔬 未捕获 HTTP/连接失败；仍可能是字段变化、脚本异常或请求尚未完成")
 
             ss_dir = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -226,7 +270,7 @@ async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallbac
             os.makedirs(ss_dir, exist_ok=True)
             try:
                 await page.screenshot(
-                    path=os.path.join(ss_dir, f"sheerid_form_missing_attempt_{attempt}.png"),
+                    path=os.path.join(ss_dir, f"sheerid_form_missing_{uuid.uuid4().hex}_attempt_{attempt}.png"),
                     full_page=True,
                 )
             except Exception:
