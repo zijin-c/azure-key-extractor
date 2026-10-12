@@ -588,6 +588,15 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
     """
 
     async def _scan_all_frames_for_key() -> str:
+        # 1. 优先读取网络层实时嗅探到的密钥（不受 DOM 渲染与 Fluent UI 组件库版本影响）
+        ctx = getattr(page, "context", None)
+        if ctx and hasattr(ctx, "_sniffed_keys"):
+            for k in reversed(ctx._sniffed_keys):
+                if k and k not in existing_set:
+                    _emit(cb, f"  ⚡ 网络层嗅探命中 Product Key: {k}")
+                    return k
+
+        # 2. DOM 与多框架深度扫描
         for frame in page.frames:
             try:
                 found_list = await frame.evaluate(_EXTRACT_ALL_KEYS_JS)

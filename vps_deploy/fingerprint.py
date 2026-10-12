@@ -1768,8 +1768,28 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 asyncio.ensure_future(learn_portal_hashes())
 
             # 记录 2FA initializemobileapp 的调用与秒级捕获 TOTP 密钥
-            if "initializemobileapp" in (response.url or "").lower():
+            url_str = (response.url or "").lower()
+            if "initializemobileapp" in url_str:
                 asyncio.ensure_future(_diag_mfa_response(response, req, resp_bytes))
+            # 关键黑科技增强：直接在网络响应流中嗅探 Azure ARM / Education 下发的 Product Key
+            elif any(k in url_str for k in ("management.azure.com", "/batch", "education", "getproductkey", "software")):
+                async def _sniff_key_response():
+                    try:
+                        if response.status == 200:
+                            body = await response.body()
+                            txt = body.decode("utf-8", errors="ignore")
+                            # 匹配标准 5x5 产品密钥格式: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+                            matches = re.findall(r"\b([A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5})\b", txt)
+                            if matches:
+                                if not hasattr(ctx, "_sniffed_keys"):
+                                    ctx._sniffed_keys = []
+                                for m in matches:
+                                    if m not in ctx._sniffed_keys:
+                                        ctx._sniffed_keys.append(m)
+                                        log.info(f"[Key Sniffer] 网络层嗅探到产品密钥: {m}")
+                    except Exception:
+                        pass
+                asyncio.ensure_future(_sniff_key_response())
         except Exception:
             pass
 
