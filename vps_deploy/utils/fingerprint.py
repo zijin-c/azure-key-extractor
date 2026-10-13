@@ -37,6 +37,7 @@ import threading
 import time
 from urllib.parse import urlparse, urlsplit
 from utils.http_cache import LocalHttpCache, transfer_body_size
+from utils.traffic_diagnostics import HttpSizeDiagnostics, safe_traffic_url
 
 log = logging.getLogger(__name__)
 
@@ -1505,6 +1506,7 @@ class TrafficStats:
         self.telemetry_blocked_count = 0
         self.proxy_bridge = proxy_bridge
         self.network_requests = []
+        self.diagnostics = HttpSizeDiagnostics(self)
         self.mfa_diag = []  # 仅诊断：记录 2FA initializemobileapp 请求的次数/大小/结构（不影响任何请求）
 
     def set_proxy_bridge(self, bridge):
@@ -1514,7 +1516,7 @@ class TrafficStats:
         if num_bytes > 0:
             self.net_transfer_bytes += num_bytes
             if url:
-                self.network_requests.append((num_bytes, url, r_type, status))
+                self.network_requests.append((num_bytes, safe_traffic_url(url), r_type, status))
 
     def record_cache_hit(self, body_size: int, wire_size: int | None = None):
         self.cache_hit_count += 1
@@ -1528,18 +1530,22 @@ class TrafficStats:
         # 未下载的媒体没有实际传输尺寸，只记录次数。
         self.blocked_count += 1
 
-    def record_response(self, response, request=None, decoded_size=None):
+    def record_response(self, response, request=None, decoded_size=None, native=True):
         request = request or response.request
+        if id(request) in self.diagnostics.pending:
+            return
         req_size = 250 + sum(len(k) + len(v) + 4 for k, v in request.headers.items())
         payload = request.post_data_buffer
         req_size += len(payload) if payload else 0
         headers = response.headers
         body_size = 0 if response.status in (204, 304) or request.method == "HEAD" else transfer_body_size(headers, decoded_size)
-        if body_size is None:
+        unknown = body_size is None
+        if unknown:
             self.transfer_size_unknown_responses += 1
             body_size = 0
         header_size = 250 + sum(len(k) + len(v) + 4 for k, v in headers.items())
         self.record_transfer(req_size + header_size + body_size, response.url, request.resource_type, response.status)
+        self.diagnostics.recorded(request, len(self.network_requests) - 1, unknown, native)
 
     def transfer_source(self):
         return "代理连接累计传输" if self.proxy_bridge and hasattr(self.proxy_bridge, "get_total_bytes") and self.proxy_bridge.get_total_bytes() > 0 else "HTTP 传输估算"
@@ -1626,6 +1632,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     )
 
     fulfilled_request_ids = set()
+    if stats:
+        stats.diagnostics.attach(ctx)
+
+    def _mark_fulfilled(request):
+        fulfilled_request_ids.add(id(request))
+        if stats:
+            stats.diagnostics.mark_synthetic(request)
+
     block_telemetry = os.getenv("BLOCK_TELEMETRY", "true").strip().lower() not in ("0", "false", "no", "off")
 
     async def _route_handler(route, request):
@@ -1641,13 +1655,13 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         _is_block_domain = any(host == s or host.endswith("." + s) for s in BLOCK_DOMAIN_SUFFIXES)
         if block_telemetry and _is_block_domain:
             if r_type == "image" or any(host.endswith(s) for s in _AUTH_IMAGE_SUFFIXES):
-                fulfilled_request_ids.add(id(request))
+                _mark_fulfilled(request)
                 await route.fulfill(status=200, content_type="image/png", body=_DUMMY_PNG_IMAGE)
                 if stats:
                     stats.record_blocked(est_size=280000)
                 return
             if r_type != "document" and not request.is_navigation_request():
-                fulfilled_request_ids.add(id(request))
+                _mark_fulfilled(request)
                 await route.fulfill(status=204, headers={"cache-control": "no-store"}, body=b"")
                 if stats:
                     stats.telemetry_blocked_count += 1
@@ -1662,7 +1676,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 "Url": None, "AffinityRegion": None,
                 "ActivationCode": None, "RegistrationType": 0, "ErrorCode": 0,
             }).encode()
-            fulfilled_request_ids.add(id(request))
+            _mark_fulfilled(request)
             await route.fulfill(status=200, content_type="application/json", body=_synth)
             if stats:
                 stats.record_blocked(est_size=1300000)
@@ -1702,7 +1716,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             if request.method == "OPTIONS":
                 headers["access-control-allow-methods"] = "GET, POST, OPTIONS"
                 headers["access-control-allow-headers"] = request.headers.get("access-control-request-headers", "content-type")
-            fulfilled_request_ids.add(id(request))
+            _mark_fulfilled(request)
             await route.fulfill(status=204, headers=headers, body=b"")
             if stats:
                 stats.telemetry_blocked_count += 1
@@ -1712,7 +1726,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         if (block_telemetry and "portal.azure.com" in host
                 and any(path_lower.startswith(p) for p in NONESSENTIAL_PORTAL_API)
                 and r_type != "document"):
-            fulfilled_request_ids.add(id(request))
+            _mark_fulfilled(request)
             ct = "application/json"
             await route.fulfill(status=200, content_type=ct, body=b"[]",
                                 headers={"cache-control": "no-store", "content-type": ct})
@@ -1729,13 +1743,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         if clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=5000000 if not clean_url.endswith(".map") else 300000)
+                stats.diagnostics.mark_synthetic(request)
             await route.abort()
             return
 
         # 4b. 拦截 favicon / manifest 等浏览器自动请求
         _basename = path_lower.rsplit("/", 1)[-1]
         if _basename in ("favicon.ico", "manifest.json", "manifest.webmanifest", "browserconfig.xml"):
-            fulfilled_request_ids.add(id(request))
+            _mark_fulfilled(request)
             if _basename == "favicon.ico":
                 await route.fulfill(status=200, content_type="image/x-icon", body=_DUMMY_PNG_IMAGE)
             else:
@@ -1750,7 +1765,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 "education", "software", "captcha", "arkose", "product",
             ))
             if not _is_essential_img:
-                fulfilled_request_ids.add(id(request))
+                _mark_fulfilled(request)
                 await route.fulfill(status=200, content_type="image/svg+xml", body=_DUMMY_SVG_IMAGE)
                 if stats:
                     stats.record_blocked(est_size=50000)
@@ -1771,7 +1786,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                     body, headers, status = cached
                     if stats:
                         stats.record_cache_hit(len(body), LocalHttpCache.get_wire_size(url))
-                    fulfilled_request_ids.add(id(request))
+                    _mark_fulfilled(request)
                     await route.fulfill(body=body, headers=headers, status=status)
                     return
 
@@ -1783,8 +1798,10 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                         fetch_kwargs["headers"] = {**request.headers, "If-None-Match": etag}
                 try:
                     fetched = await route.fetch(timeout=20000, max_retries=1, **fetch_kwargs)
-                except Exception:
+                except Exception as error:
                     # fetch 失败后允许浏览器正常请求，不计为缓存命中。
+                    if stats:
+                        stats.diagnostics.fetch_failed(request, error)
                     await route.continue_()
                     return
 
@@ -1798,15 +1815,15 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                     except OSError:
                         pass
                     if stats:
-                        stats.record_response(fetched, request)
+                        stats.record_response(fetched, request, native=False)
                         stats.record_cache_hit(len(body), meta.get("wire_body_bytes"))
-                    fulfilled_request_ids.add(id(request))
+                    _mark_fulfilled(request)
                     await route.fulfill(body=body, headers=headers, status=200)
                     return
 
                 body = await fetched.body()
                 if stats:
-                    stats.record_response(fetched, request, len(body))
+                    stats.record_response(fetched, request, len(body), native=False)
                 if fetched.status == 200:
                     try:
                         LocalHttpCache.put(url, body, fetched.headers, fetched.status)
@@ -1814,7 +1831,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                             LocalHttpCache.save_canonical_manifest(url, body, fetched.headers)
                     except OSError as error:
                         log.warning("静态缓存写入失败，已继续返回网络响应: %s", error)
-                fulfilled_request_ids.add(id(request))
+                _mark_fulfilled(request)
                 await route.fulfill(response=fetched, body=body)
                 return
 
@@ -1822,6 +1839,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
+                stats.diagnostics.mark_synthetic(request)
             await route.abort()
             return
 
@@ -2238,6 +2256,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         await setup_save_data_route(ctx, stats)
     else:
         ctx.on("response", stats.add_response)
+        stats.diagnostics.attach(ctx)
 
     async def _fallback_mfa_capture(response):
         if "initializemobileapp" in (response.url or "").lower():

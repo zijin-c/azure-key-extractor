@@ -34,6 +34,7 @@ from modules.azure_login import do_azure_login, LoginNetworkError, EmailInputTim
 from modules.azure_signup import fill_azure_profile_form, SheerIDVerificationError
 from modules.key_extractor import extract_all_keys, PortalLoadError, AzureRiskBlockedError
 from utils.fingerprint import new_fingerprint_context, warmup_static_cache
+from utils.traffic_diagnostics import proxy_report_lines
 from utils.xray_proxy import XrayProxyChain
 from utils.captcha_detector import check_captcha_present
 from utils.process_manager import BrowserProcessManager, get_playwright_driver_pid, safe_close_playwright
@@ -129,12 +130,29 @@ class DynamicProxyBridge:
         self.local_port = None
         self._xray_chain = None
         self._total_bytes_transferred = 0
+        self._domain_stats = {}
         self._set_upstream_locked(initial_proxy)
 
-    def record_bytes(self, num_bytes: int):
+    def _domain_locked(self, host):
+        return self._domain_stats.setdefault(host or '[unknown]', {
+            'host': host or '[unknown]', 'upload_bytes': 0, 'download_bytes': 0,
+            'connections': 0, 'failed_connections': 0,
+        })
+
+    def record_connection(self, host, failed=False):
+        with self._lock:
+            row = self._domain_locked(host)
+            row['failed_connections' if failed else 'connections'] += 1
+
+    def get_domain_stats(self):
+        with self._lock:
+            return [dict(row) for row in self._domain_stats.values()]
+
+    def record_bytes(self, num_bytes: int, direction='upload', host=''):
         if num_bytes > 0:
             with self._lock:
                 self._total_bytes_transferred += num_bytes
+                self._domain_locked(host)['download_bytes' if direction == 'download' else 'upload_bytes'] += num_bytes
 
     def get_total_bytes(self) -> int:
         with self._lock:
@@ -194,6 +212,8 @@ class DynamicProxyBridge:
             def handle(self):
                 client_sock = self.request
                 upstream_sock = None
+                t_host = ''
+                connected = False
                 with bridge._lock:
                     bridge._active_sockets.add(client_sock)
                     scheme = bridge._scheme
@@ -213,10 +233,10 @@ class DynamicProxyBridge:
                         if len(raw) > 65536:
                             return
 
-                    bridge.record_bytes(len(raw))
                     first_line = raw.split(b"\r\n")[0].decode(errors="ignore")
                     parts = first_line.split()
                     if len(parts) < 2:
+                        bridge.record_bytes(len(raw))
                         return
 
                     method = parts[0].upper()
@@ -229,6 +249,9 @@ class DynamicProxyBridge:
                         p_target = urlparse(target)
                         t_host = p_target.hostname or target
                         t_port = p_target.port or 80
+
+                    bridge.record_connection(t_host)
+                    bridge.record_bytes(len(raw), 'upload', t_host)
 
                     # 向上游建立连接
                     if scheme in ("socks5", "socks5h", "socks4", "socks4a") and host:
@@ -256,6 +279,7 @@ class DynamicProxyBridge:
                                 break
                             resp += c
                         if b" 200 " not in resp.split(b"\r\n")[0]:
+                            bridge.record_connection(t_host, failed=True)
                             sock.close()
                             return
                         upstream_sock = sock
@@ -267,6 +291,7 @@ class DynamicProxyBridge:
 
                     with bridge._lock:
                         bridge._active_sockets.add(upstream_sock)
+                    connected = True
 
                     # 建连超时只约束握手，不能变成 HTTPS 隧道的空闲读取超时。
                     # Azure 请求及 HTTP/2 长连接可能超过 15 秒没有返回数据。
@@ -277,13 +302,13 @@ class DynamicProxyBridge:
                     else:
                         upstream_sock.sendall(raw)
 
-                    def relay(src, dst):
+                    def relay(src, dst, direction):
                         try:
                             while True:
                                 data = src.recv(65536)
                                 if not data:
                                     break
-                                bridge.record_bytes(len(data))
+                                bridge.record_bytes(len(data), direction, t_host)
                                 dst.sendall(data)
                         except Exception as exc:
                             log.debug(
@@ -295,14 +320,16 @@ class DynamicProxyBridge:
                         except Exception:
                             pass
 
-                    t1 = threading.Thread(target=relay, args=(client_sock, upstream_sock), daemon=True)
-                    t2 = threading.Thread(target=relay, args=(upstream_sock, client_sock), daemon=True)
+                    t1 = threading.Thread(target=relay, args=(client_sock, upstream_sock, 'upload'), daemon=True)
+                    t2 = threading.Thread(target=relay, args=(upstream_sock, client_sock, 'download'), daemon=True)
                     t1.start()
                     t2.start()
                     t1.join()
                     t2.join()
 
                 except Exception as e:
+                    if t_host and not connected:
+                        bridge.record_connection(t_host, failed=True)
                     try:
                         client_sock.sendall(f"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\nProxy Error: {e}".encode())
                     except Exception:
@@ -452,8 +479,10 @@ async def process_account(
         chromium_path = config.get_chromium_path()
         exe_path = chromium_path if chromium_path and os.path.exists(chromium_path) else None
 
+        warmup_before = proxy_obj.get_total_bytes() if proxy_obj else 0
         if config.ENABLE_SAVE_DATA:
             await warmup_static_cache(pw, proxy_config=proxy_config, exe_path=exe_path, cb=cb)
+        warmup_after = proxy_obj.get_total_bytes() if proxy_obj else 0
 
         browser, ctx, fp, stats = await new_fingerprint_context(
             pw, headless=headless,
@@ -464,6 +493,8 @@ async def process_account(
         )
         if stats and proxy_obj and hasattr(stats, "set_proxy_bridge"):
             stats.set_proxy_bridge(proxy_obj)
+            stats.proxy_warmup_bytes = warmup_after - warmup_before
+            stats.proxy_startup_bytes = proxy_obj.get_total_bytes() - warmup_after
         BrowserProcessManager.record_descendants(driver_pid)
 
         # 启动账号时确保从缓存载入历史 2FA 密钥并挂载实时捕获回调
@@ -892,22 +923,35 @@ async def process_account(
 
     finally:
         if 'stats' in locals() and stats:
+            try:
+                await stats.diagnostics.drain()
+            except Exception as error:
+                log.debug('流量尺寸收尾失败: %s', type(error).__name__)
             _emit(cb, f"  📊 本次账号{stats.transfer_source()}约 {stats.get_transfer_mb():.2f} MB | 已知缓存避免的响应体下载约 {stats.get_cache_saved_mb():.2f} MB（命中 {stats.cache_hit_count} 次，拦截媒体/安装包 {stats.blocked_count} 次）")
             if stats.telemetry_blocked_count:
                 _emit(cb, f"  📉 已在本地响应 {stats.telemetry_blocked_count} 次遥测请求，未发送到远端（未将请求次数折算为节省 MB）")
             if stats.cache_size_unknown_hits:
                 _emit(cb, f"  ℹ️ 另有 {stats.cache_size_unknown_hits} 次缓存命中缺少原压缩尺寸，未计入节省 MB；缓存复用内容总计（解压后）{stats.cache_replayed_bytes / 1048576:.2f} MB")
             if stats.transfer_size_unknown_responses:
-                _emit(cb, f"  ℹ️ {stats.transfer_size_unknown_responses} 个网络响应缺少传输长度，HTTP 估算未包含其响应体")
+                _emit(cb, f"  ℹ️ {stats.transfer_size_unknown_responses} 个网络响应仍缺少传输尺寸，HTTP 统计未完整包含其响应体")
             if hasattr(stats, "get_top_downloads"):
                 top_dl = stats.get_top_downloads(5)
                 if top_dl:
-                    _emit(cb, "  🔝 本次 HTTP 请求估算 Top 5（不含代理连接额外开销）:")
+                    _emit(cb, "  🔝 本次 HTTP 请求 Top 5（浏览器实测 + 缓存 fetch 估算，不含代理连接额外开销）:")
                     for sz_kb, url, r_type in top_dl:
                         if sz_kb >= 1024:
                             _emit(cb, f"    • {sz_kb/1024:.2f} MB [{r_type}] {url[:85]}")
                         else:
                             _emit(cb, f"    • {sz_kb:.1f} KB [{r_type}] {url[:85]}")
+            try:
+                for line in stats.diagnostics.report_lines():
+                    _emit(cb, line)
+                for line in proxy_report_lines(proxy_obj, stats.net_transfer_bytes,
+                                               getattr(stats, 'proxy_warmup_bytes', 0),
+                                               getattr(stats, 'proxy_startup_bytes', 0)):
+                    _emit(cb, line)
+            except Exception as error:
+                log.warning('流量诊断汇总失败（不影响业务）: %s', type(error).__name__)
             mfa_diag = getattr(stats, "mfa_diag", None)
             if mfa_diag:
                 _emit(cb, f"  🔬 [2FA 诊断] initializemobileapp 共调用 {len(mfa_diag)} 次:")
