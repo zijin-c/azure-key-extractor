@@ -1667,7 +1667,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         # 1. 优先放行所有动态安全挑战、登录认证、Azure ARM/Education 与 2FA 相关接口（100% 原生直连）
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            if "portal.azure.com" in host and path_lower.rstrip("/") == "/api/telemetry":
+            if "portal.azure.com" in host and path_lower.rstrip("/").endswith("/api/telemetry"):
                 pass  # Portal 遥测不放行，落入后续 step 2 拦截
             elif LocalHttpCache.is_cacheable(url):
                 pass  # 落入后续缓存逻辑
@@ -1681,14 +1681,15 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
             "education.azure.com", "signup.azure.com", "mysignins.microsoft.com", "login.microsoftonline.com"
         )
         if any(d in host for d in core_api_domains) or (
-            "portal.azure.com" in host and path_lower.startswith("/api/") and path_lower.rstrip("/") != "/api/telemetry"
+            "portal.azure.com" in host and path_lower.startswith("/api/") and not path_lower.rstrip("/").endswith("/api/telemetry")
         ):
             if not LocalHttpCache.is_cacheable(url):
                 await route.continue_()
                 return
 
         # 2. 广义遥测端点拦截（返回空成功响应）
-        is_telemetry = any(path_lower.rstrip("/") == tp for tp in TELEMETRY_PATHS)
+        _path_stripped = path_lower.rstrip("/")
+        is_telemetry = any(_path_stripped == tp or _path_stripped.endswith(tp) for tp in TELEMETRY_PATHS)
         if (block_telemetry and is_telemetry and request.method in ("GET", "POST", "OPTIONS")
                 and r_type != "document" and not request.is_navigation_request()):
             headers = {"cache-control": "no-store"}
