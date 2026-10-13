@@ -89,6 +89,39 @@ def _emit(cb: ProgressCallback, msg: str):
         cb(msg)
 
 
+def _emit_traffic_summary(stats, proxy_obj, cb: ProgressCallback):
+    """正常模式只输出一行汇总；诊断开关不改变流量测量和省流规则。"""
+    _emit(cb, f"  📊 本次账号{stats.transfer_source()}约 {stats.get_transfer_mb():.2f} MB | "
+              f"缓存命中 {stats.cache_hit_count} 次，已知节省 {stats.get_cache_saved_mb():.2f} MB | "
+              f"拦截资源 {stats.blocked_count} 次，遥测本地响应 {stats.telemetry_blocked_count} 次")
+    if os.getenv('TRAFFIC_DIAGNOSTICS', 'false').strip().lower() not in ('1', 'true', 'yes', 'on'):
+        return
+
+    if stats.cache_size_unknown_hits:
+        _emit(cb, f"  ℹ️ {stats.cache_size_unknown_hits} 次缓存命中缺少原压缩尺寸，未计入节省 MB；"
+                  f"缓存复用内容总计（解压后）{stats.cache_replayed_bytes / 1048576:.2f} MB")
+    if stats.transfer_size_unknown_responses:
+        _emit(cb, f"  ℹ️ {stats.transfer_size_unknown_responses} 个网络响应仍缺少传输尺寸，HTTP 统计未完整包含其响应体")
+    try:
+        for line in stats.diagnostics.report_lines():
+            _emit(cb, line)
+        for line in proxy_report_lines(proxy_obj, stats.net_transfer_bytes,
+                                       getattr(stats, 'proxy_warmup_bytes', 0),
+                                       getattr(stats, 'proxy_startup_bytes', 0)):
+            _emit(cb, line)
+    except Exception as error:
+        log.warning('流量诊断汇总失败（不影响业务）: %s', type(error).__name__)
+    mfa_diag = getattr(stats, 'mfa_diag', None)
+    if mfa_diag:
+        _emit(cb, f"  🔬 [2FA 诊断] initializemobileapp 共调用 {len(mfa_diag)} 次:")
+        for i, entry in enumerate(mfa_diag, 1):
+            _emit(cb, f"    #{i} 传输≈{entry.get('size', 0)/1024:.1f}KB "
+                      f"解压后={entry.get('raw_len', 0)/1024:.1f}KB "
+                      f"压缩={entry.get('enc')} 状态={entry.get('status')}")
+            _emit(cb, f"       请求体: {entry.get('post', '')}")
+            _emit(cb, f"       响应字段: {entry.get('fields', '')}")
+
+
 def _persist_result(result: KeyResult):
     """追加写入 JSONL 结果文件（含密码，方便后续重新导出）。"""
     fpath = os.path.join(_RESULTS_DIR, f"keys_{datetime.now().strftime('%Y%m%d')}.jsonl")
@@ -928,38 +961,7 @@ async def process_account(
                 await stats.diagnostics.drain()
             except Exception as error:
                 log.debug('流量尺寸收尾失败: %s', type(error).__name__)
-            _emit(cb, f"  📊 本次账号{stats.transfer_source()}约 {stats.get_transfer_mb():.2f} MB | 已知缓存避免的响应体下载约 {stats.get_cache_saved_mb():.2f} MB（命中 {stats.cache_hit_count} 次，拦截媒体/安装包 {stats.blocked_count} 次）")
-            if stats.telemetry_blocked_count:
-                _emit(cb, f"  📉 已在本地响应 {stats.telemetry_blocked_count} 次遥测请求，未发送到远端（未将请求次数折算为节省 MB）")
-            if stats.cache_size_unknown_hits:
-                _emit(cb, f"  ℹ️ 另有 {stats.cache_size_unknown_hits} 次缓存命中缺少原压缩尺寸，未计入节省 MB；缓存复用内容总计（解压后）{stats.cache_replayed_bytes / 1048576:.2f} MB")
-            if stats.transfer_size_unknown_responses:
-                _emit(cb, f"  ℹ️ {stats.transfer_size_unknown_responses} 个网络响应仍缺少传输尺寸，HTTP 统计未完整包含其响应体")
-            if hasattr(stats, "get_top_downloads"):
-                top_dl = stats.get_top_downloads(5)
-                if top_dl:
-                    _emit(cb, "  🔝 本次 HTTP 请求 Top 5（浏览器实测 + 缓存 fetch 估算，不含代理连接额外开销）:")
-                    for sz_kb, url, r_type in top_dl:
-                        if sz_kb >= 1024:
-                            _emit(cb, f"    • {sz_kb/1024:.2f} MB [{r_type}] {url[:85]}")
-                        else:
-                            _emit(cb, f"    • {sz_kb:.1f} KB [{r_type}] {url[:85]}")
-            try:
-                for line in stats.diagnostics.report_lines():
-                    _emit(cb, line)
-                for line in proxy_report_lines(proxy_obj, stats.net_transfer_bytes,
-                                               getattr(stats, 'proxy_warmup_bytes', 0),
-                                               getattr(stats, 'proxy_startup_bytes', 0)):
-                    _emit(cb, line)
-            except Exception as error:
-                log.warning('流量诊断汇总失败（不影响业务）: %s', type(error).__name__)
-            mfa_diag = getattr(stats, "mfa_diag", None)
-            if mfa_diag:
-                _emit(cb, f"  🔬 [2FA 诊断] initializemobileapp 共调用 {len(mfa_diag)} 次:")
-                for i, d in enumerate(mfa_diag, 1):
-                    _emit(cb, f"    #{i} 传输≈{d.get('size', 0)/1024:.1f}KB 解压后={d.get('raw_len', 0)/1024:.1f}KB 压缩={d.get('enc')} 状态={d.get('status')}")
-                    _emit(cb, f"       请求体: {d.get('post', '')}")
-                    _emit(cb, f"       响应字段: {d.get('fields', '')}")
+            _emit_traffic_summary(stats, proxy_obj, cb)
         
         # 安全优雅关闭（使用 shield 保护不受取消中断）+ 强制杀死所有底层浏览器/驱动子进程
         await safe_close_playwright(
