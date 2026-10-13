@@ -1587,7 +1587,8 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     BLOCKED_MEDIA_EXTS = (
         ".mp4", ".webm", ".ogg", ".mp3", ".wav",
         ".zip", ".iso", ".exe", ".msi", ".rar", ".7z", ".tar", ".gz",
-        ".dmg", ".pkg", ".bin", ".apk", ".m4s", ".ts", ".flv", ".m3u8"
+        ".dmg", ".pkg", ".bin", ".apk", ".m4s", ".ts", ".flv", ".m3u8",
+        ".map",
     )
 
     # 纯装饰性背景图 / 头像 / 遥测 / 分析追踪域（后缀匹配，覆盖 CDN 变体子域）
@@ -1612,6 +1613,13 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         "/collect/v1", "/v2/track",
         "/api/portal/diagnostics", "/api/portal/intents",
         "/api/clienterror", "/api/trace",
+    )
+    # Portal 非必要 API（不影响 Education Hub 提 Key 流程）
+    NONESSENTIAL_PORTAL_API = (
+        "/api/notifications", "/api/favorites", "/api/recommendations",
+        "/api/spotlight", "/api/experimentation", "/api/feedback",
+        "/api/marketplace", "/api/usersettings", "/api/dismissedinfobars",
+        "/api/useractivity",
     )
 
     fulfilled_request_ids = set()
@@ -1679,27 +1687,53 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 stats.telemetry_blocked_count += 1
             return
 
+        # 2b. Portal 非必要 API（不影响 Education Hub 提 Key 功能）
+        if (block_telemetry and "portal.azure.com" in host
+                and any(path_lower.startswith(p) for p in NONESSENTIAL_PORTAL_API)
+                and r_type != "document"):
+            fulfilled_request_ids.add(id(request))
+            ct = "application/json"
+            await route.fulfill(status=200, content_type=ct, body=b"[]",
+                                headers={"cache-control": "no-store", "content-type": ct})
+            if stats:
+                stats.telemetry_blocked_count += 1
+            return
+
         # 3. 核心业务导航、主 HTML 文档以及所有非 GET 请求：100% 原生直连
         if r_type == "document" or request.is_navigation_request() or request.method != "GET":
             await route.continue_()
             return
 
-        # 4. 拦截超大体积无用媒体与安装包文件
+        # 4. 拦截超大体积无用媒体、安装包与 Source Map 文件
         if clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
-                stats.record_blocked(est_size=5000000)
+                stats.record_blocked(est_size=5000000 if not clean_url.endswith(".map") else 300000)
             await route.abort()
             return
 
-        # 4b. 拦截 Portal 非必要图片（仅保留 Education 产品图标与验证码图片）
-        if r_type == "image" and "portal.azure.com" in host and not any(
-            k in url_lower for k in ("education", "software", "captcha", "arkose")
-        ):
+        # 4b. 拦截 favicon / manifest 等浏览器自动请求
+        _basename = path_lower.rsplit("/", 1)[-1]
+        if _basename in ("favicon.ico", "manifest.json", "manifest.webmanifest", "browserconfig.xml"):
             fulfilled_request_ids.add(id(request))
-            await route.fulfill(status=200, content_type="image/svg+xml", body=_DUMMY_SVG_IMAGE)
+            if _basename == "favicon.ico":
+                await route.fulfill(status=200, content_type="image/x-icon", body=_DUMMY_PNG_IMAGE)
+            else:
+                await route.fulfill(status=204, body=b"")
             if stats:
-                stats.record_blocked(est_size=50000)
+                stats.record_blocked(est_size=5000)
             return
+
+        # 4c. 广域非必要图片拦截（保留 Education 产品图标、验证码与缓存静态图）
+        if r_type == "image" and not LocalHttpCache.is_cacheable(url):
+            _is_essential_img = any(k in url_lower for k in (
+                "education", "software", "captcha", "arkose", "product",
+            ))
+            if not _is_essential_img:
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(status=200, content_type="image/svg+xml", body=_DUMMY_SVG_IMAGE)
+                if stats:
+                    stats.record_blocked(est_size=50000)
+                return
 
         if LocalHttpCache.is_cacheable(url, "GET"):
             # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
