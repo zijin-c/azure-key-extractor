@@ -1966,6 +1966,67 @@ def _get_proxy_geo(proxy_config: dict | None) -> dict:
     return {}
 
 
+_cache_warm_done = False
+
+
+async def warmup_static_cache(pw, proxy_config: dict | None = None,
+                               exe_path: str | None = None,
+                               min_files: int = 100):
+    """首次部署缓存预热：加载登录页和 Portal 页面，缓存 JS/CSS/字体等静态资源。"""
+    global _cache_warm_done
+    if _cache_warm_done:
+        return
+    cache_dir = LocalHttpCache.CACHE_DIR
+    try:
+        body_count = sum(1 for f in os.listdir(cache_dir) if f.endswith(".body")) if os.path.isdir(cache_dir) else 0
+    except OSError:
+        body_count = 0
+    if body_count >= min_files:
+        _cache_warm_done = True
+        return
+    log.info("[缓存预热] 本地缓存不足 (%d 个文件 < %d)，自动预热中...", body_count, min_files)
+    launch_args = list(get_traffic_saving_args())
+    browser = await pw.chromium.launch(
+        headless=True,
+        proxy=proxy_config,
+        **({"executable_path": exe_path} if exe_path else {}),
+        args=launch_args,
+    )
+    try:
+        ctx = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            ignore_https_errors=True,
+        )
+        warmup_stats = TrafficStats()
+        await setup_save_data_route(ctx, warmup_stats)
+        page = await ctx.new_page()
+        page.set_default_timeout(30000)
+        warmup_urls = [
+            "https://signup.azure.com/api/user/login?returnUrl=https%3A%2F%2Fsignup.azure.com",
+            "https://portal.azure.com/",
+        ]
+        for url in warmup_urls:
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=45000)
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        await ctx.close()
+    except Exception as e:
+        log.warning("[缓存预热] 出错: %s", e)
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+    try:
+        new_count = sum(1 for f in os.listdir(cache_dir) if f.endswith(".body")) if os.path.isdir(cache_dir) else 0
+    except OSError:
+        new_count = 0
+    log.info("[缓存预热] 完成，缓存文件: %d → %d", body_count, new_count)
+    _cache_warm_done = True
+
+
 async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
                                    exe_path: str | None, slow_mo: int = 80,
                                    enable_save_data: bool = True):

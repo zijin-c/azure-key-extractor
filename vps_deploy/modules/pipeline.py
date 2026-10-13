@@ -33,7 +33,7 @@ import config
 from modules.azure_login import do_azure_login, LoginNetworkError, EmailInputTimeoutError, AzureCaptchaError
 from modules.azure_signup import fill_azure_profile_form, SheerIDVerificationError
 from modules.key_extractor import extract_all_keys, PortalLoadError, AzureRiskBlockedError
-from utils.fingerprint import new_fingerprint_context
+from utils.fingerprint import new_fingerprint_context, warmup_static_cache
 from utils.xray_proxy import XrayProxyChain
 from utils.captcha_detector import check_captcha_present
 from utils.process_manager import BrowserProcessManager, get_playwright_driver_pid, safe_close_playwright
@@ -451,6 +451,9 @@ async def process_account(
 
         chromium_path = config.get_chromium_path()
         exe_path = chromium_path if chromium_path and os.path.exists(chromium_path) else None
+
+        if config.ENABLE_SAVE_DATA:
+            await warmup_static_cache(pw, proxy_config=proxy_config, exe_path=exe_path)
 
         browser, ctx, fp, stats = await new_fingerprint_context(
             pw, headless=headless,
