@@ -1650,9 +1650,26 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                     stats.telemetry_blocked_count += 1
                 return
 
+        # 0c. 已有 TOTP 密钥时拦截 initializemobileapp，返回合成响应（省 ~1.25 MB QR 码）
+        if ("initializemobileapp" in url_lower and request.method == "POST"
+                and getattr(ctx, "_cached_totp_for_mfa", "")):
+            _synth = json.dumps({
+                "QrCode": "", "AccountName": "",
+                "SecretKey": ctx._cached_totp_for_mfa,
+                "Url": None, "AffinityRegion": None,
+                "ActivationCode": None, "RegistrationType": 0, "ErrorCode": 0,
+            }).encode()
+            fulfilled_request_ids.add(id(request))
+            await route.fulfill(status=200, content_type="application/json", body=_synth)
+            if stats:
+                stats.record_blocked(est_size=1300000)
+            return
+
         # 1. 优先放行所有动态安全挑战、登录认证、Azure ARM/Education 与 2FA 相关接口（100% 原生直连）
         if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            if LocalHttpCache.is_cacheable(url):
+            if "portal.azure.com" in host and path_lower.rstrip("/") == "/api/telemetry":
+                pass  # Portal 遥测不放行，落入后续 step 2 拦截
+            elif LocalHttpCache.is_cacheable(url):
                 pass  # 落入后续缓存逻辑
             else:
                 await route.continue_()
@@ -2103,6 +2120,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
 
     ctx = await browser.new_context(**context_kwargs)
     ctx._captured_totp_secret = ""
+    ctx._cached_totp_for_mfa = ""
     await ctx.add_init_script(build_init_script(fp))
 
     stats = TrafficStats()

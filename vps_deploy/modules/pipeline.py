@@ -469,10 +469,13 @@ async def process_account(
             if cached_totp:
                 account.totp_secret = cached_totp
                 _emit(cb, f"  💾 从本地持久化缓存载入 2FA 密钥: {cached_totp[:4]}***")
+        if getattr(account, "totp_secret", ""):
+            ctx._cached_totp_for_mfa = account.totp_secret
 
         def _on_secret_captured(secret_val: str):
             if secret_val:
                 account.totp_secret = secret_val
+                ctx._cached_totp_for_mfa = secret_val
                 save_totp_cache(account.email, secret_val)
                 _emit(cb, f"  💾 实时捕获并保存 2FA 密钥: {secret_val}")
 
