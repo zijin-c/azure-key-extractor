@@ -1590,9 +1590,9 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         ".dmg", ".pkg", ".bin", ".apk", ".m4s", ".ts", ".flv", ".m3u8"
     )
 
-    # 纯装饰性背景图 / 头像 / 遥测 / 分析追踪域（拦截后不影响任何业务功能）
-    BLOCK_DOMAINS = (
-        "aadcdn.msftauthimages.net", "aadcdn.msauthimages.net",
+    # 纯装饰性背景图 / 头像 / 遥测 / 分析追踪域（后缀匹配，覆盖 CDN 变体子域）
+    BLOCK_DOMAIN_SUFFIXES = (
+        "msftauthimages.net", "msauthimages.net",
         "dc.services.visualstudio.com", "self.events.data.microsoft.com",
         "browser.pipe.aria.microsoft.com", "mobile.events.data.microsoft.com",
         "in.applicationinsights.azure.com", "js.monitor.azure.com",
@@ -1601,6 +1601,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         "res-1.cdn.office.net",
         "c.bing.com", "th.bing.com",
     )
+    _AUTH_IMAGE_SUFFIXES = ("msftauthimages.net", "msauthimages.net")
 
     TELEMETRY_PATHS = (
         "/onecollector/1.0", "/api/telemetry",
@@ -1621,9 +1622,10 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         host = (parsed.hostname or "").lower()
         path_lower = (parsed.path or "").lower()
 
-        # 0. 拦截纯装饰性背景图 / 头像 / 遥测追踪域（整域拦截，不影响任何业务功能）
-        if block_telemetry and host in BLOCK_DOMAINS:
-            if r_type == "image" or host in ("aadcdn.msftauthimages.net", "aadcdn.msauthimages.net"):
+        # 0. 拦截纯装饰性背景图 / 头像 / 遥测追踪域（后缀匹配，覆盖 CDN 变体子域）
+        _is_block_domain = any(host == s or host.endswith("." + s) for s in BLOCK_DOMAIN_SUFFIXES)
+        if block_telemetry and _is_block_domain:
+            if r_type == "image" or any(host.endswith(s) for s in _AUTH_IMAGE_SUFFIXES):
                 fulfilled_request_ids.add(id(request))
                 await route.fulfill(status=200, content_type="image/png", body=_DUMMY_PNG_IMAGE)
                 if stats:

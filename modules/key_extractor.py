@@ -1943,17 +1943,7 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     _emit(cb, "  ⏳ 等待微软后台确认协议生效（5s）...")
     await asyncio.sleep(5)
 
-    # 6. 重新刷新 Software 页面并校验横幅是否已消除
-    _emit(cb, "  🔄 刷新 Software 页面以应用协议与加载软件列表...")
-    try:
-        await sw_page.reload(wait_until="domcontentloaded", timeout=30000)
-    except Exception:
-        try:
-            await sw_page.goto(config.AZURE_EDU_SOFTWARE_URL,
-                                wait_until="domcontentloaded", timeout=45000)
-        except Exception:
-            pass
-
+    # 6. 等待软件搜索框出现（协议接受后页面自动刷新，无需手动 reload）
     for _w in range(30):
         await asyncio.sleep(0.5)
         try:
