@@ -453,7 +453,7 @@ async def process_account(
         exe_path = chromium_path if chromium_path and os.path.exists(chromium_path) else None
 
         if config.ENABLE_SAVE_DATA:
-            await warmup_static_cache(pw, proxy_config=proxy_config, exe_path=exe_path)
+            await warmup_static_cache(pw, proxy_config=proxy_config, exe_path=exe_path, cb=cb)
 
         browser, ctx, fp, stats = await new_fingerprint_context(
             pw, headless=headless,

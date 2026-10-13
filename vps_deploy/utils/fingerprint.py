@@ -25,6 +25,7 @@
 22. Event.prototype.isTrusted 原生 getter 保护。
 """
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -32,6 +33,8 @@ import os
 import random
 import re
 import sys
+import threading
+import time
 from urllib.parse import urlparse, urlsplit
 from utils.http_cache import LocalHttpCache, transfer_body_size
 
@@ -1755,7 +1758,9 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         if LocalHttpCache.is_cacheable(url, "GET"):
             # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
-            async with LocalHttpCache.download_lock(url, timeout=8) as acquired:
+            # 单次 fetch 的上限为 20 秒。等待共享下载必须比它更长，
+            # 否则慢代理会让等待者在下载完成前同时发起重复请求。
+            async with LocalHttpCache.download_lock(url, timeout=45) as acquired:
                 if not acquired:
                     # 其他账号下载卡住时，当前账号原生加载；正常快速下载仍共享缓存。
                     await route.continue_()
@@ -1966,65 +1971,108 @@ def _get_proxy_geo(proxy_config: dict | None) -> dict:
     return {}
 
 
-_cache_warm_done = False
+_cache_warm_guard = threading.Lock()
+_cache_warm_done = set()
+_cache_warm_inflight = {}
+_cache_warm_retry_after = {}
+
+
+def _static_cache_count():
+    try:
+        return sum(name.endswith('.body') for name in os.listdir(LocalHttpCache.CACHE_DIR))
+    except OSError:
+        return 0
+
+
+async def _download_public_cache(pw, proxy_config, exe_path):
+    """无登录会话的公共资源预热；不提交身份资料或请求产品密钥。"""
+    browser = None
+    try:
+        args = ['--disable-background-networking', '--no-first-run',
+                '--no-default-browser-check', '--disable-dev-shm-usage']
+        if sys.platform != 'win32':
+            args.append('--no-sandbox')
+        browser = await pw.chromium.launch(
+            headless=True, proxy=proxy_config, args=args, timeout=15000,
+            **({'executable_path': exe_path} if exe_path else {}),
+        )
+        ctx = await browser.new_context(locale='en-US', viewport={'width': 1440, 'height': 900})
+        await setup_save_data_route(ctx, TrafficStats())
+        page = await ctx.new_page()
+        for url in ('https://signup.azure.com/studentverification?offerType=1',
+                    'https://portal.azure.com/'):
+            try:
+                await page.goto(url, wait_until='domcontentloaded', timeout=10000)
+                await page.wait_for_load_state('networkidle', timeout=4000)
+            except Exception:
+                # 已成功下载的资源仍保留；一个入口失败不阻断另一个。
+                continue
+    finally:
+        if browser is not None:
+            await browser.close()
 
 
 async def warmup_static_cache(pw, proxy_config: dict | None = None,
                                exe_path: str | None = None,
-                               min_files: int = 100):
-    """首次部署缓存预热：加载登录页和 Portal 页面，缓存 JS/CSS/字体等静态资源。"""
-    global _cache_warm_done
-    if _cache_warm_done:
+                               min_files: int = 100, cb=None):
+    """缓存不足时自动预热；进程内跨线程/事件循环仅一个任务下载。"""
+    def emit(message):
+        log.info(message)
+        if cb:
+            cb(message)
+
+    root = os.path.abspath(LocalHttpCache.CACHE_DIR)
+    before = _static_cache_count()
+    with _cache_warm_guard:
+        if root in _cache_warm_done:
+            return
+        if before >= min_files:
+            _cache_warm_done.add(root)
+            return
+        if time.monotonic() < _cache_warm_retry_after.get(root, 0):
+            return
+        future = _cache_warm_inflight.get(root)
+        owner = future is None
+        if owner:
+            future = concurrent.futures.Future()
+            _cache_warm_inflight[root] = future
+
+    if not owner:
+        emit('  ⏳ [缓存预热] 等待其他任务完成共享预热...')
+        # 某个等待任务被取消时，不能取消所有任务共享的 future。
+        await asyncio.shield(asyncio.wrap_future(future))
         return
-    cache_dir = LocalHttpCache.CACHE_DIR
+
+    success = False
     try:
-        body_count = sum(1 for f in os.listdir(cache_dir) if f.endswith(".body")) if os.path.isdir(cache_dir) else 0
-    except OSError:
-        body_count = 0
-    if body_count >= min_files:
-        _cache_warm_done = True
-        return
-    log.info("[缓存预热] 本地缓存不足 (%d 个文件 < %d)，自动预热中...", body_count, min_files)
-    launch_args = list(get_traffic_saving_args())
-    browser = await pw.chromium.launch(
-        headless=True,
-        proxy=proxy_config,
-        **({"executable_path": exe_path} if exe_path else {}),
-        args=launch_args,
-    )
-    try:
-        ctx = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            ignore_https_errors=True,
-        )
-        warmup_stats = TrafficStats()
-        await setup_save_data_route(ctx, warmup_stats)
-        page = await ctx.new_page()
-        page.set_default_timeout(30000)
-        warmup_urls = [
-            "https://signup.azure.com/api/user/login?returnUrl=https%3A%2F%2Fsignup.azure.com",
-            "https://portal.azure.com/",
-        ]
-        for url in warmup_urls:
+        emit(f'  📦 [缓存预热] 当前 {before} 个资源，优先直连下载公共静态资源...')
+        paths = [('直连', None)]
+        if proxy_config:
+            paths.append(('代理回退', proxy_config))
+        for label, route in paths:
             try:
-                await page.goto(url, wait_until="networkidle", timeout=45000)
-            except Exception:
-                pass
-            await asyncio.sleep(1)
-        await ctx.close()
-    except Exception as e:
-        log.warning("[缓存预热] 出错: %s", e)
+                await asyncio.wait_for(_download_public_cache(pw, route, exe_path), timeout=25)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                emit(f'  ⚠️ [缓存预热] {label}未完成 ({type(error).__name__})，保留已下载资源')
+            after = _static_cache_count()
+            if after > before:
+                success = True
+                emit(f'  ✅ [缓存预热] {label}完成：{before} → {after} 个资源；其余资源运行时继续补齐')
+                break
+            if route is None and proxy_config:
+                emit('  🌐 [缓存预热] 直连未取得缓存，尝试代理下载（会消耗代理流量）...')
+        if not success:
+            emit('  ⚠️ [缓存预热] 暂未取得资源，继续正常流程；5 分钟后允许再次预热')
     finally:
-        try:
-            await browser.close()
-        except Exception:
-            pass
-    try:
-        new_count = sum(1 for f in os.listdir(cache_dir) if f.endswith(".body")) if os.path.isdir(cache_dir) else 0
-    except OSError:
-        new_count = 0
-    log.info("[缓存预热] 完成，缓存文件: %d → %d", body_count, new_count)
-    _cache_warm_done = True
+        with _cache_warm_guard:
+            if success:
+                _cache_warm_done.add(root)
+            else:
+                _cache_warm_retry_after[root] = time.monotonic() + 300
+            _cache_warm_inflight.pop(root, None)
+            future.set_result(success)
 
 
 async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
