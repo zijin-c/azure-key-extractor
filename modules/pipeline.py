@@ -519,6 +519,7 @@ async def process_account(
         vp_info = fp.get('viewport', {'width': 1920, 'height': 1080})
         tz_info = fp.get('timezone', 'UTC')
         _emit(cb, f"  🖥️  指纹: Chrome/{c_ver} | {vp_info['width']}x{vp_info['height']} | TZ={tz_info}")
+        _emit(cb, "  📦 浏览器组件更新/默认应用后台下载已禁用（仅本次浏览器进程）")
         if config.ENABLE_SAVE_DATA:
             _emit(cb, "  🚀 省流量模式已开启（公共静态资源缓存复用，媒体/安装包拦截，认证/API 放行）")
         else:

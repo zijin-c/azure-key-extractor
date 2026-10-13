@@ -1995,6 +1995,16 @@ _cache_warm_inflight = {}
 _cache_warm_retry_after = {}
 
 
+# 仅限制本次启动的自动化浏览器，不修改系统浏览器的更新设置。
+# 网页路由看不到浏览器进程的组件下载，必须在启动时禁用。
+BROWSER_BACKGROUND_NETWORK_ARGS = (
+    '--disable-background-networking',
+    '--disable-component-update',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
+)
+
+
 def _static_cache_count():
     try:
         return sum(name.endswith('.body') for name in os.listdir(LocalHttpCache.CACHE_DIR))
@@ -2006,7 +2016,7 @@ async def _download_public_cache(pw, proxy_config, exe_path):
     """无登录会话的公共资源预热；不提交身份资料或请求产品密钥。"""
     browser = None
     try:
-        args = ['--disable-background-networking', '--no-first-run',
+        args = [*BROWSER_BACKGROUND_NETWORK_ARGS, '--no-first-run',
                 '--no-default-browser-check', '--disable-dev-shm-usage']
         if sys.platform != 'win32':
             args.append('--no-sandbox')
@@ -2142,7 +2152,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--enforce-webrtc-ip-permission-check",
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-pings",
-        "--disable-background-networking",
+        *BROWSER_BACKGROUND_NETWORK_ARGS,
         "--disable-domain-reliability",
         "--disable-sync",
         "--disable-background-timer-throttling",
@@ -2169,7 +2179,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         import config
         exe_path = config.ensure_chromium_installed()
 
-    # 严格移除 Playwright 默认的自动化与受控特征参数（参考 Patchright / rebrowser-patches）
+    # 保留原有兼容参数；不可移除禁止组件更新/默认应用安装的省流参数。
     launch_kwargs = {
         "headless": headless,
         "slow_mo": slow_mo,
@@ -2177,10 +2187,7 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "ignore_default_args": [
             "--enable-automation",
             "--disable-popup-blocking",
-            "--disable-default-apps",
             "--disable-extensions",
-            "--disable-component-update",
-            "--disable-component-extensions-with-background-pages",
         ],
         "args": browser_args,
     }
