@@ -1292,7 +1292,7 @@ async def extract_all_keys(
         _emit(cb, "  🌐 新开标签页 → Azure Education Software...")
         sw_page = await ctx.new_page()
 
-    sw_page.set_default_timeout(8000)
+    sw_page.set_default_timeout(15000)
 
     # 挂载网络层实时嗅探器（自动嗅探发包返回的 Product Key 与 403 风控拒发）
     if not hasattr(sw_page, "_sniffed_keys"):

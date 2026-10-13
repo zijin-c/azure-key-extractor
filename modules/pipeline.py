@@ -235,13 +235,13 @@ class DynamicProxyBridge:
                         stype = bridge._socks_mod.SOCKS4 if "4" in scheme else bridge._socks_mod.SOCKS5
                         sock = bridge._socks_mod.socksocket()
                         sock.set_proxy(stype, host, port, True, user, pwd)
-                        sock.settimeout(15)
+                        sock.settimeout(30)
                         sock.connect((t_host, t_port))
                         upstream_sock = sock
                     elif scheme in ("http", "https") and host:
                         import base64
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(15)
+                        sock.settimeout(20)
                         sock.connect((host, port))
                         connect_req = f"CONNECT {t_host}:{t_port} HTTP/1.1\r\nHost: {t_host}:{t_port}\r\n"
                         if user and pwd:

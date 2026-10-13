@@ -1593,13 +1593,17 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
     # 纯装饰性背景图 / 头像 / 遥测 / 分析追踪域（后缀匹配，覆盖 CDN 变体子域）
     BLOCK_DOMAIN_SUFFIXES = (
         "msftauthimages.net", "msauthimages.net",
-        "dc.services.visualstudio.com", "self.events.data.microsoft.com",
+        "dc.services.visualstudio.com",
+        "self.events.data.microsoft.com", "browser.events.data.microsoft.com",
         "browser.pipe.aria.microsoft.com", "mobile.events.data.microsoft.com",
         "in.applicationinsights.azure.com", "js.monitor.azure.com",
         "edge.microsoft.com", "config.edge.skype.com",
         "go.microsoft.com",
         "res-1.cdn.office.net",
         "c.bing.com", "th.bing.com",
+        "substrate.office.com", "arc.msn.com", "assets.msn.com",
+        "nrb.footprintdns.com",
+        "activity.windows.com",
     )
     _AUTH_IMAGE_SUFFIXES = ("msftauthimages.net", "msauthimages.net")
 
@@ -1659,10 +1663,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 return
 
         # 2. 广义遥测端点拦截（返回空成功响应）
-        is_telemetry = (
-            any(path_lower.rstrip("/") == tp for tp in TELEMETRY_PATHS)
-            or host == "browser.events.data.microsoft.com"
-        )
+        is_telemetry = any(path_lower.rstrip("/") == tp for tp in TELEMETRY_PATHS)
         if (block_telemetry and is_telemetry and request.method in ("GET", "POST", "OPTIONS")
                 and r_type != "document" and not request.is_navigation_request()):
             headers = {"cache-control": "no-store"}
@@ -1702,7 +1703,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
 
         if LocalHttpCache.is_cacheable(url, "GET"):
             # 一个账号下载时，其余账号等待并复用结果；所有等待结束后释放锁索引。
-            async with LocalHttpCache.download_lock(url, timeout=3) as acquired:
+            async with LocalHttpCache.download_lock(url, timeout=8) as acquired:
                 if not acquired:
                     # 其他账号下载卡住时，当前账号原生加载；正常快速下载仍共享缓存。
                     await route.continue_()
@@ -1724,7 +1725,7 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                     if etag:
                         fetch_kwargs["headers"] = {**request.headers, "If-None-Match": etag}
                 try:
-                    fetched = await route.fetch(timeout=10000, max_retries=0, **fetch_kwargs)
+                    fetched = await route.fetch(timeout=20000, max_retries=1, **fetch_kwargs)
                 except Exception:
                     # fetch 失败后允许浏览器正常请求，不计为缓存命中。
                     await route.continue_()
@@ -1973,7 +1974,11 @@ async def new_fingerprint_context(pw, headless: bool, proxy_config: dict | None,
         "--ignore-gpu-blocklist",
         "--password-store=basic",
         "--disable-search-engine-choice-screen",
-        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider",
+        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,InterestFeedContentSuggestions",
+        "--disable-client-side-phishing-detection",
+        "--disable-breakpad",
+        "--metrics-recording-only",
+        "--no-report-upload",
         "--enable-features=NetworkService,NetworkServiceInProcess",
         f"--lang={locale}",
     ]
