@@ -157,6 +157,13 @@ async def _find_visible_locator(page: Page, selectors: list[str], timeout_ms: in
     return None, None
 
 
+async def _complete_azure_offer_signup(page: Page, ms_email: str, cb: ProgressCallback = None) -> bool:
+    """The signup.azure.com/signup profile page means SheerID passed; the form needs no input
+    and key extraction opens its own tab."""
+    _emit(cb, "  ✅ 已到达订阅资料页（无需填写），SheerID 认证通过，转入新标签页提取 Key...")
+    return True
+
+
 async def fill_azure_profile_form(page: Page, ms_email: str, cb: ProgressCallback = None) -> bool:
     """保留有界加载诊断，结束时移除监听，避免长时间运行积累回调。"""
     diagnostics = []
@@ -225,9 +232,9 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
             else:
                 _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
                 return True
-        elif "signup?offer=" in cur_url:
-            _emit(cb, "  ✅ 学术认证已通过，处于 Offer 订阅开通阶段")
-            return True
+        elif "signup.azure.com/signup" in cur_url and "/studentverification" not in cur_url:
+            _emit(cb, "  ✅ 学术认证已通过，处于订阅激活阶段，开始完成订阅...")
+            return await _complete_azure_offer_signup(page, ms_email, cb)
 
         # 2. 等待 SheerID 表单渲染。慢网络下 Angular/iframe 可能需要几十秒，
         #    不在等待中途刷新，避免把正在加载的表单主动打断。
@@ -238,9 +245,9 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
         form_wait_seconds = 20
         for wait_s in range(form_wait_seconds):
             cur_url = (page.url or "").lower()
-            if "signup?offer=" in cur_url:
-                _emit(cb, "  ✅ 学术认证已通过，无需重复填写")
-                return True
+            if "signup.azure.com/signup" in cur_url and "/studentverification" not in cur_url:
+                _emit(cb, "  ✅ 学术认证已通过，进入订阅激活阶段...")
+                return await _complete_azure_offer_signup(page, ms_email, cb)
             if "portal.azure.com" in cur_url or "education.azure.com" in cur_url:
                 is_unregistered_portal = False
                 try:
@@ -663,20 +670,28 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
                 _emit(cb, "  ❌ SheerID 学术审核明确被拒 / 需要人工上传证明文件")
                 raise SheerIDVerificationError("SheerID 审核未通过: 账号被拒或要求人工上传学生证件")
 
-            # 1. 成功跳转到 Portal / 业务平台 / 注册 Offer 页面
-            if "portal.azure.com" in url or "education.azure.com" in url or "signup?offer=" in url:
+            # 1. 成功跳转到 Portal / 业务平台
+            if "portal.azure.com" in url or "education.azure.com" in url:
                 _emit(cb, f"  ✅ Academic Verification 确认完成（页面已跳转: {url[:60]}）")
                 verification_passed = True
                 return True
+
+            # 1b. 跳转到 signup.azure.com/signup — 需要完成订阅激活
+            if "signup.azure.com/signup" in url and "/studentverification" not in url:
+                _emit(cb, f"  ✅ SheerID 学术认证通过，进入订阅激活阶段: {url[:60]}")
+                result = await _complete_azure_offer_signup(page, ms_email, cb)
+                if result:
+                    verification_passed = True
+                    return True
+                continue
 
             # 2. 正在审核中/过渡状态，持续等待
             if "confirming your account" in body_lower or "setting up" in body_lower or "verifying" in body_lower or "正在确认" in body_lower:
                 _emit(cb, f"  ⏳ 正在确认账户 (confirming your account, {i+1}/20)...")
                 continue
 
-            # 3. 成功通过标志（到达 Your profile / 个人资料 / 验证完成 / 邮件已发送）
+            # 3. 成功通过标志（到达 Portal / 验证完成 / 邮件已发送）
             if any(k in body_lower for k in (
-                "your profile", "你的个人资料", "面向学生的 azure", "azure for students",
                 "verification complete", "verification email has been sent", "已发送验证电子邮件",
                 "you are verified", "you're verified", "you've been verified",
                 "academic verification approved", "academic status confirmed", "verification successful",
@@ -685,6 +700,18 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
                 _emit(cb, "  ✅ Academic Verification 确认完成")
                 verification_passed = True
                 return True
+
+            # 3b. 停留在 signup.azure.com 且页面有 profile/offer 内容 — 需要完成订阅激活
+            if "signup.azure.com" in url and "/studentverification" not in url and any(k in body_lower for k in (
+                "your profile", "你的个人资料", "面向学生的 azure", "azure for students",
+                "sign up", "注册", "subscription agreement",
+            )):
+                _emit(cb, "  ✅ SheerID 认证通过，检测到订阅激活页面，开始填写...")
+                result = await _complete_azure_offer_signup(page, ms_email, cb)
+                if result:
+                    verification_passed = True
+                    return True
+                continue
 
         # 若本次尝试在 60 秒内均未确认成功，触发刷新重试
         if not verification_passed:

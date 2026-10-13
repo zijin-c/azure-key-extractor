@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from modules.azure_login import do_azure_login, LoginNetworkError, EmailInputTimeoutError, AzureCaptchaError
 from modules.azure_signup import fill_azure_profile_form, SheerIDVerificationError
-from modules.key_extractor import extract_all_keys, PortalLoadError
+from modules.key_extractor import extract_all_keys, PortalLoadError, AzureRiskBlockedError
 from utils.fingerprint import new_fingerprint_context
 from utils.xray_proxy import XrayProxyChain
 from utils.captcha_detector import check_captcha_present
@@ -543,7 +543,8 @@ async def process_account(
 
         # ── 步骤2: 确保主动定向到学生认证入口 ──────────────
         # 必须带上 returnUrl 到 studentverification，使微软账号上下文与学生认证严格绑定
-        if "studentverification" not in page.url.lower() and "signup?offer=" not in page.url.lower():
+        cur_pipeline_url = page.url.lower()
+        if "studentverification" not in cur_pipeline_url and "signup?offer=" not in cur_pipeline_url and "signup.azure.com/signup" not in cur_pipeline_url:
             target_redir = config.AZURE_SIGNUP_URL
             _emit(cb, f"  🌐 主动定向至学生认证入口: {target_redir[:80]}")
             try:
@@ -571,25 +572,67 @@ async def process_account(
             if is_captcha:
                 raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
 
-            # portal / education 平台检测：必须排查是否需要 Sign up now
+            # portal / education 平台检测：排查风控红条与是否需要 Sign up now
             if "portal.azure.com" in current_url or "education.azure.com" in current_url or "azureforeducation" in current_url:
                 try:
-                    has_signup_prompt = await page.evaluate("""
+                    portal_eval = await page.evaluate("""
                         () => {
-                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                            return txt.includes('sign up for azure for students') ||
-                                   (txt.includes('sign up now') && txt.includes('students')) ||
-                                   (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                            const txt = (document.body ? document.body.innerText : '') || '';
+                            const lower = txt.toLowerCase();
+
+                            // 1. 微软账号/教育授权系统级风控红条
+                            if (lower.includes('unable to validate your access') ||
+                                lower.includes('detecting a problem with your account') ||
+                                lower.includes('are a detecting a problem') ||
+                                lower.includes('sorry but our systems are detecting a problem') ||
+                                lower.includes('sorry but our systems are a detecting a problem') ||
+                                lower.includes('无法验证您的访问权限') ||
+                                lower.includes('无法验证你的访问权限') ||
+                                lower.includes('检测到您的帐户存在问题') ||
+                                lower.includes('检测到你的帐户存在问题')) {
+                                const m = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
+                                return { risk_blocked: true, tx_id: m ? m[1] : '' };
+                            }
+
+                            // 2. 页面明确提示 Sign up now（尚未开通学生订阅 MS-AZR-0170P）
+                            if (lower.includes('sign up for azure for students') ||
+                                (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
+                                (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
+                                return { needs_signup: true };
+                            }
+
+                            // 3. 检查 Portal 是否真正加载就绪（排除初期的空白骨架 DOM）
+                            const isLoaded = !!(
+                                document.querySelector('.fxs-topbar') ||
+                                document.querySelector('.fxs-blade') ||
+                                document.querySelector('[class*="education" i]') ||
+                                lower.includes('learning resources') ||
+                                lower.includes('学习资源') ||
+                                lower.includes('software') ||
+                                lower.includes('软件')
+                            );
+                            return { is_loaded: isLoaded, needs_signup: false, risk_blocked: false };
                         }
                     """)
                 except Exception:
-                    has_signup_prompt = False
+                    portal_eval = {}
 
-                if has_signup_prompt:
+                if portal_eval.get("risk_blocked"):
+                    tx_id = portal_eval.get("tx_id", "")
+                    err_msg = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
+                    if tx_id:
+                        err_msg += f" [Transaction Id: {tx_id}]"
+                    _emit(cb, f"  ❌ {err_msg}")
+                    _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
+                    raise AzureRiskBlockedError(err_msg, totp=totp_secret)
+
+                if portal_eval.get("needs_signup"):
                     _emit(cb, f"  ⚠️ 处于 Azure 平台但检测到 [Sign up now]（该账号尚未开通学生资格），转入学生认证流程...")
                     is_unregistered = True
                     break
-                else:
+
+                if portal_eval.get("is_loaded") and poll_i >= 4:
+                    # 确保页面渲染稳定（至少经过 4 秒），且无 sign up now 与风控提示
                     is_already_registered = True
                     _emit(cb, f"  ✅ 检测到 Azure 业务管理平台已开通就绪（{poll_i+1}s）: {current_url[:60]}")
                     break
@@ -670,28 +713,58 @@ async def process_account(
                 ))
             )):
                 try:
-                    has_signup_prompt = await page.evaluate("""
+                    eval_reg = await page.evaluate("""
                         () => {
-                            const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                            return txt.includes('sign up for azure for students') ||
-                                   (txt.includes('sign up now') && txt.includes('students')) ||
-                                   (txt.includes('面向学生的 azure') && txt.includes('立即注册'));
+                            const txt = (document.body ? document.body.innerText : '') || '';
+                            const lower = txt.toLowerCase();
+
+                            // 1. 微软账号/教育授权系统级风控红条
+                            if (lower.includes('unable to validate your access') ||
+                                lower.includes('detecting a problem with your account') ||
+                                lower.includes('are a detecting a problem') ||
+                                lower.includes('sorry but our systems are detecting a problem') ||
+                                lower.includes('sorry but our systems are a detecting a problem') ||
+                                lower.includes('无法验证您的访问权限') ||
+                                lower.includes('无法验证你的访问权限') ||
+                                lower.includes('检测到您的帐户存在问题') ||
+                                lower.includes('检测到你的帐户存在问题')) {
+                                const m = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
+                                return { risk_blocked: true, tx_id: m ? m[1] : '' };
+                            }
+
+                            // 2. 页面明确提示 Sign up now（尚未开通学生订阅 MS-AZR-0170P）
+                            if (lower.includes('sign up for azure for students') ||
+                                (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
+                                (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
+                                return { needs_signup: true };
+                            }
+
+                            return { ready: true };
                         }
                     """)
                 except Exception:
-                    has_signup_prompt = False
+                    eval_reg = {}
 
-                if has_signup_prompt:
+                if eval_reg.get("risk_blocked"):
+                    tx_id = eval_reg.get("tx_id", "")
+                    err_msg = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
+                    if tx_id:
+                        err_msg += f" [Transaction Id: {tx_id}]"
+                    _emit(cb, f"  ❌ {err_msg}")
+                    _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
+                    raise AzureRiskBlockedError(err_msg, totp=totp_secret)
+
+                if eval_reg.get("needs_signup"):
                     _emit(cb, "  ⚠️ 页面提示需开通学生资格 (Sign up now)，转入 SheerID 学生认证流程...")
                     is_unregistered = True
                     break
-                else:
+                elif poll_i >= 4:
                     is_already_registered = True
                     _emit(cb, f"  ✅ 检测到已注册就绪状态（{poll_i+1}s）")
                     break
 
             # 检测 SheerID 学术核验阶段 或 Your profile 个人资料阶段
-            if "signup?offer=" in current_url.lower() or any(k in (page_headings + " " + page_title.lower()) for k in (
+            if "signup?offer=" in current_url.lower() or ("signup.azure.com/signup" in current_url.lower() and "/studentverification" not in current_url.lower()) or any(k in (page_headings + " " + page_title.lower()) for k in (
                 "academic verification", "verify your academic status", "check your info",
                 "学术验证", "验证学术状态", "学生验证", "your profile", "你的个人资料",
                 "面向学生的 azure", "azure for students"
@@ -1011,7 +1084,12 @@ async def run_pipeline(
                         is_tunnel_err = any(k in err_msg for k in ["ERR_TUNNEL_CONNECTION_FAILED", "ERR_EMPTY_RESPONSE", "ERR_PROXY", "502 Bad Gateway"])
                         if is_tunnel_err and curr_proxy:
                             _account_cb(f"⚠️  [代理隧道断开/认证失败] 当前代理 {curr_proxy} 拒绝连接或无法访问目标网站！")
-                        stage = "Portal/提 Key 页面" if isinstance(e, PortalLoadError) else ("登录页面" if isinstance(e, (EmailInputTimeoutError, LoginNetworkError)) else "网络连接")
+                        if isinstance(e, AzureRiskBlockedError):
+                            stage = "微软风控拦截"
+                        elif isinstance(e, PortalLoadError):
+                            stage = "Portal/提 Key 页面"
+                        else:
+                            stage = "登录页面" if isinstance(e, (EmailInputTimeoutError, LoginNetworkError)) else "网络连接"
                         if network_retry < max_network_retries:
                             network_retry += 1
                             old_proxy = curr_proxy

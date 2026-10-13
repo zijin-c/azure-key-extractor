@@ -1590,6 +1590,25 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         ".dmg", ".pkg", ".bin", ".apk", ".m4s", ".ts", ".flv", ".m3u8"
     )
 
+    # 纯装饰性背景图 / 头像 / 遥测 / 分析追踪域（拦截后不影响任何业务功能）
+    BLOCK_DOMAINS = (
+        "aadcdn.msftauthimages.net", "aadcdn.msauthimages.net",
+        "dc.services.visualstudio.com", "self.events.data.microsoft.com",
+        "browser.pipe.aria.microsoft.com", "mobile.events.data.microsoft.com",
+        "in.applicationinsights.azure.com", "js.monitor.azure.com",
+        "edge.microsoft.com", "config.edge.skype.com",
+        "go.microsoft.com",
+        "res-1.cdn.office.net",
+        "c.bing.com", "th.bing.com",
+    )
+
+    TELEMETRY_PATHS = (
+        "/onecollector/1.0", "/api/telemetry",
+        "/collect/v1", "/v2/track",
+        "/api/portal/diagnostics", "/api/portal/intents",
+        "/api/clienterror", "/api/trace",
+    )
+
     fulfilled_request_ids = set()
     block_telemetry = os.getenv("BLOCK_TELEMETRY", "true").strip().lower() not in ("0", "false", "no", "off")
 
@@ -1598,37 +1617,51 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
         url = request.url
         url_lower = url.lower()
         clean_url = url_lower.split("?")[0].split("#")[0]
-
-        # 0. 优先放行所有动态安全挑战、登录认证、Azure ARM/Education 与 2FA 相关接口（100% 原生直连，绝不拦截、绝不干扰）
-        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            await route.continue_()
-            return
-
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
+        path_lower = (parsed.path or "").lower()
 
-        # 核心 Azure 管理/业务 API、教育平台、批处理与身份认证域：绝不拦截，绝不进缓存
+        # 0. 拦截纯装饰性背景图 / 头像 / 遥测追踪域（整域拦截，不影响任何业务功能）
+        if block_telemetry and host in BLOCK_DOMAINS:
+            if r_type == "image" or host in ("aadcdn.msftauthimages.net", "aadcdn.msauthimages.net"):
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(status=200, content_type="image/png", body=_DUMMY_PNG_IMAGE)
+                if stats:
+                    stats.record_blocked(est_size=280000)
+                return
+            if r_type != "document" and not request.is_navigation_request():
+                fulfilled_request_ids.add(id(request))
+                await route.fulfill(status=204, headers={"cache-control": "no-store"}, body=b"")
+                if stats:
+                    stats.telemetry_blocked_count += 1
+                return
+
+        # 1. 优先放行所有动态安全挑战、登录认证、Azure ARM/Education 与 2FA 相关接口（100% 原生直连）
+        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
+            if LocalHttpCache.is_cacheable(url):
+                pass  # 落入后续缓存逻辑
+            else:
+                await route.continue_()
+                return
+
+        # 核心 Azure 管理/业务 API、教育平台、批处理与身份认证域
         core_api_domains = (
             "management.azure.com", "graph.microsoft.com", "main.iam.ad.ext.azure.com",
             "education.azure.com", "signup.azure.com", "mysignins.microsoft.com", "login.microsoftonline.com"
         )
         if any(d in host for d in core_api_domains) or (
-            "portal.azure.com" in host and (
-                (parsed.path.lower().startswith("/api/") and parsed.path.rstrip("/").lower() != "/api/telemetry")
-                or any(seg in url_lower for seg in ("/batch", "/education", "/subscriptions", "/providers", "software"))
-            )
+            "portal.azure.com" in host and path_lower.startswith("/api/") and path_lower.rstrip("/") != "/api/telemetry"
         ):
-            # 仅当属于明确的纯静态 CSS/JS/字体等公开资源时才允许复用缓存，其他动态请求全部原生直连
             if not LocalHttpCache.is_cacheable(url):
                 await route.continue_()
                 return
 
-        # 明确的遥测端点在 POST 放行规则之前处理。返回成功，避免客户端错误重试。
-        telemetry_endpoint = (
-            (parsed.hostname == "browser.events.data.microsoft.com" and parsed.path.rstrip("/").lower() == "/onecollector/1.0")
-            or (parsed.hostname == "portal.azure.com" and parsed.path.rstrip("/").lower() == "/api/telemetry")
+        # 2. 广义遥测端点拦截（返回空成功响应）
+        is_telemetry = (
+            any(path_lower.rstrip("/") == tp for tp in TELEMETRY_PATHS)
+            or host == "browser.events.data.microsoft.com"
         )
-        if (block_telemetry and telemetry_endpoint and request.method in ("GET", "POST", "OPTIONS")
+        if (block_telemetry and is_telemetry and request.method in ("GET", "POST", "OPTIONS")
                 and r_type != "document" and not request.is_navigation_request()):
             headers = {"cache-control": "no-store"}
             origin = request.headers.get("origin")
@@ -1643,16 +1676,26 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 stats.telemetry_blocked_count += 1
             return
 
-        # 1. 核心业务导航、主 HTML 文档以及所有非 GET 请求 (POST/PUT/DELETE/OPTIONS)：100% 原生直连（保证 Cookie、Session、登录跳转与 API 完整性）
+        # 3. 核心业务导航、主 HTML 文档以及所有非 GET 请求：100% 原生直连
         if r_type == "document" or request.is_navigation_request() or request.method != "GET":
             await route.continue_()
             return
 
-        # 2. 拦截超大体积无用媒体与安装包文件 (.mp4, .zip, .iso, .exe, .msi 等)
+        # 4. 拦截超大体积无用媒体与安装包文件
         if clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=5000000)
             await route.abort()
+            return
+
+        # 4b. 拦截 Portal 非必要图片（仅保留 Education 产品图标与验证码图片）
+        if r_type == "image" and "portal.azure.com" in host and not any(
+            k in url_lower for k in ("education", "software", "captcha", "arkose")
+        ):
+            fulfilled_request_ids.add(id(request))
+            await route.fulfill(status=200, content_type="image/svg+xml", body=_DUMMY_SVG_IMAGE)
+            if stats:
+                stats.record_blocked(est_size=50000)
             return
 
         if LocalHttpCache.is_cacheable(url, "GET"):
@@ -1715,19 +1758,14 @@ async def setup_save_data_route(ctx, stats: TrafficStats = None):
                 await route.fulfill(response=fetched, body=body)
                 return
 
-        # 7. 核心风控/验证码挑战接口、Microsoft 动态登录认证接口、2FA 注册密钥接口与 ARM 提 Key 接口：100% 绝对原生放行
-        if any(p in url_lower for p in LocalHttpCache.DYNAMIC_SECURITY_PATTERNS):
-            await route.continue_()
-            return
-
-        # 8. 拦截大体积音视频及安装包
+        # 7. 拦截大体积音视频
         if r_type == "media" or clean_url.endswith(BLOCKED_MEDIA_EXTS):
             if stats:
                 stats.record_blocked(est_size=100000)
             await route.abort()
             return
 
-        # 9. 其他所有核心请求 100% 原生放行（绝不拦截、绝不阻断）
+        # 8. 其他所有请求原生放行
         await route.continue_()
 
     await ctx.route("**/*", _route_handler)

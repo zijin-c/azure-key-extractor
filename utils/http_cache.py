@@ -44,8 +44,7 @@ class LocalHttpCache:
         "/oauth2/token", "/oauth2/v2.0/token", "/reprocess", "/federal/login",
         "/api/authenticationmethods/", "management.azure.com", "graph.microsoft.com",
         "main.iam.ad.ext.azure.com", "education.azure.com",
-        "/batch", "/education", "/software", "/subscriptions", "/providers",
-        "getproductkey",
+        "portal.azure.com/api/", "getproductkey", "educationhub",
         "signup.azure.com/api/", "signup.azure.com/studentverification", "signup.azure.com/signup?offer=",
         "expires=", "signature=", "key-pair-id=",
     )

@@ -32,8 +32,12 @@ ProgressCallback = Optional[Callable[[str], None]]
 _SOFTWARE_SEARCH_JS = """(i) => {
     const r = i.getBoundingClientRect();
     if (!r.width || !r.height || i.disabled || i.readOnly) return false;
-    const label = ((i.placeholder || '') + ' ' + (i.getAttribute('aria-label') || '')).toLowerCase();
+    // 关键：坚决排除顶部全局导航栏与全局搜索框
+    if (i.closest('.fxs-topbar, .fxs-header, nav, [role="banner"], [class*="topbar" i]')) return false;
+    const label = ((i.placeholder || '') + ' ' + (i.getAttribute('aria-label') || '') + ' ' + (i.name || '') + ' ' + (i.id || '')).toLowerCase();
     if (/search resources|global search|搜索资源|全局搜索/.test(label)) return false;
+    // 若当前处于含有顶栏的真实 Azure Portal 中，处于顶栏高度内（top < 55）的输入框一律排除
+    if (document.querySelector('.fxs-topbar, .fxs-header, [class*="topbar" i]') && r.top < 55) return false;
     return /search|搜索|筛选|filter/.test(label) || i.type === 'search' ||
         !!i.closest('.ms-SearchBox, [role="search"], [class*="searchBox" i]');
 }"""
@@ -75,6 +79,11 @@ class PortalLoadError(RuntimeError):
     def __init__(self, msg: str, totp: str = ""):
         super().__init__(msg)
         self.totp = totp or ""
+
+
+class AzureRiskBlockedError(PortalLoadError):
+    """微软系统级风控拦截（无法验证访问权限 / IP风控拒发 Key）。"""
+    pass
 
 
 async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int = 45,
@@ -122,17 +131,40 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
             await asyncio.sleep(1)
             continue
 
-        # 2. 检测 Portal 是否已真正渲染就绪 (排除 bare skeleton)
+        # 2. 检测 Portal 是否已真正渲染就绪 (排除 bare skeleton)，并检查是否命中风控或待注册
         try:
-            ready = await page.evaluate("""
+            eval_res = await page.evaluate("""
                 () => {
                     const u = window.location.href.toLowerCase();
                     const is_login = u.includes('login.microsoftonline') ||
                                      u.includes('login.live.com') ||
                                      u.includes('mysignins');
-                    if (is_login) return false;
+                    if (is_login) return { is_login: true };
                     const txt = (document.body ? document.body.innerText : '') || '';
-                    return !!(
+                    const lower = txt.toLowerCase();
+
+                    // 检测微软风控红条
+                    if (lower.includes('unable to validate your access') ||
+                        lower.includes('detecting a problem with your account') ||
+                        lower.includes('are a detecting a problem') ||
+                        lower.includes('sorry but our systems are detecting a problem') ||
+                        lower.includes('sorry but our systems are a detecting a problem') ||
+                        lower.includes('无法验证您的访问权限') ||
+                        lower.includes('无法验证你的访问权限') ||
+                        lower.includes('检测到您的帐户存在问题') ||
+                        lower.includes('检测到你的帐户存在问题')) {
+                        const txMatch = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
+                        return { risk_blocked: true, tx_id: txMatch ? txMatch[1] : '' };
+                    }
+
+                    // 尚未开通学生资格提示
+                    if (lower.includes('sign up for azure for students') ||
+                        (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
+                        (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
+                        return { needs_signup: true };
+                    }
+
+                    const is_ready = !!(
                         document.querySelector('[placeholder*="Search" i]') ||
                         document.querySelector('[aria-label*="Search" i]') ||
                         document.querySelector('[placeholder*="搜索"]') ||
@@ -148,11 +180,26 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
                         txt.includes('软件') ||
                         txt.includes('Microsoft Azure')
                     );
+                    return { ready: is_ready };
                 }
             """)
-            if ready:
-                _emit(cb, "  ✅ Azure Portal 已加载")
-                return True, current_totp
+            if isinstance(eval_res, dict):
+                if eval_res.get("risk_blocked"):
+                    tx_id = eval_res.get("tx_id", "")
+                    err_msg = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
+                    if tx_id:
+                        err_msg += f" [Transaction Id: {tx_id}]"
+                    _emit(cb, f"  ❌ {err_msg}")
+                    _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
+                    raise AzureRiskBlockedError(err_msg, totp=current_totp)
+                if eval_res.get("needs_signup"):
+                    _emit(cb, "  ⚠️ 当前处于 Education 但页面提示需 [Sign up now]（该账号尚未开通学生资格）")
+                    raise PortalLoadError("该账号尚未开通 Azure for Students 学生资格（页面提示需点击 Sign up now 注册开通）", totp=current_totp)
+                if eval_res.get("ready"):
+                    _emit(cb, "  ✅ Azure Portal 已加载")
+                    return True, current_totp
+        except (AzureRiskBlockedError, PortalLoadError):
+            raise
         except Exception:
             pass
 
@@ -588,7 +635,23 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
     """
 
     async def _scan_all_frames_for_key() -> str:
+        # 0. 优先检测网络层是否遭遇微软 Education 接口风控拒发
+        risk_rej = getattr(page, "_network_risk_rejection", None)
+        if risk_rej and risk_rej.get("error"):
+            ip_str = f" [IP: {risk_rej['ip']}]" if risk_rej.get("ip") else ""
+            sess_str = f" [Session: {risk_rej['session'][:8]}]" if risk_rej.get("session") else ""
+            err_msg = f"微软风控拦截: Education 提 Key 接口被拒 (GetProductOfferKey rejected because of risk rejection, errorID: 1751){ip_str}{sess_str}"
+            _emit(cb, f"  ❌ {err_msg}")
+            _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常，接口直接拒绝发 Key（请更换优质住宅代理）")
+            raise AzureRiskBlockedError(err_msg)
+
         # 1. 优先读取网络层实时嗅探到的密钥（不受 DOM 渲染与 Fluent UI 组件库版本影响）
+        page_sniffed = getattr(page, "_sniffed_keys", None)
+        if page_sniffed:
+            for k in reversed(page_sniffed):
+                if k and k not in existing_set:
+                    _emit(cb, f"  ⚡ 网络层嗅探命中 Product Key: {k}")
+                    return k
         ctx = getattr(page, "context", None)
         if ctx and hasattr(ctx, "_sniffed_keys"):
             for k in reversed(ctx._sniffed_keys):
@@ -1231,6 +1294,35 @@ async def extract_all_keys(
 
     sw_page.set_default_timeout(8000)
 
+    # 挂载网络层实时嗅探器（自动嗅探发包返回的 Product Key 与 403 风控拒发）
+    if not hasattr(sw_page, "_sniffed_keys"):
+        sw_page._sniffed_keys = []
+    if not hasattr(sw_page, "_network_risk_rejection"):
+        sw_page._network_risk_rejection = {}
+
+    async def _on_key_response(response):
+        try:
+            url_lower = response.url.lower()
+            if any(k in url_lower for k in ("educationhub", "batch", "getproductkey", "productcatalog")):
+                body = await response.text()
+                if "risk rejection" in body or '"errorid": 1751' in body.lower() or '"isriskblocked":true' in body.lower():
+                    m_ip = re.search(r'IPAddress=([\d\.]+)', body)
+                    m_tx = re.search(r'SessionId=([a-fA-F0-9-]+)', body)
+                    sw_page._network_risk_rejection["error"] = "risk rejection"
+                    sw_page._network_risk_rejection["ip"] = m_ip.group(1) if m_ip else ""
+                    sw_page._network_risk_rejection["session"] = m_tx.group(1) if m_tx else ""
+                found_keys = re.findall(r'[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}', body)
+                for fk in found_keys:
+                    if fk not in sw_page._sniffed_keys:
+                        sw_page._sniffed_keys.append(fk)
+        except Exception:
+            pass
+
+    try:
+        sw_page.on("response", _on_key_response)
+    except Exception:
+        pass
+
     # 如果不在 Education Software 页面，则导航
     if "EducationMenuBlade" not in (sw_page.url or ""):
         for attempt in range(3):
@@ -1280,6 +1372,77 @@ async def extract_all_keys(
             w += 1
             await asyncio.sleep(1)
 
+            # 优先在主页面检测风控横幅与需注册提示（优先级最高）
+            try:
+                page_status = await sw_page.evaluate("""
+                    () => {
+                        const txt = (document.body ? document.body.innerText : '') || '';
+                        const lower = txt.toLowerCase();
+
+                        // 微软账号/教育授权系统级风控红条
+                        if (lower.includes('unable to validate your access') ||
+                            lower.includes('detecting a problem with your account') ||
+                            lower.includes('are a detecting a problem') ||
+                            lower.includes('sorry but our systems are detecting a problem') ||
+                            lower.includes('sorry but our systems are a detecting a problem') ||
+                            lower.includes('无法验证您的访问权限') ||
+                            lower.includes('无法验证你的访问权限') ||
+                            lower.includes('检测到您的帐户存在问题') ||
+                            lower.includes('检测到你的帐户存在问题')) {
+                            const txMatch = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
+                            return {
+                                risk_blocked: true,
+                                tx_id: txMatch ? txMatch[1] : '',
+                                raw_text: txt.substring(0, 180)
+                            };
+                        }
+
+                        // 显式检测是否尚未开通学生资格（页面提示 Sign up now）
+                        if (lower.includes('sign up for azure for students') ||
+                            (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
+                            (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
+                            return { needs_signup: true };
+                        }
+
+                        return null;
+                    }
+                """)
+                if isinstance(page_status, dict):
+                    if page_status.get("risk_blocked"):
+                        tx_id = page_status.get("tx_id", "")
+                        err_desc = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
+                        if tx_id:
+                            err_desc += f" [Transaction Id: {tx_id}]"
+                        _emit(cb, f"  ❌ {err_desc}")
+                        _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
+                        ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
+                        os.makedirs(ss_dir, exist_ok=True)
+                        try:
+                            await sw_page.screenshot(path=os.path.join(ss_dir, "risk_blocked.png"))
+                        except Exception:
+                            pass
+                        raise AzureRiskBlockedError(err_desc, totp=updated_totp)
+
+                    if page_status.get("needs_signup"):
+                        _emit(cb, "  ⚠️ 当前处于 Education 但页面提示需 [Sign up now]（该账号尚未开通学生资格）")
+                        from modules.azure_signup import fill_azure_profile_form
+                        try:
+                            _emit(cb, "  🚀 尝试自愈：正在导航至 Azure 学生认证入口执行 SheerID 资格开通...")
+                            await sw_page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=35000)
+                            verified = await fill_azure_profile_form(sw_page, ms_email, cb)
+                            if verified:
+                                _emit(cb, "  ✅ 自愈开通学生资格成功！正在重新导航至软件列表...")
+                                await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=35000)
+                                list_deadline = loop.time() + 25
+                                continue
+                        except Exception as ex:
+                            _emit(cb, f"  ⚠️ 自动开通学生资格失败: {ex}")
+                        raise PortalLoadError("该账号尚未开通 Azure for Students 学生资格（页面提示需点击 Sign up now 注册开通）", totp=updated_totp)
+            except (AzureRiskBlockedError, PortalLoadError):
+                raise
+            except Exception:
+                pass
+
             # 在第 1, 4, 8, 14 秒主动尝试点击左侧 Education 菜单中的「Software / 软件」
             if w in (1, 4, 8, 14):
                 await _ensure_software_blade_active(sw_page, cb)
@@ -1291,13 +1454,6 @@ async def extract_all_keys(
                             const txt = (document.body ? document.body.innerText : '') || '';
                             const lower = txt.toLowerCase();
 
-                            // 0. 显式检测是否尚未开通学生资格（页面提示 Sign up now）
-                            if (lower.includes('sign up for azure for students') ||
-                                (lower.includes('sign up now') && (lower.includes('students') || lower.includes('education') || lower.includes('credit'))) ||
-                                (lower.includes('面向学生的 azure') && lower.includes('立即注册'))) {
-                                return { needs_signup: true };
-                            }
-
                             // 1. 显式检测是否无软件授权或无可用产品
                             if (lower.includes('no software available') || lower.includes('无可用软件') ||
                                 lower.includes('没有可用的软件') || lower.includes('no packages available') ||
@@ -1306,65 +1462,17 @@ async def extract_all_keys(
                                 return { no_software: true };
                             }
 
-                            // 3. 显式检测微软账号/教育授权系统级风控与访问校验失败红条
-                            if (lower.includes('unable to validate your access') ||
-                                lower.includes('detecting a problem with your account') ||
-                                lower.includes('sorry but our systems are detecting a problem') ||
-                                lower.includes('无法验证您的访问权限') ||
-                                lower.includes('无法验证你的访问权限') ||
-                                lower.includes('检测到您的帐户存在问题') ||
-                                lower.includes('检测到你的帐户存在问题')) {
-                                const txMatch = txt.match(/Transaction\\s*Id:\\s*([a-zA-Z0-9-]+)/i) || txt.match(/事务\\s*ID:\\s*([a-zA-Z0-9-]+)/i);
-                                return {
-                                    risk_blocked: true,
-                                    tx_id: txMatch ? txMatch[1] : '',
-                                    raw_text: txt.substring(0, 180)
-                                };
-                            }
-
                             // 2. 内部软件搜索框（排除顶部全局搜索）
                             const searchInputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
                             const has_search = searchInputs.length > 0;
 
                             return {
                                 ready: has_search,
-                                no_software: false,
-                                risk_blocked: false,
-                                needs_signup: false
+                                no_software: false
                             };
                         }
                     """)
                     if isinstance(status, dict):
-                        if status.get("needs_signup"):
-                            _emit(cb, "  ⚠️ 当前处于 Education 但页面提示需 [Sign up now]（该账号尚未开通学生资格）")
-                            from modules.azure_signup import fill_azure_profile_form
-                            try:
-                                _emit(cb, "  🚀 尝试自愈：正在导航至 Azure 学生认证入口执行 SheerID 资格开通...")
-                                await sw_page.goto(config.AZURE_SIGNUP_URL, wait_until="domcontentloaded", timeout=35000)
-                                verified = await fill_azure_profile_form(sw_page, ms_email, cb)
-                                if verified:
-                                    _emit(cb, "  ✅ 自愈开通学生资格成功！正在重新导航至软件列表...")
-                                    await sw_page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=35000)
-                                    list_deadline = loop.time() + 25
-                                    continue
-                            except Exception as ex:
-                                _emit(cb, f"  ⚠️ 自动开通学生资格失败: {ex}")
-                            raise PortalLoadError("该账号尚未开通 Azure for Students 学生资格（页面提示需点击 Sign up now 注册开通）", totp=updated_totp)
-                        if status.get("risk_blocked"):
-                            tx_id = status.get("tx_id", "")
-                            err_desc = f"微软风控拦截: 检测到账号访问校验失败 (unable to validate your access)"
-                            if tx_id:
-                                err_desc += f" [Transaction Id: {tx_id}]"
-                            _emit(cb, f"  ❌ {err_desc}")
-                            _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
-                            # 保存风控现场截图
-                            ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
-                            os.makedirs(ss_dir, exist_ok=True)
-                            try:
-                                await sw_page.screenshot(path=os.path.join(ss_dir, "risk_blocked.png"))
-                            except Exception:
-                                pass
-                            raise PortalLoadError(err_desc, totp=updated_totp)
                         if status.get("no_software"):
                             _emit(cb, "  ℹ️  该账号无可用 Education 软件授权，直接记录并跳过")
                             return {}, updated_totp
@@ -1409,6 +1517,32 @@ async def extract_all_keys(
 
         # ── 对每个产品提取 key ───────────────────────────────
         failed_products = []
+        _risk_swap_count = 0
+        _MAX_RISK_SWAPS = 3
+
+        async def _hot_swap_proxy_on_risk(sw_pg, label=""):
+            """风控拦截时通过 ProxyController 热切换代理并刷新页面，避免重启浏览器。"""
+            nonlocal _risk_swap_count
+            if not proxy_ctrl or not hasattr(proxy_ctrl, 'switch_next'):
+                return False
+            if _risk_swap_count >= _MAX_RISK_SWAPS:
+                _emit(cb, f"  ⚠️ 已热切换 {_risk_swap_count} 次代理仍被风控，放弃热切换")
+                return False
+            old = proxy_ctrl.bridge.get_current_proxy() if hasattr(proxy_ctrl, 'bridge') and proxy_ctrl.bridge else None
+            new_proxy = await proxy_ctrl.switch_next()
+            if not new_proxy:
+                return False
+            _risk_swap_count += 1
+            _emit(cb, f"  🔄 [风控热切换 {_risk_swap_count}/{_MAX_RISK_SWAPS}] 代理已切换: {old or '直连'} → {new_proxy}{label}")
+            sw_pg._network_risk_rejection = {}
+            sw_pg._sniffed_keys = []
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+            try:
+                await sw_pg.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+            return True
 
         for product_name in config.PRODUCTS_TO_EXTRACT:
             has_sw_dom = await _has_software_search(sw_page)
@@ -1443,8 +1577,28 @@ async def extract_all_keys(
                 await _clear_search(sw_page)
                 continue
 
-            # 提取 key
-            key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+            # 提取 key（遇风控时热切换代理重试）
+            key = ""
+            try:
+                key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+            except AzureRiskBlockedError:
+                swapped = await _hot_swap_proxy_on_risk(sw_page, f"（产品: {product_name[:20]}）")
+                if swapped:
+                    _emit(cb, f"  🔁 热切换代理后重试提取: {product_name[:30]}")
+                    try:
+                        await _close_panel(sw_page)
+                        await _clear_search(sw_page)
+                        await asyncio.sleep(1)
+                        searched2 = await _search_product(sw_page, search_term, cb)
+                        if searched2:
+                            await asyncio.sleep(0.5)
+                            clicked2 = await _click_product_row(sw_page, product_name, cb)
+                            if clicked2:
+                                key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+                    except AzureRiskBlockedError:
+                        _emit(cb, f"  ❌ 热切换代理后仍被风控拦截: {product_name[:30]}")
+                else:
+                    raise
 
             keys[product_name] = key
 
@@ -1493,7 +1647,24 @@ async def extract_all_keys(
                     await _clear_search(sw_page)
                     continue
 
-                key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+                try:
+                    key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+                except AzureRiskBlockedError:
+                    swapped = await _hot_swap_proxy_on_risk(sw_page, f"（二次重试: {product_name[:20]}）")
+                    if swapped:
+                        try:
+                            await _clear_search(sw_page)
+                            s2 = await _search_product(sw_page, search_term, cb)
+                            if s2:
+                                await asyncio.sleep(0.5)
+                                c2 = await _click_product_row(sw_page, product_name, cb)
+                                if c2:
+                                    key = await _extract_key_from_panel(sw_page, product_name, cb, existing_keys=list(keys.values()))
+                        except AzureRiskBlockedError:
+                            _emit(cb, f"  ❌ [二次重试] 热切换后仍被风控: {product_name[:30]}")
+                            key = ""
+                    else:
+                        raise
 
                 if key:
                     keys[product_name] = key
