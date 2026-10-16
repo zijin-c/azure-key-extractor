@@ -1376,10 +1376,10 @@ async def extract_all_keys(
         already_signed = terms_already_accepted or is_terms_accepted(ms_email)
         if already_signed:
             _emit(cb, "  ℹ️  该账号已在学生认证阶段完成条款签署 (Terms)，跳过提取阶段的条款签署步骤")
-        else:
-            await _handle_terms_flow(sw_page, cb)
+        # 不再预先花 60 秒检测 Terms，改为在软件列表加载循环中按需处理
 
         # ── 等待软件列表加载（支持侧边栏自动点击切换与秒级就绪）─────────────
+        _terms_handled_in_loop = already_signed
         _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")
         list_ready = False
         loop = asyncio.get_running_loop()
@@ -1484,8 +1484,23 @@ async def extract_all_keys(
                             const searchInputs = [...document.querySelectorAll('input')].filter(""" + _SOFTWARE_SEARCH_JS + """);
                             const has_search = searchInputs.length > 0;
 
+                            // 3. 检测是否有产品（Items 计数 > 0 或有产品表格行）
+                            const itemCountMatch = txt.match(/(\\d+)\\s*Items?/i);
+                            const itemCount = itemCountMatch ? parseInt(itemCountMatch[1]) : -1;
+                            // 只检测产品列表表格中的行，排除侧边栏导航链接
+                            const hasProductRows = document.querySelectorAll('.fxs-portal-blade-content table tbody tr, .azc-grid-row, [role="row"]').length > 1;
+
+                            // 4. 检测 Terms 横幅
+                            const hasTermsBanner = lower.includes("couldn't confirm you have accepted") ||
+                                                   lower.includes("could not confirm you have accepted") ||
+                                                   lower.includes("accept the terms here") ||
+                                                   lower.includes("请在此处接受条款");
+
                             return {
                                 ready: has_search,
+                                has_items: itemCount > 0 || (itemCount === -1 && hasProductRows),
+                                item_count: itemCount,
+                                has_terms_banner: hasTermsBanner,
                                 no_software: false
                             };
                         }
@@ -1495,25 +1510,26 @@ async def extract_all_keys(
                             _emit(cb, "  ℹ️  该账号无可用 Education 软件授权，直接记录并跳过")
                             return {}, updated_totp
                         if status.get("ready"):
-                            list_ready = True
-                            break
+                            if status.get("has_items"):
+                                list_ready = True
+                                break
+                            if status.get("has_terms_banner") and not _terms_handled_in_loop:
+                                ic = status.get("item_count", -1)
+                                _emit(cb, f"  ⚠️ 搜索框已就绪但产品为 {ic} Items + Terms 横幅存在，先处理条款签署...")
+                                await _handle_terms_flow(sw_page, cb)
+                                _terms_handled_in_loop = True
+                                list_deadline = loop.time() + 25
+                                w = -1
+                                break
+                            if w >= 6 and not status.get("has_terms_banner"):
+                                list_ready = True
+                                break
                 except Exception:
                     pass
 
             if list_ready:
                 _emit(cb, f"  ✅ 软件列表/搜索框已就绪（{loop.time() - list_started:.0f}s）")
                 break
-
-            # 如果 8 秒后仍未就绪且出现红条横幅，自动重试一次条款接受
-            if w == 8:
-                try:
-                    has_red = await sw_page.evaluate("() => (document.body.innerText || '').includes('accept the terms')")
-                    if has_red:
-                        _emit(cb, "  ⚠️ 检测到条款横幅依然存在，重新触发条款接受...")
-                        await _handle_terms_flow(sw_page, cb)
-                        list_deadline = loop.time() + 25
-                except Exception:
-                    pass
 
             # 仅重新刷新/导航一次；结束后给完整的 25 秒加载时间。
             if w == 16:
@@ -1753,6 +1769,7 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
         scan_secs = 30
         for w in range(scan_secs):
             await asyncio.sleep(1)
+
             for frame in [sw_page] + list(sw_page.frames):
                 try:
                     r = await frame.evaluate(_TERMS_DETECT_JS)
@@ -1812,7 +1829,7 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
                 "text=Please accept the terms here.",
                 "text=/accept the terms here/i",
                 "a:has-text('accept the terms')",
-                "a:has-text('terms')",
+                "a:has-text('terms here')",
                 "button:has-text('accept the terms')",
             ]:
                 try:
@@ -1821,16 +1838,72 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
                         await loc.scroll_into_view_if_needed()
                         await loc.click(force=True)
                         clicked = True
-                        _emit(cb, "  ✅ 已点击 Terms 链接")
+                        _emit(cb, f"  ✅ 已点击 Terms 链接: {sel}")
                         break
                 except Exception:
                     continue
             if clicked:
                 break
 
+        if not clicked:
+            _emit(cb, "  ⚠️ Playwright 未命中 Terms 链接，尝试 JS 点击...")
+            for frame in [sw_page] + list(sw_page.frames):
+                try:
+                    js_ok = await frame.evaluate(r"""
+                        () => {
+                            // 查找包含 "accept the terms here" 或 "接受条款" 的可点击元素
+                            const allEls = [...document.querySelectorAll('a, span, div, button, [role="link"], [role="button"]')];
+                            let target = allEls.find(el => {
+                                const t = (el.textContent || el.innerText || '').trim().toLowerCase();
+                                return (t.includes('accept the terms here') || t.includes('请在此处接受条款')) &&
+                                       el.getBoundingClientRect().width > 0;
+                            });
+                            // 兜底：查找红色横幅中的链接（Azure Portal 横幅通常用 <a> 标签）
+                            if (!target) {
+                                const links = [...document.querySelectorAll('a')];
+                                target = links.find(a => {
+                                    const href = (a.href || '').toLowerCase();
+                                    const t = (a.textContent || '').toLowerCase();
+                                    return href.includes('termsacceptance') || href.includes('terms') ||
+                                           t.includes('terms here') || t.includes('接受条款');
+                                });
+                            }
+                            if (target) {
+                                target.scrollIntoView({block: 'center'});
+                                target.click();
+                                return true;
+                            }
+                            // 最后兜底：直接导航到 TermsAcceptanceBlade
+                            const url = window.location.href;
+                            if (url.includes('Education')) {
+                                window.location.href = url.replace(/\/~\/.*/, '/~/termsAcceptance');
+                                return true;
+                            }
+                            return false;
+                        }
+                    """)
+                    if js_ok:
+                        clicked = True
+                        _emit(cb, "  ✅ 已通过 JS 点击 Terms 链接")
+                        break
+                except Exception:
+                    pass
+
+        if not clicked:
+            _emit(cb, "  ⚠️ Terms 链接点击均失败，尝试直接导航到 Terms Acceptance 页...")
+            try:
+                cur = sw_page.url or ""
+                if "Education" in cur:
+                    terms_url = cur.split("/~/")[0] + "/~/termsAcceptance" if "/~/" in cur else cur.rstrip("/") + "/~/termsAcceptance"
+                    await sw_page.goto(terms_url, wait_until="domcontentloaded", timeout=20000)
+                    clicked = True
+                    _emit(cb, "  ✅ 已直接导航到 Terms Acceptance 页")
+            except Exception:
+                pass
+
         # 2. 等待 Terms Acceptance 页加载
         _emit(cb, "  ⏳ 等待 Terms Acceptance 页加载...")
-        for w in range(20):
+        for w in range(25):
             await asyncio.sleep(1)
             for frame in [sw_page] + list(sw_page.frames):
                 try:
@@ -1839,7 +1912,8 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
                             const txt = (document.body ? document.body.innerText : '') || '';
                             return txt.includes('Terms Acceptance') ||
                                    txt.includes('Please accept the terms and conditions') ||
-                                   txt.includes('Accept and continue');
+                                   txt.includes('Accept and continue') ||
+                                   txt.includes('接受并继续');
                         }
                     """)
                     if on_terms:
@@ -1849,6 +1923,17 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
                     pass
             if on_terms:
                 break
+
+        if not on_terms:
+            _emit(cb, "  ⚠️ Terms Acceptance 页未加载成功，尝试直接导航...")
+            try:
+                cur = sw_page.url or ""
+                base = cur.split("/~/")[0] if "/~/" in cur else cur.rstrip("/")
+                await sw_page.goto(base + "/~/termsAcceptance", wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(3)
+                on_terms = True
+            except Exception:
+                pass
 
     await asyncio.sleep(1)
 
@@ -1978,11 +2063,54 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
             break
         await asyncio.sleep(0.5)
 
-    # 5. 等待后台协议确认完成（至少等待 5 秒让微软后端完成入库）
+    # 5. 等待后台协议确认完成
     _emit(cb, "  ⏳ 等待微软后台确认协议生效（5s）...")
     await asyncio.sleep(5)
 
-    # 6. 等待软件搜索框出现（协议接受后页面自动刷新，无需手动 reload）
+    # 5b. 导航回 Software 页并验证横幅已消失
+    _emit(cb, "  🔄 导航回 Software 页，验证条款已生效...")
+    try:
+        sw_url = (sw_page.url or "")
+        if "termsAcceptance" in sw_url.lower() or "termsacceptance" in sw_url.lower():
+            base = sw_url.split("/~/")[0] if "/~/" in sw_url else sw_url
+            await sw_page.goto(base + "/~/software", wait_until="domcontentloaded", timeout=20000)
+        else:
+            await sw_page.reload(wait_until="domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+    await asyncio.sleep(3)
+
+    # 验证横幅是否消失
+    banner_gone = False
+    for _check in range(10):
+        try:
+            still_has = await sw_page.evaluate(r"""
+                () => {
+                    const txt = (document.body ? document.body.innerText : '') || '';
+                    return txt.includes("couldn't confirm you have accepted") ||
+                           txt.includes("could not confirm you have accepted") ||
+                           txt.includes("accept the terms here") ||
+                           txt.includes("请在此处接受条款");
+                }
+            """)
+            if not still_has:
+                banner_gone = True
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+    if banner_gone:
+        _emit(cb, "  ✅ Terms 横幅已消失，条款签署确认成功")
+    else:
+        _emit(cb, "  ⚠️ Terms 横幅仍存在，条款可能未成功签署，尝试再次刷新...")
+        try:
+            await sw_page.reload(wait_until="domcontentloaded", timeout=20000)
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+    # 6. 等待软件搜索框出现
     for _w in range(30):
         await asyncio.sleep(0.5)
         try:
