@@ -28,6 +28,19 @@ from utils.totp_cache import save_totp_cache, get_cached_totp
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
 
+_TERMS_ACCEPTED_EMAILS: set[str] = set()
+
+def mark_terms_accepted(email: str):
+    """记录在学生认证阶段已完成条款签署的账号。"""
+    if email:
+        _TERMS_ACCEPTED_EMAILS.add(email.strip().lower())
+
+def is_terms_accepted(email: str) -> bool:
+    """检查账号是否已在学生认证阶段完成条款签署。"""
+    if not email:
+        return False
+    return email.strip().lower() in _TERMS_ACCEPTED_EMAILS
+
 # 同一判定用于搜索、清空、页面就绪及保护 Software 根 blade。
 _SOFTWARE_SEARCH_JS = """(i) => {
     const r = i.getBoundingClientRect();
@@ -1274,6 +1287,7 @@ async def extract_all_keys(
     proxy_ctrl: Optional[Any] = None,
     keys_out: Optional[dict] = None,
     on_key: Optional[Callable[[dict, str], None]] = None,
+    terms_already_accepted: bool = False,
 ) -> tuple[dict, str]:
     """
     提取所有目标产品的 key。
@@ -1359,7 +1373,11 @@ async def extract_all_keys(
         await asyncio.sleep(0.5)
 
         # ── 处理 Terms Acceptance ────────────────────────────
-        await _handle_terms_flow(sw_page, cb)
+        already_signed = terms_already_accepted or is_terms_accepted(ms_email)
+        if already_signed:
+            _emit(cb, "  ℹ️  该账号已在学生认证阶段完成条款签署 (Terms)，跳过提取阶段的条款签署步骤")
+        else:
+            await _handle_terms_flow(sw_page, cb)
 
         # ── 等待软件列表加载（支持侧边栏自动点击切换与秒级就绪）─────────────
         _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")

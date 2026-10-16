@@ -715,6 +715,8 @@ async def process_account(
                     fname_loc = tgt.locator(
                         "#sse-vnext-fname-input, #first-name-input, input[id*='fname' i], input[placeholder*='First' i], "
                         "button:has-text('Verify academic status'), button:has-text('验证学术状态'), "
+                        "button:has-text('Next'), button:has-text('下一步'), "
+                        "button:has-text('accept terms'), button:has-text('接受条款'), "
                         "#sse-vnext-submit-button"
                     ).first
                     if await fname_loc.is_visible(timeout=80):
@@ -892,7 +894,14 @@ async def process_account(
         # ── 步骤3: 新开标签页提取所有产品 key ────────────────
         # 直接调用 extract_all_keys，新开标签页直接导航到 software 页面
         _emit(cb, "  🌐 开始提取 key（新开标签页）...")
-        keys, totp_secret = await extract_all_keys(page, ctx, totp_secret, account.email, cb, proxy_str=proxy_str, proxy_ctrl=proxy_ctrl, keys_out=keys, on_key=_save_key_checkpoint)
+        from modules.key_extractor import is_terms_accepted
+        terms_accepted_flag = is_terms_accepted(account.email)
+        keys, totp_secret = await extract_all_keys(
+            page, ctx, totp_secret, account.email, cb,
+            proxy_str=proxy_str, proxy_ctrl=proxy_ctrl,
+            keys_out=keys, on_key=_save_key_checkpoint,
+            terms_already_accepted=terms_accepted_flag,
+        )
         if totp_secret:
             account.totp_secret = totp_secret
             save_totp_cache(account.email, totp_secret)

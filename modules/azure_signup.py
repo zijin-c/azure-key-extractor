@@ -103,9 +103,21 @@ _EMAIL_SELECTORS = [
 
 _SUBMIT_SELECTORS = [
     "#sse-vnext-submit-button",
+    "button:has-text('Next')", "button:has-text('下一步')",
     "button:has-text('Verify academic status')", "button:has-text('验证学术状态')",
-    "button:has-text('Verify status')", "button:has-text('Verify')",
-    "button:has-text('验证')", "button[type='submit']", "input[type='submit']"
+    "button:has-text('Verify eligibility')", "button:has-text('Verify status')",
+    "button:has-text('Verify')", "button:has-text('验证')",
+    "button[type='submit']", "input[type='submit']"
+]
+
+_TERMS_SUBMIT_SELECTORS = [
+    "button:has-text('Verify academic status and accept terms')",
+    "button:has-text('验证学术地位并接受条款')",
+    "button:has-text('accept terms')",
+    "button:has-text('接受条款')",
+    "button:has-text('Verify academic status')",
+    "button:has-text('验证学术状态')",
+    "button[type='submit']",
 ]
 
 _TRIGGER_BUTTON_SELECTORS = [
@@ -120,7 +132,18 @@ _btn_js = """() => {
     const btn = document.querySelector("#sse-vnext-submit-button") ||
                 [...document.querySelectorAll("button, input[type='submit']")].find(x => {
                     const txt = (x.textContent || x.value || '').trim();
-                    return txt.includes("Verify") || txt.includes("验证") || txt.includes("Submit");
+                    if (txt.includes("accept terms") || txt.includes("接受条款")) return false;
+                    return txt.includes("Verify academic status") ||
+                           txt.includes("验证学术状态") ||
+                           txt.includes("Verify eligibility") ||
+                           txt.includes("Verify status") ||
+                           txt.includes("Verify") ||
+                           txt.includes("验证") ||
+                           txt === "Next" ||
+                           txt === "下一步" ||
+                           txt.includes("Next") ||
+                           txt.includes("下一步") ||
+                           txt.includes("Submit");
                 });
     if (!btn) return "not_found";
     const r = btn.getBoundingClientRect();
@@ -129,7 +152,38 @@ _btn_js = """() => {
     if (btn.getAttribute("aria-disabled") === "true") return "disabled";
     const style = window.getComputedStyle(btn);
     if (style.pointerEvents === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") < 0.6) return "disabled";
-    return "enabled";
+
+    // 严格检测背景颜色是否已变蓝（无论 Next 还是 Verify，均需变蓝后才可点击）
+    const bg = (style.backgroundColor || '').toLowerCase();
+    const isWhiteOrTransparent = bg === 'rgb(255, 255, 255)' || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent' || bg.includes('255, 255, 255');
+    if (isWhiteOrTransparent) {
+        return "not_blue_yet";
+    }
+
+    const match = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+    if (match) {
+        const rVal = parseInt(match[1]), gVal = parseInt(match[2]), bVal = parseInt(match[3]);
+        // 浅色或浅灰底表示尚未激活变蓝 (白色/浅灰底)
+        if (rVal > 180 && gVal > 180 && bVal > 180) {
+            return "not_blue_yet";
+        }
+        // 纯灰底 (r, g, b 互相接近) 尚未变蓝
+        if (Math.abs(rVal - gVal) < 20 && Math.abs(gVal - bVal) < 20 && bVal < 200) {
+            return "not_blue_yet";
+        }
+        // 蓝色系：蓝色分量明显高于红色和绿色，且 bVal > 120
+        if (bVal > 120 && bVal > rVal + 20) {
+            return "enabled";
+        }
+    }
+
+    // 类名辅助判断：若明确包含 primary / btn-blue / active 且没有 disabled 类
+    const cls = (btn.className || '').toLowerCase();
+    if ((cls.includes('primary') || cls.includes('blue') || cls.includes('active')) && !cls.includes('disabled')) {
+        return "enabled";
+    }
+
+    return "not_blue_yet";
 }"""
 
 
@@ -161,6 +215,237 @@ async def _complete_azure_offer_signup(page: Page, ms_email: str, cb: ProgressCa
     """The signup.azure.com/signup profile page means SheerID passed; the form needs no input
     and key extraction opens its own tab."""
     _emit(cb, "  ✅ 已到达订阅资料页（无需填写），SheerID 认证通过，转入新标签页提取 Key...")
+    return True
+
+
+async def _handle_terms_acceptance_if_present(page: Page, cb: ProgressCallback = None, max_wait_s: float = 10.0) -> bool:
+    """
+    自适应检测并处理条款确认卡片（Terms）：
+    - 适配部分账号在提交基本学术信息后展开的第二步「Terms / 条款」卡片；
+    - 若账号无此步骤（旧版账号直接跳转或进入确认），平滑返回 False；
+    - 若出现条款卡片：
+      1. 精确勾选第一个同意条款（我同意订阅协议、Azure Dev Tools for Teaching 协议）；
+      2. 轮询等待最下方的验证按钮（Verify academic status and accept terms）激活变蓝；
+      3. 按钮变蓝后，使用拟人化方式点击提交。
+    """
+    start_t = asyncio.get_event_loop().time()
+    targets = [page] + list(page.frames)
+    terms_detected = False
+
+    while (asyncio.get_event_loop().time() - start_t) < max_wait_s:
+        # 0. 快速退出判断：若已脱离 studentverification 页面，说明直接通过了
+        cur_url = (page.url or "").lower()
+        if "portal.azure.com" in cur_url or "education.azure.com" in cur_url or ("signup.azure.com/signup" in cur_url and "/studentverification" not in cur_url):
+            return False
+
+        try:
+            body_txt = (await page.locator("body").inner_text(timeout=300)).lower()
+            if any(k in body_txt for k in ("confirming your account", "正在确认", "verification complete", "you are verified")):
+                return False
+        except Exception:
+            body_txt = ""
+
+        # 检查是否出现 Terms 相关元素或文本
+        for tgt in targets:
+            try:
+                has_terms = await tgt.evaluate("""() => {
+                    const txt = (document.body ? document.body.innerText : '').toLowerCase();
+                    const hasKeyword = txt.includes('terms') || txt.includes('条款') ||
+                                       txt.includes('subscription agreement') || txt.includes('订阅协议') ||
+                                       txt.includes('azure dev tools for teaching');
+                    const btns = [...document.querySelectorAll('button, input[type="submit"]')];
+                    const hasTermsBtn = btns.some(b => {
+                        const t = (b.textContent || b.value || '').trim().toLowerCase();
+                        return t.includes('accept terms') || t.includes('接受条款') ||
+                               (t.includes('verify') && t.includes('terms')) ||
+                               (t.includes('验证') && t.includes('条款'));
+                    });
+                    return hasKeyword && (hasTermsBtn || document.querySelectorAll('input[type="checkbox"]').length >= 2);
+                }""")
+                if has_terms:
+                    terms_detected = True
+                    break
+            except Exception:
+                pass
+
+        if terms_detected:
+            break
+        await asyncio.sleep(0.4)
+
+    if not terms_detected:
+        return False
+
+    _emit(cb, "  📋 检测到条款确认面板 (Terms)，开始处理协议勾选...")
+
+    # ── 1. 勾选第一个同意条款（订阅协议、Azure Dev Tools for Teaching 协议） ──
+    cb_checked = False
+    for attempt in range(6):
+        for tgt in targets:
+            try:
+                res = await tgt.evaluate("""() => {
+                    const cbs = [...document.querySelectorAll('input[type="checkbox"], [role="checkbox"]')].filter(el => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    });
+                    if (cbs.length === 0) return { status: 'no_cb' };
+
+                    // 优先寻找文本包含订阅协议 (subscription agreement) 的第一个 checkbox
+                    let targetCb = null;
+                    for (const cb of cbs) {
+                        let p = cb.closest('label') || cb.parentElement;
+                        for (let depth = 0; depth < 5 && p; depth++) {
+                            const t = (p.innerText || p.textContent || '').toLowerCase();
+                            if (t.includes('subscription agreement') || t.includes('订阅协议') || t.includes('dev tools') || t.includes('我同意') || t.includes('i agree')) {
+                                targetCb = cb;
+                                break;
+                            }
+                            p = p.parentElement;
+                        }
+                        if (targetCb) break;
+                    }
+
+                    // 兜底：直接取可见的第一个复选框（截图明确展示第1个即为条款）
+                    if (!targetCb) {
+                        targetCb = cbs[0];
+                    }
+
+                    const isChecked = targetCb.checked || targetCb.getAttribute('aria-checked') === 'true';
+                    if (!isChecked) {
+                        const label = targetCb.closest('label') || (targetCb.id ? document.querySelector('label[for="' + targetCb.id + '"]') : null);
+                        if (label) {
+                            label.click();
+                        } else {
+                            targetCb.click();
+                        }
+                        if (!targetCb.checked && targetCb.getAttribute('aria-checked') !== 'true') {
+                            targetCb.checked = true;
+                            targetCb.setAttribute('aria-checked', 'true');
+                            targetCb.dispatchEvent(new Event('change', { bubbles: true }));
+                            targetCb.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    }
+                    return { status: 'ok', checked: targetCb.checked || targetCb.getAttribute('aria-checked') === 'true' };
+                }""")
+                if res and res.get("checked"):
+                    cb_checked = True
+                    break
+            except Exception:
+                pass
+
+        if cb_checked:
+            break
+        await asyncio.sleep(0.4)
+
+    if cb_checked:
+        _emit(cb, "  📝 已成功勾选第一个同意条款 (我同意订阅协议、Azure Dev Tools for Teaching 协议)")
+    else:
+        _emit(cb, "  ⚠️ 未能确凿勾选协议复选框，继续检查按钮状态...")
+
+    await asyncio.sleep(random.uniform(0.4, 0.7))
+
+    # ── 2. 等待最下方的验证按钮激活变蓝 (enabled) ──
+    _emit(cb, "  ⏳ 等待「验证学术地位并接受条款」按钮激活变蓝...")
+    btn_ready = False
+
+    for _step in range(25):  # 最多等待约 12.5 秒
+        for tgt in targets:
+            try:
+                state = await tgt.evaluate("""() => {
+                    const btns = [...document.querySelectorAll("button, input[type='submit']")];
+                    const btn = btns.find(b => {
+                        const t = (b.textContent || b.value || '').trim().toLowerCase();
+                        return t.includes('accept terms') || t.includes('接受条款') ||
+                               (t.includes('verify') && t.includes('terms')) ||
+                               (t.includes('验证') && t.includes('条款'));
+                    }) || btns.find(b => {
+                        const t = (b.textContent || b.value || '').trim().toLowerCase();
+                        return t.includes('verify') || t.includes('验证');
+                    });
+                    if (!btn) return "not_found";
+
+                    const r = btn.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return "hidden";
+                    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return "disabled";
+
+                    const style = window.getComputedStyle(btn);
+                    if (style.pointerEvents === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") < 0.6) return "disabled";
+
+                    // 检查背景色：白底或浅底表示尚未变蓝
+                    const bg = (style.backgroundColor || '').toLowerCase();
+                    const isWhite = bg === 'rgb(255, 255, 255)' || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent' || bg.includes('255, 255, 255');
+                    if (isWhite) {
+                        return "white_not_ready";
+                    }
+
+                    const match = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
+                    if (match) {
+                        const rVal = parseInt(match[1]), gVal = parseInt(match[2]), bVal = parseInt(match[3]);
+                        if (rVal > 220 && gVal > 220 && bVal > 220) {
+                            return "white_not_ready";
+                        }
+                        if (bVal > 120 && bVal > rVal) {
+                            return "blue_ready";
+                        }
+                    }
+
+                    return "ready";
+                }""")
+                if state in ("blue_ready", "ready"):
+                    btn_ready = True
+                    break
+            except Exception:
+                pass
+
+        if btn_ready:
+            break
+        await asyncio.sleep(0.5)
+
+    if not btn_ready:
+        _emit(cb, "  ⚠️ 条款验证按钮未明确检测到变蓝，尝试拟人化直接点击...")
+    else:
+        _emit(cb, "  🔵 「验证学术地位并接受条款」按钮已变蓝激活")
+
+    await asyncio.sleep(random.uniform(0.3, 0.6))
+
+    # ── 3. 点击「验证学术地位并接受条款」按钮 ──
+    clicked = False
+    tgt_tbtn, t_btn_loc = await _find_visible_locator(page, _TERMS_SUBMIT_SELECTORS, timeout_ms=1500)
+    if t_btn_loc:
+        try:
+            await t_btn_loc.scroll_into_view_if_needed()
+            await human_hover_and_click(page, t_btn_loc, timeout=4000)
+            clicked = True
+        except Exception:
+            try:
+                await t_btn_loc.click(timeout=3000)
+                clicked = True
+            except Exception:
+                pass
+
+    if not clicked:
+        for tgt in targets:
+            try:
+                ok = await tgt.evaluate("""() => {
+                    const btns = [...document.querySelectorAll("button, input[type='submit']")];
+                    const btn = btns.find(b => {
+                        const t = (b.textContent || b.value || '').trim().toLowerCase();
+                        return t.includes('accept terms') || t.includes('接受条款') ||
+                               (t.includes('verify') && t.includes('terms')) ||
+                               (t.includes('验证') && t.includes('条款'));
+                    });
+                    if (btn) {
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }""")
+                if ok:
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+    _emit(cb, "  🎓 点击「验证学术地位并接受条款」(Verify academic status and accept terms)")
     return True
 
 
@@ -429,23 +714,22 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
                     pass
             await asyncio.sleep(0.15)
 
-            # ── 勾选必要的非风控同意复选框 ────────────────────────────
+            # ── 勾选必要的非风控同意复选框（仅限必要的第一项，避免误勾选营销推广） ──────
             for t_item in targets:
                 try:
                     cbs = t_item.locator("input[type='checkbox']")
-                    cb_count = min(await cbs.count(), 5)
-                    for c_i in range(cb_count):
-                        cb_item = cbs.nth(c_i)
+                    cb_count = await cbs.count()
+                    if cb_count > 0:
+                        cb_item = cbs.first
                         if await cb_item.is_visible(timeout=100):
                             c_id = (await cb_item.get_attribute("id") or "").lower()
                             c_name = (await cb_item.get_attribute("name") or "").lower()
-                            if "cf-" in c_id or "turnstile" in c_id or "cf-" in c_name:
-                                continue
-                            is_checked = await cb_item.is_checked()
-                            if not is_checked:
-                                b_box = await cb_item.bounding_box()
-                                if b_box and b_box["width"] > 0:
-                                    await human_hover_and_click(page, cb_item, timeout=1500)
+                            if not ("cf-" in c_id or "turnstile" in c_id or "cf-" in c_name):
+                                is_checked = await cb_item.is_checked()
+                                if not is_checked:
+                                    b_box = await cb_item.bounding_box()
+                                    if b_box and b_box["width"] > 0:
+                                        await human_hover_and_click(page, cb_item, timeout=1500)
                 except Exception:
                     pass
 
@@ -598,13 +882,50 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
 
         await asyncio.sleep(random.uniform(0.40, 0.80))
 
-        # ── 点击 Verify academic status ───────────────────────────────
+        # ── 点击 Next / Verify academic status ───────────────────────
         tgt_sub, verify_btn = await _find_visible_locator(page, _SUBMIT_SELECTORS, timeout_ms=2000)
         if not verify_btn:
             verify_btn = page.locator(", ".join(_SUBMIT_SELECTORS)).first
 
+        btn_txt = "Verify academic status"
+        try:
+            btn_txt = (await verify_btn.inner_text() or "Verify academic status").strip()
+        except Exception:
+            pass
+
+        _emit(cb, f"  🎓 点击 {btn_txt}")
         await verify_btn.scroll_into_view_if_needed()
-        await human_hover_and_click(page, verify_btn, timeout=8000)
+        clicked_ok = False
+        try:
+            clicked_ok = await human_hover_and_click(page, verify_btn, timeout=6000)
+        except Exception:
+            pass
+        if not clicked_ok:
+            try:
+                await verify_btn.click(timeout=4000)
+            except Exception:
+                for tgt in targets:
+                    try:
+                        await tgt.evaluate(
+                            "() => { const b = document.querySelector('#sse-vnext-submit-button') || [...document.querySelectorAll('button, input[type=\"submit\"]')].find(x => { const t = (x.textContent || x.value || '').trim(); return t.includes('Next') || t.includes('下一步') || t.includes('Verify') || t.includes('验证'); }); if(b) b.click(); }"
+                        )
+                    except Exception:
+                        pass
+
+        is_captcha, cap_msg = await check_captcha_present(page)
+        if is_captcha:
+            raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
+
+        # ── 自适应检测与处理第二步条款确认（适配部分账号出现的 Terms 卡片） ──
+        terms_handled = await _handle_terms_acceptance_if_present(page, cb, max_wait_s=8.0)
+        if terms_handled:
+            _emit(cb, "  ✅ 条款确认与验证完成，进入资格审核与跳转确认...")
+            if ms_email:
+                try:
+                    from modules.key_extractor import mark_terms_accepted
+                    mark_terms_accepted(ms_email)
+                except Exception:
+                    pass
 
         _DONE_JS = """() => {
             const t = (document.body ? document.body.innerText : '').toLowerCase();
@@ -617,30 +938,11 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
                    t.includes('verification email has been sent');
         }"""
 
-        submitted = False
-        is_captcha, cap_msg = await check_captcha_present(page)
-        if is_captcha:
-            raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
-
-        _emit(cb, "  🎓 点击 Verify academic status")
         try:
-            await verify_btn.click(timeout=8000)
-        except Exception:
-            for tgt in targets:
-                try:
-                    await tgt.evaluate(
-                        "() => { const b = document.querySelector('#sse-vnext-submit-button') || [...document.querySelectorAll('button, input[type=\"submit\"]')].find(x => (x.textContent || x.value || '').includes('Verify') || (x.textContent || x.value || '').includes('验证')); if(b) b.click(); }"
-                    )
-                except Exception:
-                    pass
-
-        try:
-            await page.wait_for_function(_DONE_JS, timeout=25000)
-            submitted = True
+            await page.wait_for_function(_DONE_JS, timeout=12000)
             _emit(cb, "  ✅ 表单已提交")
         except Exception:
             # 容错：即使未能精确匹配 _DONE_JS，只要已点击且未报错，直接转入结果轮询
-            submitted = True
             pass
 
         # ── 等待确认（20 轮 × 3 秒 = 60 秒） ─────────────────
@@ -669,6 +971,19 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
             )):
                 _emit(cb, "  ❌ SheerID 学术审核明确被拒 / 需要人工上传证明文件")
                 raise SheerIDVerificationError("SheerID 审核未通过: 账号被拒或要求人工上传学生证件")
+
+            # 0b. 兼容慢网延迟：若条款卡片在此处才延迟渲染出来，立即自适应处理
+            if any(k in body_lower for k in ("subscription agreement", "订阅协议", "accept terms", "接受条款", "dev tools")):
+                th = await _handle_terms_acceptance_if_present(page, cb, max_wait_s=2.5)
+                if th:
+                    _emit(cb, "  ✅ [延迟捕获] 条款确认与验证完成")
+                    if ms_email:
+                        try:
+                            from modules.key_extractor import mark_terms_accepted
+                            mark_terms_accepted(ms_email)
+                        except Exception:
+                            pass
+                    continue
 
             # 1. 成功跳转到 Portal / 业务平台
             if "portal.azure.com" in url or "education.azure.com" in url:
