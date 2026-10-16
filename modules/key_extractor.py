@@ -1726,37 +1726,58 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     has_banner = False
     detected_text = ""
 
+    _TERMS_DETECT_JS = r"""
+        () => {
+            const txt = (document.body ? document.body.innerText : '') || '';
+            const lower = txt.toLowerCase();
+            if (txt.includes("couldn't confirm you have accepted") ||
+                txt.includes("could not confirm you have accepted") ||
+                txt.includes("accept the terms here") ||
+                txt.includes("Please accept the terms") ||
+                txt.includes("Terms Acceptance") ||
+                lower.includes("terms and conditions") ||
+                lower.includes("subscription agreement") ||
+                lower.includes("accept and continue") ||
+                txt.includes("接受条款") ||
+                txt.includes("请在此处接受条款") ||
+                txt.includes("条款和条件") ||
+                txt.includes("订阅协议")) {
+                return { found: true, text: txt.substring(0, 150) };
+            }
+            return { found: false };
+        }
+    """
+
     _emit(cb, "  🔍 正在检测 Terms 协议横幅（持续监测以确保协议签署完成）...")
-    for w in range(15):
-        await asyncio.sleep(1)
-        for frame in [sw_page] + list(sw_page.frames):
-            try:
-                r = await frame.evaluate(r"""
-                    () => {
-                        const txt = (document.body ? document.body.innerText : '') || '';
-                        if (txt.includes("couldn't confirm you have accepted") ||
-                            txt.includes("could not confirm you have accepted") ||
-                            txt.includes("accept the terms here") ||
-                            txt.includes("Please accept the terms") ||
-                            txt.includes("Terms Acceptance") ||
-                            txt.includes("接受条款") ||
-                            txt.includes("请在此处接受条款")) {
-                            return { found: true, text: txt.substring(0, 150) };
-                        }
-                        return { found: false };
-                    }
-                """)
-                if isinstance(r, dict) and r.get("found"):
-                    has_banner = True
-                    detected_text = r.get("text", "")
-                    break
-            except Exception:
-                pass
+    for round_idx in range(2):
+        scan_secs = 30
+        for w in range(scan_secs):
+            await asyncio.sleep(1)
+            for frame in [sw_page] + list(sw_page.frames):
+                try:
+                    r = await frame.evaluate(_TERMS_DETECT_JS)
+                    if isinstance(r, dict) and r.get("found"):
+                        has_banner = True
+                        detected_text = r.get("text", "")
+                        break
+                except Exception:
+                    pass
+            if has_banner:
+                break
+
+            if w in (2, 6, 15):
+                await _ensure_software_blade_active(sw_page, cb)
+
         if has_banner:
             break
 
-        # 在第 2 秒和第 6 秒主动尝试切换到 Software 标签
-        if w in (2, 6):
+        if round_idx == 0:
+            _emit(cb, "  🔄 首轮未检测到 Terms 横幅，刷新页面重新检测...")
+            try:
+                await sw_page.reload(wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
             await _ensure_software_blade_active(sw_page, cb)
 
     if not has_banner:

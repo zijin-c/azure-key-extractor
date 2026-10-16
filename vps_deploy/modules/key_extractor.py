@@ -28,6 +28,19 @@ from utils.totp_cache import save_totp_cache, get_cached_totp
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
 
+_TERMS_ACCEPTED_EMAILS: set[str] = set()
+
+def mark_terms_accepted(email: str):
+    """记录在学生认证阶段已完成条款签署的账号。"""
+    if email:
+        _TERMS_ACCEPTED_EMAILS.add(email.strip().lower())
+
+def is_terms_accepted(email: str) -> bool:
+    """检查账号是否已在学生认证阶段完成条款签署。"""
+    if not email:
+        return False
+    return email.strip().lower() in _TERMS_ACCEPTED_EMAILS
+
 # 同一判定用于搜索、清空、页面就绪及保护 Software 根 blade。
 _SOFTWARE_SEARCH_JS = """(i) => {
     const r = i.getBoundingClientRect();
@@ -1274,6 +1287,7 @@ async def extract_all_keys(
     proxy_ctrl: Optional[Any] = None,
     keys_out: Optional[dict] = None,
     on_key: Optional[Callable[[dict, str], None]] = None,
+    terms_already_accepted: bool = False,
 ) -> tuple[dict, str]:
     """
     提取所有目标产品的 key。
@@ -1359,7 +1373,11 @@ async def extract_all_keys(
         await asyncio.sleep(0.5)
 
         # ── 处理 Terms Acceptance ────────────────────────────
-        await _handle_terms_flow(sw_page, cb)
+        already_signed = terms_already_accepted or is_terms_accepted(ms_email)
+        if already_signed:
+            _emit(cb, "  ℹ️  该账号已在学生认证阶段完成条款签署 (Terms)，跳过提取阶段的条款签署步骤")
+        else:
+            await _handle_terms_flow(sw_page, cb)
 
         # ── 等待软件列表加载（支持侧边栏自动点击切换与秒级就绪）─────────────
         _emit(cb, "  ⏳ 等待软件列表加载（最多 25 秒）...")
@@ -1708,37 +1726,58 @@ async def _handle_terms_flow(sw_page: Page, cb: ProgressCallback):
     has_banner = False
     detected_text = ""
 
+    _TERMS_DETECT_JS = r"""
+        () => {
+            const txt = (document.body ? document.body.innerText : '') || '';
+            const lower = txt.toLowerCase();
+            if (txt.includes("couldn't confirm you have accepted") ||
+                txt.includes("could not confirm you have accepted") ||
+                txt.includes("accept the terms here") ||
+                txt.includes("Please accept the terms") ||
+                txt.includes("Terms Acceptance") ||
+                lower.includes("terms and conditions") ||
+                lower.includes("subscription agreement") ||
+                lower.includes("accept and continue") ||
+                txt.includes("接受条款") ||
+                txt.includes("请在此处接受条款") ||
+                txt.includes("条款和条件") ||
+                txt.includes("订阅协议")) {
+                return { found: true, text: txt.substring(0, 150) };
+            }
+            return { found: false };
+        }
+    """
+
     _emit(cb, "  🔍 正在检测 Terms 协议横幅（持续监测以确保协议签署完成）...")
-    for w in range(15):
-        await asyncio.sleep(1)
-        for frame in [sw_page] + list(sw_page.frames):
-            try:
-                r = await frame.evaluate(r"""
-                    () => {
-                        const txt = (document.body ? document.body.innerText : '') || '';
-                        if (txt.includes("couldn't confirm you have accepted") ||
-                            txt.includes("could not confirm you have accepted") ||
-                            txt.includes("accept the terms here") ||
-                            txt.includes("Please accept the terms") ||
-                            txt.includes("Terms Acceptance") ||
-                            txt.includes("接受条款") ||
-                            txt.includes("请在此处接受条款")) {
-                            return { found: true, text: txt.substring(0, 150) };
-                        }
-                        return { found: false };
-                    }
-                """)
-                if isinstance(r, dict) and r.get("found"):
-                    has_banner = True
-                    detected_text = r.get("text", "")
-                    break
-            except Exception:
-                pass
+    for round_idx in range(2):
+        scan_secs = 30
+        for w in range(scan_secs):
+            await asyncio.sleep(1)
+            for frame in [sw_page] + list(sw_page.frames):
+                try:
+                    r = await frame.evaluate(_TERMS_DETECT_JS)
+                    if isinstance(r, dict) and r.get("found"):
+                        has_banner = True
+                        detected_text = r.get("text", "")
+                        break
+                except Exception:
+                    pass
+            if has_banner:
+                break
+
+            if w in (2, 6, 15):
+                await _ensure_software_blade_active(sw_page, cb)
+
         if has_banner:
             break
 
-        # 在第 2 秒和第 6 秒主动尝试切换到 Software 标签
-        if w in (2, 6):
+        if round_idx == 0:
+            _emit(cb, "  🔄 首轮未检测到 Terms 横幅，刷新页面重新检测...")
+            try:
+                await sw_page.reload(wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            await asyncio.sleep(3)
             await _ensure_software_blade_active(sw_page, cb)
 
     if not has_banner:
