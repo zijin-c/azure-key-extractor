@@ -102,11 +102,13 @@ _EMAIL_SELECTORS = [
 ]
 
 _SUBMIT_SELECTORS = [
+    "button:has-text('Next'):not(:has-text('accept'))", "button:has-text('下一步'):not(:has-text('条款'))",
     "#sse-vnext-submit-button",
-    "button:has-text('Next')", "button:has-text('下一步')",
-    "button:has-text('Verify academic status')", "button:has-text('验证学术状态')",
+    "button:has-text('Verify academic status'):not(:has-text('accept terms'))",
+    "button:has-text('验证学术状态'):not(:has-text('条款'))",
     "button:has-text('Verify eligibility')", "button:has-text('Verify status')",
-    "button:has-text('Verify')", "button:has-text('验证')",
+    "button:has-text('Verify'):not(:has-text('accept'))",
+    "button:has-text('验证'):not(:has-text('条款'))",
     "button[type='submit']", "input[type='submit']"
 ]
 
@@ -129,22 +131,21 @@ _TRIGGER_BUTTON_SELECTORS = [
 ]
 
 _btn_js = """() => {
-    const btn = document.querySelector("#sse-vnext-submit-button") ||
-                [...document.querySelectorAll("button, input[type='submit']")].find(x => {
-                    const txt = (x.textContent || x.value || '').trim();
-                    if (txt.includes("accept terms") || txt.includes("接受条款")) return false;
-                    return txt.includes("Verify academic status") ||
-                           txt.includes("验证学术状态") ||
-                           txt.includes("Verify eligibility") ||
-                           txt.includes("Verify status") ||
-                           txt.includes("Verify") ||
-                           txt.includes("验证") ||
-                           txt === "Next" ||
-                           txt === "下一步" ||
-                           txt.includes("Next") ||
-                           txt.includes("下一步") ||
-                           txt.includes("Submit");
-                });
+    // 查找第一步提交按钮（Next / Verify academic status），严格排除含 "accept terms" 的第二步按钮
+    function isStep1Btn(el) {
+        const txt = (el.textContent || el.value || '').trim();
+        if (txt.toLowerCase().includes("accept terms") || txt.includes("接受条款")) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        return txt.includes("Verify academic status") || txt.includes("验证学术状态") ||
+               txt.includes("Verify eligibility") || txt.includes("Verify status") ||
+               txt.includes("Verify") || txt.includes("验证") ||
+               txt === "Next" || txt === "下一步" || txt.includes("Next") || txt.includes("下一步") ||
+               txt.includes("Submit");
+    }
+    const sseBtn = document.querySelector("#sse-vnext-submit-button");
+    const btn = (sseBtn && isStep1Btn(sseBtn)) ? sseBtn :
+                [...document.querySelectorAll("button, input[type='submit']")].find(isStep1Btn);
     if (!btn) return "not_found";
     const r = btn.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return "hidden";
@@ -240,19 +241,21 @@ async def _handle_terms_acceptance_if_present(page: Page, cb: ProgressCallback =
 
         try:
             body_txt = (await page.locator("body").inner_text(timeout=300)).lower()
-            if any(k in body_txt for k in ("confirming your account", "正在确认", "verification complete", "you are verified")):
+            # 仅在明确进入账号确认/设置阶段时退出（排除 Turnstile 的 "验证完成" 小徽章）
+            if any(k in body_txt for k in ("confirming your account", "正在确认你的帐户", "setting up your account")):
                 return False
         except Exception:
             body_txt = ""
 
-        # 检查是否出现 Terms 相关元素或文本
+        # 检查是否出现 Terms 相关元素或文本（含展开的条款复选框区域）
         for tgt in targets:
             try:
                 has_terms = await tgt.evaluate("""() => {
                     const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                    const hasKeyword = txt.includes('terms') || txt.includes('条款') ||
-                                       txt.includes('subscription agreement') || txt.includes('订阅协议') ||
-                                       txt.includes('azure dev tools for teaching');
+                    // 检测条款关键词（subscription agreement 只在 Terms 展开后可见）
+                    const hasAgreement = txt.includes('subscription agreement') || txt.includes('订阅协议') ||
+                                         txt.includes('azure dev tools for teaching') || txt.includes('i agree to');
+                    // 检测 accept terms 按钮
                     const btns = [...document.querySelectorAll('button, input[type="submit"]')];
                     const hasTermsBtn = btns.some(b => {
                         const t = (b.textContent || b.value || '').trim().toLowerCase();
@@ -260,7 +263,10 @@ async def _handle_terms_acceptance_if_present(page: Page, cb: ProgressCallback =
                                (t.includes('verify') && t.includes('terms')) ||
                                (t.includes('验证') && t.includes('条款'));
                     });
-                    return hasKeyword && (hasTermsBtn || document.querySelectorAll('input[type="checkbox"]').length >= 2);
+                    // 检测复选框（兼容原生 <input> 和 ARIA [role="checkbox"]）
+                    const cbCount = document.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length;
+                    // 条件：有订阅协议文本 或 (有条款按钮 且 有复选框)
+                    return hasAgreement || (hasTermsBtn && cbCount >= 1) || ((txt.includes('terms') || txt.includes('条款')) && cbCount >= 2);
                 }""")
                 if has_terms:
                     terms_detected = True
@@ -882,42 +888,108 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
 
         await asyncio.sleep(random.uniform(0.40, 0.80))
 
-        # ── 点击 Next / Verify academic status ───────────────────────
-        tgt_sub, verify_btn = await _find_visible_locator(page, _SUBMIT_SELECTORS, timeout_ms=2000)
-        if not verify_btn:
-            verify_btn = page.locator(", ".join(_SUBMIT_SELECTORS)).first
+        # ── 点击 Next / Verify academic status（严格排除第二步 accept terms 按钮） ──
+        _STEP1_CLICK_JS = """() => {
+            const btns = [...document.querySelectorAll('button, input[type="submit"]')].filter(b => {
+                const r = b.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            });
+            // 优先级 1：精确匹配 "Next" / "下一步"
+            let btn = btns.find(b => {
+                const t = (b.textContent || b.value || '').trim();
+                return t === 'Next' || t === '下一步';
+            });
+            // 优先级 2："Verify academic status" 但排除 "accept terms"
+            if (!btn) {
+                btn = btns.find(b => {
+                    const t = (b.textContent || b.value || '').trim().toLowerCase();
+                    if (t.includes('accept terms') || t.includes('接受条款')) return false;
+                    return t.includes('verify') || t.includes('验证');
+                });
+            }
+            // 优先级 3：#sse-vnext-submit-button（也排除 accept terms）
+            if (!btn) {
+                const sse = document.querySelector('#sse-vnext-submit-button');
+                if (sse) {
+                    const t = (sse.textContent || sse.value || '').trim().toLowerCase();
+                    if (!t.includes('accept terms') && !t.includes('接受条款')) btn = sse;
+                }
+            }
+            if (!btn) return { clicked: false, text: '' };
+            btn.scrollIntoView({ block: 'center' });
+            btn.click();
+            return { clicked: true, text: (btn.textContent || btn.value || '').trim() };
+        }"""
 
-        btn_txt = "Verify academic status"
-        try:
-            btn_txt = (await verify_btn.inner_text() or "Verify academic status").strip()
-        except Exception:
-            pass
-
-        _emit(cb, f"  🎓 点击 {btn_txt}")
-        await verify_btn.scroll_into_view_if_needed()
         clicked_ok = False
-        try:
-            clicked_ok = await human_hover_and_click(page, verify_btn, timeout=6000)
-        except Exception:
-            pass
-        if not clicked_ok:
-            try:
-                await verify_btn.click(timeout=4000)
-            except Exception:
-                for tgt in targets:
+        btn_txt = "Next"
+        # 方式 1：Playwright Locator（优先 "Next" 精确匹配）
+        for sel in ["button:text-is('Next')", "button:text-is('下一步')"]:
+            tgt_sub, verify_btn = await _find_visible_locator(page, [sel], timeout_ms=800)
+            if verify_btn:
+                try:
+                    btn_txt = (await verify_btn.inner_text() or "Next").strip()
+                except Exception:
+                    pass
+                try:
+                    await verify_btn.scroll_into_view_if_needed()
+                    clicked_ok = await human_hover_and_click(page, verify_btn, timeout=5000)
+                except Exception:
                     try:
-                        await tgt.evaluate(
-                            "() => { const b = document.querySelector('#sse-vnext-submit-button') || [...document.querySelectorAll('button, input[type=\"submit\"]')].find(x => { const t = (x.textContent || x.value || '').trim(); return t.includes('Next') || t.includes('下一步') || t.includes('Verify') || t.includes('验证'); }); if(b) b.click(); }"
-                        )
+                        await verify_btn.click(timeout=3000)
+                        clicked_ok = True
                     except Exception:
                         pass
+                if clicked_ok:
+                    break
+
+        # 方式 2：Playwright Locator（"Verify academic status" 排除 accept terms）
+        if not clicked_ok:
+            for sel in _SUBMIT_SELECTORS:
+                tgt_sub, verify_btn = await _find_visible_locator(page, [sel], timeout_ms=600)
+                if verify_btn:
+                    try:
+                        txt = (await verify_btn.inner_text() or "").strip().lower()
+                        if "accept terms" in txt or "接受条款" in txt:
+                            continue
+                        btn_txt = (await verify_btn.inner_text() or "Verify").strip()
+                    except Exception:
+                        pass
+                    try:
+                        await verify_btn.scroll_into_view_if_needed()
+                        clicked_ok = await human_hover_and_click(page, verify_btn, timeout=5000)
+                    except Exception:
+                        try:
+                            await verify_btn.click(timeout=3000)
+                            clicked_ok = True
+                        except Exception:
+                            pass
+                    if clicked_ok:
+                        break
+
+        # 方式 3：纯 JS 兜底点击（带优先级排序）
+        if not clicked_ok:
+            for tgt in targets:
+                try:
+                    res = await tgt.evaluate(_STEP1_CLICK_JS)
+                    if res and res.get("clicked"):
+                        btn_txt = res.get("text", "Verify")
+                        clicked_ok = True
+                        break
+                except Exception:
+                    pass
+
+        is_next_btn = btn_txt.strip().lower() in ("next", "下一步")
+        _emit(cb, f"  🎓 点击 {btn_txt}")
 
         is_captcha, cap_msg = await check_captcha_present(page)
         if is_captcha:
             raise AzureCaptchaError(f"触发 Azure 人机拼图验证 ({cap_msg})")
 
         # ── 自适应检测与处理第二步条款确认（适配部分账号出现的 Terms 卡片） ──
-        terms_handled = await _handle_terms_acceptance_if_present(page, cb, max_wait_s=8.0)
+        # 点击 "Next" 后 Terms 面板必定出现，等待更长；旧流程 "Verify academic status" 后短探测即可
+        _terms_wait = 15.0 if is_next_btn else 8.0
+        terms_handled = await _handle_terms_acceptance_if_present(page, cb, max_wait_s=_terms_wait)
         if terms_handled:
             _emit(cb, "  ✅ 条款确认与验证完成，进入资格审核与跳转确认...")
             if ms_email:
