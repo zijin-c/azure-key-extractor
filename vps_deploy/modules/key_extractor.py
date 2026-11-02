@@ -61,7 +61,7 @@ async def _has_software_search(page):
 _PRODUCT_SEARCH_MAP = {
     "Visio Professional 2021": "Visio",
     "Project Professional 2021 - DVD": "Project",
-    "Project Professional 2019": "Project Professional 2019",
+    "Project Professional 2019": "Project Professional",
     "Windows Server 2022 Standard (updated July 2023)": "Windows Server 2022",
     "Windows Server 2025 Standard": "Windows Server 2025",
     "Windows Server 2019 Standard (updated Mar 2023)": "Windows Server 2019",
