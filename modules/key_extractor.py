@@ -61,6 +61,7 @@ async def _has_software_search(page):
 _PRODUCT_SEARCH_MAP = {
     "Visio Professional 2021": "Visio",
     "Project Professional 2021 - DVD": "Project",
+    "Project Professional 2019": "Project Professional 2019",
     "Windows Server 2022 Standard (updated July 2023)": "Windows Server 2022",
     "Windows Server 2025 Standard": "Windows Server 2025",
     "Windows Server 2019 Standard (updated Mar 2023)": "Windows Server 2019",
@@ -402,13 +403,22 @@ async def _click_product_row(page: Page, product_name: str, cb: ProgressCallback
     if "visio" in product_name.lower():
         candidates.extend(["Visio Professional 2021", "Visio Professional", "Visio"])
     if "project" in product_name.lower():
-        candidates.extend(["Project Professional 2021 - DVD", "Project Professional 2021", "Project Professional", "Project"])
-    if "2022" in product_name:
-        candidates.extend(["Windows Server 2022 Standard", "Windows Server 2022"])
-    if "2025" in product_name:
-        candidates.extend(["Windows Server 2025 Standard", "Windows Server 2025"])
-    if "2019" in product_name:
-        candidates.extend(["Windows Server 2019 Standard", "Windows Server 2019"])
+        if "2019" in product_name:
+            candidates.extend([
+                "Project Professional 2019 - DVD",
+                "Project Professional 2019",
+                "Project Professional",
+                "Project",
+            ])
+        else:
+            candidates.extend(["Project Professional 2021 - DVD", "Project Professional 2021", "Project Professional", "Project"])
+    if "windows server" in product_name.lower():
+        if "2022" in product_name:
+            candidates.extend(["Windows Server 2022 Standard", "Windows Server 2022"])
+        if "2025" in product_name:
+            candidates.extend(["Windows Server 2025 Standard", "Windows Server 2025"])
+        if "2019" in product_name:
+            candidates.extend(["Windows Server 2019 Standard", "Windows Server 2019"])
     if "windows 11" in product_name.lower():
         candidates.extend(["Windows 11 Education, version 25H2", "Windows 11 Education", "Windows 11"])
 
