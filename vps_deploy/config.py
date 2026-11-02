@@ -150,6 +150,7 @@ AZURE_EDU_SOFTWARE_URL = (
 PRODUCTS_TO_EXTRACT = [
     "Visio Professional 2021",
     "Project Professional 2021 - DVD",
+    "Project Professional 2019",
     "Windows Server 2022 Standard (updated July 2023)",
     "Windows Server 2025 Standard",
     "Windows Server 2019 Standard (updated Mar 2023)",

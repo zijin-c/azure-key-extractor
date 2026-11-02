@@ -22,6 +22,7 @@ _RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 PRODUCT_COLUMNS = [
     "Visio Professional 2021",
     "Project Professional 2021 - DVD",
+    "Project Professional 2019",
     "Windows Server 2022 Standard (updated July 2023)",
     "Windows Server 2025 Standard",
     "Windows Server 2019 Standard (updated Mar 2023)",
@@ -32,6 +33,7 @@ PRODUCT_COLUMNS = [
 PRODUCT_SHORT = {
     "Visio Professional 2021":                          "Visio 2021",
     "Project Professional 2021 - DVD":                  "Project 2021",
+    "Project Professional 2019":                        "Project 2019",
     "Windows Server 2022 Standard (updated July 2023)": "WinSrv 2022",
     "Windows Server 2025 Standard":                     "WinSrv 2025",
     "Windows Server 2019 Standard (updated Mar 2023)":  "WinSrv 2019",
