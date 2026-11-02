@@ -269,7 +269,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
   <div class="logo">🔑</div>
   <div>
     <h1>Azure Education Key 提取工具</h1>
-    <p>自动登录 Azure for Students → 提取 6 个产品 License Key → Excel 导出</p>
+    <p>自动登录 Azure for Students → 提取 {{ products|length }} 个产品 License Key → Excel 导出</p>
   </div>
   <div class="topbar-right">
     <span id="mode-badge" class="idle">就绪</span>
@@ -284,7 +284,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
   <!-- 左侧控制面板 -->
   <div>
     <div class="card" style="margin-bottom:14px">
-      <div class="card-title">目标产品 <span id="product-count-label" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem"></span>（已选 6 个）</span></div>
+      <div class="card-title">目标产品 <span id="product-count-label" style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:.7rem">已选 {{ products|length }} 个（共 {{ products|length }} 项）</span></div>
       <div class="product-list">
         {% for p in products %}
         <div class="product-item" id="prod-{{ loop.index0 }}">
@@ -628,7 +628,7 @@ function appendLog(ts,msg){
     updateProgress(_doneAccounts+1, _totalAccounts);
   }
 
-  // 检测账号完成（"📊 提取结果: X/6 个 key" 或 "❌ 失败"）
+  // 检测账号完成（"📊 提取结果: X/N 个 key" 或 "❌ 失败"）
   if(msg.includes('📊 提取结果:') || (msg.includes('账号处理崩溃') || msg.includes('超时跳过'))){
     if(_totalAccounts>0){
       updateProgress(_doneAccounts+1, _totalAccounts);
