@@ -17,6 +17,7 @@ import random
 import re
 import sys
 from typing import Callable, Optional, Any
+from urllib.parse import urlsplit
 
 import pyotp
 from playwright.async_api import Page, BrowserContext, TimeoutError as PWTimeout
@@ -103,32 +104,31 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
     retry_done = False
     current_totp = totp_secret
 
+    async def handle_login():
+        nonlocal current_totp, start_time
+        try:
+            new_totp = await asyncio.wait_for(
+                _handle_portal_login(page, current_totp, ms_email, cb),
+                timeout=max(0, deadline - asyncio.get_running_loop().time()),
+            )
+        except asyncio.TimeoutError as exc:
+            raise PortalLoadError(
+                f"Portal 登录/2FA 在 {timeout} 秒内未完成，请检查当前验证页面", totp=current_totp
+            ) from exc
+        if new_totp:
+            current_totp = new_totp
+            if ms_email:
+                save_totp_cache(ms_email, current_totp)
+        start_time = asyncio.get_running_loop().time()
+
     while asyncio.get_event_loop().time() < deadline:
         cur_url = (page.url or "").lower()
 
         # 1. 实时检测是否触发微软登录/OAuth/2FA 验证页 (如 login.microsoftonline.com/organizations/oauth2/...)
         if any(k in cur_url for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com")) or await _is_mfa_login_prompt(page):
-            # 如果已有 TOTP 密钥且页面停留在 mysignins / proofup，优先直接导航到 Portal 避免重复进入 2FA 绑定向导
-            if current_totp and any(k in cur_url for k in ("mysignins.microsoft.com", "proofup")):
-                _emit(cb, "  🔄 2FA 密钥已就绪，直接导航到 Education Software 页面...")
-                try:
-                    await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-                except Exception:
-                    pass
-                start_time = asyncio.get_event_loop().time()
-                deadline = start_time + timeout
-                await asyncio.sleep(1)
-                continue
-
             _emit(cb, "  🔑 检测到 Portal 登录/2FA 重定向，正在自动处理...")
-            new_totp = await _handle_portal_login(page, current_totp, ms_email, cb)
-            if new_totp:
-                current_totp = new_totp
-                if ms_email:
-                    save_totp_cache(ms_email, current_totp)
-            # 处理完 2FA 或在登录流程中，重置计时器，确保 30 秒是从 2FA 真正完成进入 Portal 后才开始计算
-            start_time = asyncio.get_event_loop().time()
-            deadline = start_time + timeout
+            # 仅重置渲染等待起点；总截止时间固定，避免登录重定向无限续期。
+            await handle_login()
             await asyncio.sleep(1)
             continue
 
@@ -218,17 +218,18 @@ async def _wait_for_portal_ready(page: Page, cb: ProgressCallback, timeout: int 
 
             # 重新导航后可能触发 MFA 登录流程，用已有 secret 处理
             _emit(cb, "  🔍 检查是否需要重新 MFA...")
-            new_totp = await _handle_portal_login(page, current_totp, ms_email, cb)
-            if new_totp:
-                current_totp = new_totp
-                if ms_email:
-                    save_totp_cache(ms_email, current_totp)
-            start_time = asyncio.get_event_loop().time()
-            deadline = start_time + timeout
+            if await _is_mfa_login_prompt(page) or urlsplit(page.url).hostname in (
+                "login.microsoftonline.com", "login.live.com", "mysignins.microsoft.com"
+            ):
+                await handle_login()
             continue
 
         await asyncio.sleep(1)
 
+    if await _is_mfa_login_prompt(page) or urlsplit(page.url).hostname in (
+        "login.microsoftonline.com", "login.live.com", "mysignins.microsoft.com"
+    ):
+        raise PortalLoadError(f"Portal 登录/2FA 在 {timeout} 秒内未完成", totp=current_totp)
     _emit(cb, f"  ⚠️  Portal 加载超过 {timeout} 秒仍未就绪，尝试继续提取...")
     return False, current_totp
 
@@ -239,24 +240,20 @@ async def _is_mfa_setup_page(page: Page) -> bool:
     避免将包含安全声明页脚的常规登录页误判为向导。
     """
     try:
-        cur_u = (page.url or "").lower()
-        if any(k in cur_u for k in ("mysignins.microsoft.com", "proofup", "account.activedirectory.windowsazure.com/proofup")):
-            return True
+        # 不匹配整个 URL：登录页的 returnUrl/redirect_uri 经常包含 proofup。
+        # mysignins 域名也会承载登录挑战，必须按可见 DOM 区分。
         return await page.evaluate("""
             () => {
                 const bodyTxt = (document.body ? document.body.innerText : '').toLowerCase();
                 const isKmsi = bodyTxt.includes('stay signed in') || bodyTxt.includes('保持登录') ||
                                document.querySelector('#idSIButton9') && bodyTxt.includes('do this to reduce the number of times');
-                const hasCodeBox = !!(
-                    document.querySelector("input[name='otc']") ||
-                    document.querySelector("input#idTxtBx_SAOTCC_OTC") ||
-                    document.querySelector("input#idTxtBx_OTC") ||
-                    document.querySelector("input[name='VerificationCode']") ||
-                    document.querySelector("input[autocomplete='one-time-code']")
-                );
+                const hasCodeBox = [...document.querySelectorAll(
+                    "input[name='otc'], input#idTxtBx_SAOTCC_OTC, input#idTxtBx_OTC, input[name='VerificationCode'], input[autocomplete='one-time-code']"
+                )].some(el => el.getClientRects().length && !el.disabled && !el.readOnly);
                 if (isKmsi || hasCodeBox) return false;
 
                 const headings = [...document.querySelectorAll('h1, h2, h3, #loginHeader, .text-title, [role="heading"], label, p')]
+                    .filter(el => el.getClientRects().length)
                     .map(el => (el.innerText || '').trim().toLowerCase())
                     .filter(t => t.length > 0 && t.length < 150);
                 const hText = headings.join(' | ');
@@ -275,22 +272,25 @@ async def _is_mfa_setup_page(page: Page) -> bool:
                     hText.includes("在应用中设置") ||
                     hText.includes("scan the qr code") ||
                     hText.includes("扫描二维码") ||
-                    hText.includes("setting up your passkey")
+                    hText.includes("setting up your passkey") ||
+                    hText.includes("enter the following into authenticator") ||
+                    hText.includes("secret key")
                 );
                 if (isHeaderMatch) return true;
 
                 const specialBtns = [
                     "input#idSubmit_ProofUp_Redirect",
-                    "[data-automationid='set-up-authenticator-app-next-button']",
-                    "button:has-text('Can\\'t scan the QR code')",
-                    "button:has-text('I want to set up a different method')",
-                    "a:has-text('I want to set up a different method')",
-                    "a:has-text('I want to use a different authenticator app')"
+                    "[data-automationid='set-up-authenticator-app-next-button']"
                 ];
                 for (const s of specialBtns) {
-                    if (document.querySelector(s)) return true;
+                    const el = document.querySelector(s);
+                    if (el && el.getClientRects().length && !el.disabled) return true;
                 }
-                return false;
+                // querySelector 不支持 Playwright 的 :has-text()。
+                return [...document.querySelectorAll('a, button')].some(el =>
+                    el.getClientRects().length && !el.disabled &&
+                    /can't scan (the qr code|image)|i want to set up a different method|i want to use a different authenticator app/i.test(el.innerText || '')
+                );
             }
         """)
     except Exception:
@@ -316,12 +316,7 @@ async def _is_totp_input_page(page: Page) -> bool:
                         if (el && (el.offsetWidth > 0 || el.offsetHeight > 0) && !el.disabled && !el.readOnly) return true;
                     }
                 }
-                const txt = (document.body ? document.body.innerText : '').toLowerCase();
-                return txt.includes('enter code') || txt.includes('enter the code') ||
-                       txt.includes('输入代码') || txt.includes('输入验证码') ||
-                       txt.includes('approve a request') || txt.includes('sign in another way') ||
-                       txt.includes('其他登录方式') || txt.includes('其他验证方式') ||
-                       txt.includes('use a verification code') || txt.includes('使用验证码');
+                return false;
             }
         """)
     except Exception:
@@ -330,7 +325,12 @@ async def _is_totp_input_page(page: Page) -> bool:
 
 async def _is_mfa_login_prompt(page: Page) -> bool:
     """检测当前页面是否包含 2FA 验证码输入框或 MFA / 登录相关特征。"""
-    return (await _is_mfa_setup_page(page)) or (await _is_totp_input_page(page))
+    if (await _is_mfa_setup_page(page)) or (await _is_totp_input_page(page)):
+        return True
+    try:
+        return await page.evaluate("""() => /approve a request|sign in another way|use a verification code|其他登录方式|其他验证方式|使用验证码/i.test(document.body ? document.body.innerText : '')""")
+    except Exception:
+        return False
 
 
 
@@ -848,7 +848,7 @@ async def _handle_portal_login(page: Page, totp_secret: str,
        - 若出现「以其他方式登录 / Sign in another way」，自动选择「使用验证码 / Use a verification code」；
        - 若出现验证码输入框，通过 pyotp 生成 TOTP 码填入并提交；
        - 若出现「保持登录 (Stay signed in)」，点击「Yes」；
-    4. 若未配置 2FA 或快速登录未通过，兜底调用 _handle_mfa_setup 响应式状态机。
+    4. 仅在确认注册向导后调用 _handle_mfa_setup；登录等待超时抛出异常。
     """
     from modules.azure_login import _handle_mfa_setup, _azure_destination_ready, _fill_totp_code
 
@@ -862,158 +862,160 @@ async def _handle_portal_login(page: Page, totp_secret: str,
     if await _azure_destination_ready(page, cur_u):
         return secret
 
-    # ── 情况 A: 若已有 Secret，优先执行快速 TOTP 登录验证与 KMSI 推进 ──
+    async def run_setup():
+        res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
+        result_secret = res or secret
+        if res and ms_email:
+            save_totp_cache(ms_email, res)
+        # 状态机返回 Secret 只代表持有密钥；它在轮询耗尽时也会这样返回。
+        if await _is_mfa_setup_page(page):
+            raise PortalLoadError("MFA 注册向导尚未完成，已停止重复启动注册流程", totp=result_secret)
+        if result_secret and urlsplit(page.url or "").hostname == "mysignins.microsoft.com" and not await _is_mfa_login_prompt(page):
+            _emit(cb, "  🔄 MFA 向导已退出，导航进入 Azure Education Software 页面...")
+            try:
+                await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
+            except Exception:
+                pass
+        return result_secret
+
+    # 两类账号共用页面等待：已有密钥走登录挑战，首次绑定等待真实注册界面。
     if secret:
         _emit(cb, "  🔑 已有 2FA 密钥，执行快速 TOTP 登录验证...")
-        for _attempt in range(16):  # 最多轮询 ~8 秒
-            await asyncio.sleep(0.5)
-            cur_u = (page.url or "").lower()
+    else:
+        _emit(cb, "  ⏳ 尚无 2FA 密钥，等待登录跳转或首次 MFA 注册页面...")
+    last_submitted_code = ""
+    for _attempt in range(90):  # 为慢速重定向保留等待时间；外层还有总超时。
+        await asyncio.sleep(0.5)
+        cur_u = (page.url or "").lower()
 
-            # 1. 业务页就绪
-            if await _azure_destination_ready(page, cur_u):
+        # 1. 业务页就绪
+        if await _azure_destination_ready(page, cur_u):
+            _emit(cb, "  ✅ 已进入 Azure Portal")
+            return secret
+
+        try:
+            body_lower = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
+        except Exception:
+            body_lower = ""
+
+        # 2. 账号选择器 (Pick an account)
+        if "pick an account" in body_lower or "choose an account" in body_lower:
+            _emit(cb, "  👆 出现账号选择器，选择已登录账号...")
+            for sel in [f"div:has-text('{ms_email}')", f"small:has-text('{ms_email}')", "[data-test='account-item']", "#tilesHolder .table"]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=200):
+                        await loc.click(force=True)
+                        await asyncio.sleep(0.8)
+                        break
+                except Exception:
+                    pass
+            continue
+
+        # 3. 保持登录 (Stay signed in / KMSI)
+        if "stay signed in" in body_lower or "kmsi" in cur_u or "保持登录" in body_lower:
+            _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
+            await _click_first_visible(page, [
+                "input#idSIButton9", "button#idSIButton9",
+                "input[type='submit'][value='Yes']", "button:has-text('Yes')",
+                "input[type='submit'][value='是']", "button:has-text('是')"
+            ], timeout=2000)
+            await asyncio.sleep(1.0)
+            if await _azure_destination_ready(page, page.url or ""):
                 _emit(cb, "  ✅ 已进入 Azure Portal")
                 return secret
+            continue
 
-            try:
-                body_lower = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
-            except Exception:
-                body_lower = ""
+        # 4. 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
+        if any(k in body_lower for k in ("approve a request", "check your mobile device", "sign in another way", "其他登录方式", "其他验证方式")):
+            for sw_sel in [
+                "a:has-text('Sign in another way')", "button:has-text('Sign in another way')",
+                "a:has-text('其他登录方式')", "a:has-text('其他验证方式')",
+                "a:has-text('I can\\'t use my Microsoft Authenticator app right now')",
+                "button:has-text('I can\\'t use my Microsoft Authenticator app right now')",
+            ]:
+                try:
+                    loc = page.locator(sw_sel).first
+                    if await loc.is_visible(timeout=150):
+                        _emit(cb, "  🔀 点击「以其他方式登录 / Sign in another way」...")
+                        await loc.click(force=True)
+                        await asyncio.sleep(0.8)
+                        break
+                except Exception:
+                    pass
 
-            # 2. 账号选择器 (Pick an account)
-            if "pick an account" in body_lower or "choose an account" in body_lower:
-                _emit(cb, "  👆 出现账号选择器，选择已登录账号...")
-                for sel in [f"div:has-text('{ms_email}')", f"small:has-text('{ms_email}')", "[data-test='account-item']", "#tilesHolder .table"]:
-                    try:
-                        loc = page.locator(sel).first
-                        if await loc.is_visible(timeout=200):
-                            await loc.click(force=True)
-                            await asyncio.sleep(0.8)
-                            break
-                    except Exception:
-                        pass
+            for pick_sel in [
+                "[data-value='PhoneAppOTP']",
+                "div:has-text('Use a verification code')", "span:has-text('Use a verification code')",
+                "div:has-text('使用验证码')", "span:has-text('使用验证码')",
+                "a:has-text('Enter a code from an authenticator app')",
+                "a:has-text('Use a verification code')",
+            ]:
+                try:
+                    loc = page.locator(pick_sel).first
+                    if await loc.is_visible(timeout=150):
+                        _emit(cb, "  🔀 选择「使用验证码 / Use a verification code」...")
+                        await loc.click(force=True)
+                        await asyncio.sleep(0.8)
+                        break
+                except Exception:
+                    pass
+
+        # 5. 已绑定账号使用原密钥验证；没有密钥的挑战页不能当成注册页。
+        if await _is_totp_input_page(page):
+            if not secret:
+                raise PortalLoadError("页面要求已有 2FA 验证码，但未找到该账号的密钥，请提供原 2FA 密钥")
+            code = pyotp.TOTP(secret).now()
+            if code == last_submitted_code:
                 continue
-
-            # 3. 保持登录 (Stay signed in / KMSI)
-            if "stay signed in" in body_lower or "kmsi" in cur_u or "保持登录" in body_lower:
-                _emit(cb, "  ✅ 点击「保持登录 (Yes)」...")
-                await _click_first_visible(page, [
+            filled = await _fill_totp_code(page, code, cb, submit=False)
+            if filled:
+                last_submitted_code = code
+                _emit(cb, "  🔢 已填入 TOTP 码，正在提交验证...")
+                await asyncio.sleep(0.3)
+                submitted = await _click_first_visible(page, [
+                    "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
                     "input#idSIButton9", "button#idSIButton9",
-                    "input[type='submit'][value='Yes']", "button:has-text('Yes')",
-                    "input[type='submit'][value='是']", "button:has-text('是')"
+                    "button:has-text('Verify')", "input[value='Verify']",
+                    "button:has-text('Next')", "input[value='Next']",
+                    "button:has-text('验证')", "button:has-text('下一步')"
                 ], timeout=2000)
-                await asyncio.sleep(1.0)
-                if await _azure_destination_ready(page, page.url or ""):
-                    _emit(cb, "  ✅ 已进入 Azure Portal")
-                    return secret
+                if not submitted:
+                    await page.keyboard.press("Enter")
+                # 提交后实时监测后续状态（进入 Portal 或出现 KMSI）
+                for _wait_post in range(6):
+                    await asyncio.sleep(0.5)
+                    cur_u_post = (page.url or "").lower()
+                    if await _azure_destination_ready(page, cur_u_post):
+                        _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
+                        return secret
+                    try:
+                        body_post = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
+                    except Exception:
+                        body_post = ""
+                    if "stay signed in" in body_post or "kmsi" in cur_u_post or "保持登录" in body_post:
+                        _emit(cb, "  ✅ 出现「保持登录 (Stay signed in)」，点击「Yes」...")
+                        await _click_first_visible(page, [
+                            "input#idSIButton9", "button#idSIButton9",
+                            "input[type='submit'][value='Yes']", "button:has-text('Yes')",
+                            "input[type='submit'][value='是']", "button:has-text('是')"
+                        ], timeout=2000)
+                        await asyncio.sleep(1.0)
+                        if await _azure_destination_ready(page, page.url or ""):
+                            _emit(cb, "  ✅ 已进入 Azure Portal")
+                            return secret
+                        break
                 continue
 
-            # 4. 切换到「使用验证码」选项 (若停留在 Authenticator 手机推送界面)
-            if any(k in body_lower for k in ("approve a request", "check your mobile device", "sign in another way", "其他登录方式", "其他验证方式")):
-                for sw_sel in [
-                    "a:has-text('Sign in another way')", "button:has-text('Sign in another way')",
-                    "a:has-text('其他登录方式')", "a:has-text('其他验证方式')",
-                    "a:has-text('I can\\'t use my Microsoft Authenticator app right now')",
-                    "button:has-text('I can\\'t use my Microsoft Authenticator app right now')",
-                ]:
-                    try:
-                        loc = page.locator(sw_sel).first
-                        if await loc.is_visible(timeout=150):
-                            _emit(cb, "  🔀 点击「以其他方式登录 / Sign in another way」...")
-                            await loc.click(force=True)
-                            await asyncio.sleep(0.8)
-                            break
-                    except Exception:
-                        pass
-
-                for pick_sel in [
-                    "[data-value='PhoneAppOTP']",
-                    "div:has-text('Use a verification code')", "span:has-text('Use a verification code')",
-                    "div:has-text('使用验证码')", "span:has-text('使用验证码')",
-                    "a:has-text('Enter a code from an authenticator app')",
-                    "a:has-text('Use a verification code')",
-                ]:
-                    try:
-                        loc = page.locator(pick_sel).first
-                        if await loc.is_visible(timeout=150):
-                            _emit(cb, "  🔀 选择「使用验证码 / Use a verification code」...")
-                            await loc.click(force=True)
-                            await asyncio.sleep(0.8)
-                            break
-                    except Exception:
-                        pass
-
-            # 5. 填入 TOTP 验证码并提交
-            if await _is_totp_input_page(page):
-                code = pyotp.TOTP(secret).now()
-                filled = await _fill_totp_code(page, code, cb)
-                if filled:
-                    _emit(cb, f"  🔢 已填入 TOTP 码: {code}，正在提交验证...")
-                    await asyncio.sleep(0.3)
-                    try:
-                        await page.keyboard.press("Enter")
-                    except Exception:
-                        pass
-                    await _click_first_visible(page, [
-                        "button#idSubmit_SAOTCC_Continue", "input#idSubmit_SAOTCC_Continue",
-                        "input#idSIButton9", "button#idSIButton9",
-                        "button:has-text('Verify')", "input[value='Verify']",
-                        "button:has-text('Next')", "input[value='Next']",
-                        "button:has-text('验证')", "button:has-text('下一步')"
-                    ], timeout=2000)
-                    # 提交后实时监测后续状态（进入 Portal 或出现 KMSI）
-                    for _wait_post in range(6):
-                        await asyncio.sleep(0.5)
-                        cur_u_post = (page.url or "").lower()
-                        if await _azure_destination_ready(page, cur_u_post):
-                            _emit(cb, "  ✅ TOTP 验证通过，已进入 Azure Portal")
-                            return secret
-                        try:
-                            body_post = (await page.evaluate("() => (document.body ? document.body.innerText : '').toLowerCase()")) or ""
-                        except Exception:
-                            body_post = ""
-                        if "stay signed in" in body_post or "kmsi" in cur_u_post or "保持登录" in body_post:
-                            _emit(cb, "  ✅ 出现「保持登录 (Stay signed in)」，点击「Yes」...")
-                            await _click_first_visible(page, [
-                                "input#idSIButton9", "button#idSIButton9",
-                                "input[type='submit'][value='Yes']", "button:has-text('Yes')",
-                                "input[type='submit'][value='是']", "button:has-text('是')"
-                            ], timeout=2000)
-                            await asyncio.sleep(1.0)
-                            if await _azure_destination_ready(page, page.url or ""):
-                                _emit(cb, "  ✅ 已进入 Azure Portal")
-                                return secret
-                            break
-                    continue
-
-            # 6. 如果在快速登录流程中页面确实重定向到了 MFA 注册向导（如 ProofUp）
-            if await _is_mfa_setup_page(page):
-                _emit(cb, "  🔐 页面重定向至 MFA 注册向导，启动 MFA 注册流程...")
-                res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
-                if res and ms_email:
-                    save_totp_cache(ms_email, res)
-                cur_u_after = (page.url or "").lower()
-                if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
-                    _emit(cb, "  🔄 2FA 绑定已完成，直接导航进入 Azure Education Software 页面...")
-                    try:
-                        await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-                    except Exception:
-                        pass
-                return res or secret
-
-    # ── 情况 B: 无 Secret 或首次 MFA 绑定，启动响应式状态机 ──
-    _emit(cb, "  🔐 启动 MFA 注册流程 (响应式状态机)...")
-    res = await _handle_mfa_setup(page, cb, existing_secret=secret, ms_email=ms_email)
-    if res and ms_email:
-        save_totp_cache(ms_email, res)
-
-    cur_u_after = (page.url or "").lower()
-    if (res or secret) and any(k in cur_u_after for k in ("mysignins.microsoft.com", "proofup")):
-        _emit(cb, "  🔄 2FA 流程已完成，直接导航进入 Azure Education Software 页面...")
-        try:
-            await page.goto(_EDU_SW_URL, wait_until="domcontentloaded", timeout=25000)
-        except Exception:
-            pass
-    return res or secret
+        # 6. 只有可见的注册界面才进入首次绑定流程。
+        if await _is_mfa_setup_page(page):
+            _emit(cb, "  🔐 页面重定向至 MFA 注册向导，启动 MFA 注册流程...")
+            return await run_setup()
+    # 加载中、登录验证超时都不代表需要重新注册。
+    location = urlsplit(page.url or "")
+    raise PortalLoadError(
+        f"Portal 登录验证未完成（{location.hostname or ''}{location.path}），未检测到可完成的验证流程", totp=secret
+    )
 
 
 async def _click_first_visible(page: Page, selectors: list, timeout: int = 4000) -> bool:
@@ -1347,16 +1349,8 @@ async def extract_all_keys(
                 else:
                     raise PortalLoadError(f"Education Software 页面导航失败（网络/代理卡顿）: {str(e)[:120]}", totp=totp_secret)
 
-    # 仅当明确处于微软登录/2FA重定向页面时，才前置触发 MFA 处理
-    cur_u = (sw_page.url or "").lower()
+    # 登录与 MFA 统一交给下面的有界等待，避免前置处理另起一轮超时。
     updated_totp = totp_secret
-    if any(k in cur_u for k in ("login.microsoftonline", "login.live.com", "mysignins.microsoft.com")) or await _is_mfa_login_prompt(sw_page):
-        new_totp = await _handle_portal_login(sw_page, totp_secret, ms_email, cb)
-        if new_totp:
-            updated_totp = new_totp
-            if ms_email:
-                save_totp_cache(ms_email, updated_totp)
-            _emit(cb, f"  🔑 MFA Secret 已更新: {new_totp}")
 
     try:
         # 等待 portal SPA 加载完成，期间持续响应 2FA 验证

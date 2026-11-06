@@ -239,7 +239,7 @@ async def _first_visible_locator(page: Page, selector: str):
     return None
 
 
-async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) -> bool:
+async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None, *, submit: bool = True) -> bool:
     """填入 TOTP 验证码到输入框（支持 React 16+ 原生 value setter、Fluent UI 深度穿透、跨 iframe 与真实按键）。"""
     sels = [
         "input[name='otc']",
@@ -306,10 +306,11 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
             """, code)
             if ok:
                 _emit(cb, "  ✅ TOTP 已填入")
-                try:
-                    await page.keyboard.press("Enter")
-                except Exception:
-                    pass
+                if submit:
+                    try:
+                        await page.keyboard.press("Enter")
+                    except Exception:
+                        pass
                 return True
         except Exception:
             continue
@@ -337,14 +338,11 @@ async def _fill_totp_code(page: Page, code: str, cb: ProgressCallback = None) ->
                     if val and code in val:
                         _emit(cb, "  ✅ TOTP 已填入")
                         await asyncio.sleep(random.uniform(0.1, 0.2))
-                        try:
-                            await loc.press("Enter", timeout=500)
-                        except Exception:
-                            pass
-                        try:
-                            await page.keyboard.press("Enter")
-                        except Exception:
-                            pass
+                        if submit:
+                            try:
+                                await loc.press("Enter", timeout=500)
+                            except Exception:
+                                pass
                         return True
             except Exception:
                 continue
