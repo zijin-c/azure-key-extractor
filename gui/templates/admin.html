@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理后台 · Azure Key</title>
+<style>
+:root{font-family:'Segoe UI','Microsoft YaHei',sans-serif;color:#17243a;background:#f1f5f9;font-size:14px}
+*{box-sizing:border-box}body{margin:0}button,input{font:inherit}button,a{touch-action:manipulation}
+.wrap{max-width:1250px;margin:auto;padding:28px 24px 48px}.topbar,.toolbar,.actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.topbar{justify-content:space-between;margin-bottom:30px}.brand{display:flex;align-items:center;gap:13px}.logo{background:#2563eb;color:white;width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:23px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:0}p{line-height:1.7}.muted,.subtitle{color:#64748b}.subtitle{font-size:12px}.topbar a{color:#2563eb;text-decoration:none}
+button{border:1px solid #dbe3ed;border-radius:8px;background:white;padding:9px 14px;color:#334155;cursor:pointer}button:hover{border-color:#2563eb;color:#2563eb}button:disabled{opacity:.5;cursor:wait}.primary{background:#2563eb;color:white;border-color:#2563eb}.primary:hover{background:#1d4ed8;color:white}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin:22px 0}.metric,.panel{background:white;border:1px solid #e2e8f0;border-radius:12px}.metric{padding:22px}.metric strong{display:block;font-size:34px;line-height:1.4;margin:6px 0;color:#17243a}.metric:first-child{border-top:3px solid #2563eb}.metric:first-child strong{color:#2563eb}
+.panel{margin-top:20px;overflow:hidden}.panel-head{padding:20px 22px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.notice{color:#475569;font-size:13px;margin:0;background:#eaf1ff;border:1px solid #dbe7ff;padding:13px 16px;border-radius:9px}
+input{border:1px solid #dbe3ed;border-radius:8px;padding:10px 12px;min-width:0;background:white;color:#17243a}input:focus{outline:2px solid #bfdbfe;border-color:#2563eb}#search{width:260px;max-width:100%}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;text-align:left;white-space:nowrap}th{font-size:12px;color:#64748b;background:#f8fafc;font-weight:500}td,th{padding:15px 22px;border-bottom:1px solid #edf1f6}tbody tr:last-child td{border-bottom:0}td strong{font-variant-numeric:tabular-nums;color:#2563eb}td small{display:block;color:#94a3b8;margin-top:5px}.badge{display:inline-block;border-radius:5px;background:#eff6ff;color:#2563eb;font-size:11px;padding:3px 7px;margin-left:7px}.badge.deleted{background:#f1f5f9;color:#64748b}.empty{text-align:center;color:#64748b;padding:35px}.row-actions{display:flex;gap:8px}.row-actions button{font-size:12px;padding:6px 10px}.danger{color:#dc2626}.form{display:flex;align-items:end;gap:12px;flex-wrap:wrap;padding:20px 22px}.form label{display:grid;gap:7px;color:#64748b;font-size:12px}.form input{width:235px;max-width:100%}.form button{align-self:end}.status{min-height:24px;margin-top:14px;font-size:13px;color:#475569}.status.error{color:#dc2626}.products{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;padding:20px 22px}.product{display:flex;justify-content:space-between;gap:14px;padding:13px 15px;background:#f8fafc;border-radius:8px;font-size:13px}.product span{overflow-wrap:anywhere}.product strong{color:#2563eb}
+dialog{border:1px solid #e2e8f0;border-radius:12px;padding:24px;width:380px;max-width:calc(100% - 32px);box-shadow:0 20px 60px #0f172a30}dialog::backdrop{background:#0f172a60}dialog input{width:100%;margin:14px 0}dialog h2{overflow-wrap:anywhere}dialog .actions{justify-content:flex-end}
+@media(max-width:640px){.wrap{padding:20px 14px}.metrics{gap:9px}.metric{padding:14px 10px}.metric strong{font-size:27px}.metric .subtitle{font-size:11px}.panel-head{padding:16px}td,th{padding:13px 16px}.form input,.form label{width:100%}.topbar{gap:18px}.products{padding:16px}}
+</style>
+</head>
+<body>
+<main class="wrap">
+  <nav class="topbar" aria-label="后台导航">
+    <div class="brand"><div class="logo" aria-hidden="true">▦</div><div><h1>管理后台</h1><div class="subtitle">Azure Key · 用户与提取统计</div></div></div>
+    <div class="actions"><span class="muted">{{ username }}</span><a href="{{ url_for('index') }}">返回提取工具 →</a><button id="refresh" type="button">刷新统计</button></div>
+  </nav>
+  <p class="notice">累计统计按「用户 + 产品 + Key」去重，重复提取不重复计数。用户删除历史、清空历史或账号被删除后，累计数量仍会保留。升级前已删除的记录无法追溯。</p>
+  <div class="metrics">
+    <div class="metric"><span class="muted">累计提取 Key</span><strong id="total-keys">—</strong><div class="subtitle">包含已删除历史中的 Key</div></div>
+    <div class="metric"><span class="muted">有提取记录的用户</span><strong id="users-with-keys">—</strong><div class="subtitle">包含已删除的用户</div></div>
+    <div class="metric"><span class="muted">当前用户</span><strong id="active-users">—</strong><div class="subtitle">包含管理员账号</div></div>
+  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <section class="panel" aria-labelledby="users-title">
+    <div class="panel-head"><div><h2 id="users-title">用户提取统计</h2><p class="subtitle" style="margin:6px 0 0">按累计 Key 数量排序 · <span id="updated-at">等待加载</span></p></div><input id="search" type="search" aria-label="搜索用户名" placeholder="搜索用户名…"></div>
+    <div class="scroll"><table><thead><tr><th>用户</th><th>累计 Key</th><th>现存历史</th><th>最近提取</th><th>最后登录</th><th>操作</th></tr></thead><tbody id="users"><tr><td colspan="6" class="empty">正在加载统计…</td></tr></tbody></table></div>
+  </section>
+  <section class="panel" aria-labelledby="products-title"><div class="panel-head"><h2 id="products-title">各产品累计 Key</h2></div><div id="products" class="products"><span class="muted">正在加载…</span></div></section>
+  <section class="panel" aria-labelledby="create-title">
+    <div class="panel-head"><h2 id="create-title">创建用户</h2><span class="subtitle">新用户可登录提取工具</span></div>
+    <form id="create-form" class="form"><label>用户名<input id="new-username" name="username" autocomplete="off" minlength="2" maxlength="32" required placeholder="2–32 个字符"></label><label>初始密码<input id="new-password" name="password" type="password" autocomplete="new-password" minlength="4" required placeholder="至少 4 位"></label><button class="primary" type="submit">创建用户</button></form>
+  </section>
+</main>
+<dialog id="password-dialog"><form id="password-form"><h2 id="password-title">重置密码</h2><input id="reset-password" type="password" autocomplete="new-password" aria-label="新密码" minlength="4" required placeholder="新密码（至少 4 位）"><div class="actions"><button type="button" id="cancel-password">取消</button><button type="submit" class="primary">确认修改</button></div></form></dialog>
+<script>
+const CURRENT_USER_ID = {{ current_user_id | tojson }};
+let users = [], passwordUser = null, loading = false;
+const $ = id => document.getElementById(id);
+const number = value => Number(value).toLocaleString('zh-CN');
+const date = value => value ? value.replace('T',' ').slice(0,19) : '—';
+function status(message, error=false){$('status').textContent=message;$('status').classList.toggle('error',error);}
+async function api(path, data){
+  const response=await fetch(path, data === undefined ? {cache:'no-store'} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  if(response.status===401){location.href='/login';throw new Error('登录已过期');}
+  if(response.status===403)throw new Error('无管理员权限，请重新登录');
+  const result=await response.json();
+  if(!response.ok || !result.ok)throw new Error(result.error || result.msg || '请求失败');
+  return result;
+}
+function cell(row, text){const td=document.createElement('td');td.textContent=text;row.append(td);return td;}
+function renderUsers(){
+  const query=$('search').value.trim().toLowerCase();
+  $('users').replaceChildren();
+  for(const user of users.filter(u=>u.username.toLowerCase().includes(query))){
+    const row=document.createElement('tr'), name=cell(row,user.username);
+    if(user.is_admin || user.deleted){const badge=document.createElement('span');badge.className='badge'+(user.deleted?' deleted':'');badge.textContent=user.deleted?'已删除': '管理员';name.append(badge);}
+    const id=document.createElement('small');id.textContent='#'+user.id;name.append(id);
+    const count=document.createElement('strong');count.textContent=number(user.extracted_keys);cell(row,'').append(count);
+    cell(row,number(user.history_count));cell(row,date(user.last_extracted_at));cell(row,date(user.last_login));
+    const actions=cell(row,'');
+    if(!user.deleted){
+      const box=document.createElement('div');box.className='row-actions';
+      const reset=document.createElement('button');reset.textContent=user.id===CURRENT_USER_ID?'修改密码':'重置密码';reset.addEventListener('click',()=>openPassword(user));box.append(reset);
+      if(!user.is_admin){const remove=document.createElement('button');remove.textContent='删除';remove.className='danger';remove.addEventListener('click',()=>deleteUser(user,remove));box.append(remove);}
+      actions.append(box);
+    }else actions.textContent='统计已保留';
+    $('users').append(row);
+  }
+  if(!$('users').children.length){const row=document.createElement('tr'),td=cell(row,query?'没有匹配的用户':'暂无用户');td.colSpan=6;td.className='empty';$('users').append(row);}
+}
+async function loadStats(){
+  if(loading)return;loading=true;$('refresh').disabled=true;
+  try{
+    const result=await api('/api/admin/stats');users=result.users;
+    $('total-keys').textContent=number(result.summary.extracted_keys);$('users-with-keys').textContent=number(result.summary.users_with_keys);$('active-users').textContent=number(result.summary.active_users);
+    renderUsers();$('products').replaceChildren();
+    for(const product of result.products){const box=document.createElement('div');box.className='product';const name=document.createElement('span'),count=document.createElement('strong');name.textContent=product.product;count.textContent=number(product.extracted_keys);box.append(name,count);$('products').append(box);}
+    if(!result.products.length)$('products').textContent='暂无提取记录';
+    $('updated-at').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN');
+  }catch(error){status('加载失败：'+error.message,true);$('updated-at').textContent='统计加载失败，请刷新重试';if(!users.length){$('users').replaceChildren();const row=document.createElement('tr'),td=cell(row,'暂时无法加载统计');td.colSpan=6;td.className='empty';$('users').append(row);$('products').textContent='暂时无法加载统计';}}
+  finally{loading=false;$('refresh').disabled=false;}
+}
+$('refresh').addEventListener('click',()=>{status('');loadStats();});
+$('search').addEventListener('input',renderUsers);
+$('create-form').addEventListener('submit',async event=>{
+  event.preventDefault();const button=event.submitter;button.disabled=true;
+  try{await api('/admin/users/create',{username:$('new-username').value.trim(),password:$('new-password').value});$('create-form').reset();status('用户已创建');await loadStats();}catch(error){status(error.message,true);}finally{button.disabled=false;}
+});
+function openPassword(user){passwordUser=user;$('password-title').textContent='修改密码 · '+user.username;$('reset-password').value='';$('password-dialog').showModal();}
+$('cancel-password').addEventListener('click',()=>$('password-dialog').close());
+$('password-form').addEventListener('submit',async event=>{
+  event.preventDefault();const button=event.submitter;button.disabled=true;
+  try{await api('/admin/users/password',{user_id:passwordUser.id,password:$('reset-password').value});$('password-dialog').close();status('密码已修改');}catch(error){$('password-dialog').close();status(error.message,true);}finally{button.disabled=false;}
+});
+async function deleteUser(user,button){
+  if(!confirm('确认删除用户「'+user.username+'」及其历史记录？累计 Key 统计会继续保留。'))return;
+  button.disabled=true;
+  try{await api('/admin/users/delete',{user_id:user.id});status('用户已删除，累计统计已保留');await loadStats();}catch(error){status(error.message,true);}finally{button.disabled=false;}
+}
+loadStats();
+</script>
+</body>
+</html>

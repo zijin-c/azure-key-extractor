@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 
-from flask import redirect, request, session, url_for, jsonify
+from flask import abort, redirect, request, session, url_for, jsonify
 
 # ── 数据库路径 ─────────────────────────────────────────────────
 _DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -72,8 +72,35 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_history_user ON task_history(user_id);
         CREATE INDEX IF NOT EXISTS idx_history_time ON task_history(created_at DESC);
+
+        -- 独立于用户可删除的历史，只存 key 指纹，不保存密钥明文。
+        CREATE TABLE IF NOT EXISTS key_extractions (
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            product TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            extracted_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, product, key_hash)
+        );
     """)
     conn.commit()
+
+    # 一次性补入升级前仍保留的历史；标记和统计在同一事务中提交。
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM settings WHERE key = 'key_stats_backfilled_v1'").fetchone():
+            rows = conn.execute("""
+                SELECT h.user_id, u.username, h.keys, h.created_at
+                FROM task_history h LEFT JOIN users u ON u.id = h.user_id
+                ORDER BY h.id
+            """)
+            for row in rows:
+                try:
+                    keys = json.loads(row["keys"] or "{}")
+                except (ValueError, TypeError):
+                    continue
+                _record_key_extractions(conn, row["user_id"], row["username"], keys, row["created_at"])
+            conn.execute("INSERT INTO settings (key, value) VALUES ('key_stats_backfilled_v1', '1')")
 
     # 确保有默认管理员（首次启动时创建）
     admin = conn.execute("SELECT id FROM users WHERE is_admin = 1").fetchone()
@@ -163,11 +190,14 @@ def list_users() -> list[dict]:
 
 
 def delete_user(user_id: int) -> bool:
-    """删除用户及其历史记录"""
+    """删除普通用户和历史；累计提取统计独立保留。"""
     conn = _get_db()
-    conn.execute("DELETE FROM task_history WHERE user_id = ?", (user_id,))
-    conn.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))
-    conn.commit()
+    with conn:
+        cur = conn.execute("DELETE FROM users WHERE id = ? AND is_admin = 0", (user_id,))
+        if not cur.rowcount:
+            return False
+        conn.execute("DELETE FROM task_history WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
     return True
 
 
@@ -187,24 +217,83 @@ def change_password(user_id: int, new_password: str) -> bool:
 
 
 # ── 历史记录 ─────────────────────────────────────────────────
-def save_result(user_id: int, result_dict: dict):
-    """保存单条任务结果到数据库"""
+def _record_key_extractions(conn, user_id, username, keys, extracted_at):
+    """按用户、产品、key 去重；失败任务中的部分有效结果也计入。"""
+    if not isinstance(keys, dict):
+        return
+    for product, key in keys.items():
+        if not isinstance(key, str) or not key.strip():
+            continue
+        fingerprint = hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
+        conn.execute(
+            """INSERT INTO key_extractions
+               (user_id, username, product, key_hash, extracted_at) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, product, key_hash) DO UPDATE SET
+                   extracted_at = MAX(key_extractions.extracted_at, excluded.extracted_at)""",
+            (user_id, username or f"用户 #{user_id}", product, fingerprint, extracted_at),
+        )
+
+
+def get_admin_stats() -> dict:
+    """累计提取数与当前历史数分开统计，已删除用户仍能追溯。"""
     conn = _get_db()
-    conn.execute(
-        """INSERT INTO task_history (user_id, email, password, totp_secret, success, keys, message, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            user_id,
-            result_dict.get("email", ""),
-            result_dict.get("password", ""),
-            result_dict.get("totp_secret", ""),
-            1 if result_dict.get("success") else 0,
-            json.dumps(result_dict.get("keys", {}), ensure_ascii=False),
-            result_dict.get("msg", ""),
-            result_dict.get("ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ),
-    )
-    conn.commit()
+    rows = conn.execute("""
+        WITH extracted AS (
+            SELECT user_id, MIN(username) AS username, COUNT(*) AS extracted_keys,
+                   MAX(extracted_at) AS last_extracted_at
+            FROM key_extractions GROUP BY user_id
+        ), history AS (
+            SELECT user_id, COUNT(*) AS history_count FROM task_history GROUP BY user_id
+        ), identities AS (
+            SELECT id AS user_id FROM users UNION SELECT user_id FROM extracted
+        )
+        SELECT i.user_id AS id, COALESCE(u.username, e.username) AS username,
+               COALESCE(u.is_admin, 0) AS is_admin, u.created_at, u.last_login,
+               u.id IS NULL AS deleted, COALESCE(e.extracted_keys, 0) AS extracted_keys,
+               COALESCE(h.history_count, 0) AS history_count, e.last_extracted_at
+        FROM identities i LEFT JOIN users u ON u.id = i.user_id
+        LEFT JOIN extracted e ON e.user_id = i.user_id
+        LEFT JOIN history h ON h.user_id = i.user_id
+        ORDER BY extracted_keys DESC, i.user_id
+    """).fetchall()
+    users = [dict(row) for row in rows]
+    products = [dict(row) for row in conn.execute("""
+        SELECT product, COUNT(*) AS extracted_keys FROM key_extractions
+        GROUP BY product ORDER BY extracted_keys DESC, product
+    """)]
+    return {
+        "users": users,
+        "products": products,
+        "summary": {
+            "active_users": sum(not user["deleted"] for user in users),
+            "users_with_keys": sum(user["extracted_keys"] > 0 for user in users),
+            "extracted_keys": sum(user["extracted_keys"] for user in users),
+        },
+    }
+
+
+def save_result(user_id: int, result_dict: dict):
+    """历史和累计统计原子写入，删除历史不影响累计统计。"""
+    conn = _get_db()
+    keys = result_dict.get("keys", {})
+    created_at = result_dict.get("ts", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    with conn:
+        user = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+        _record_key_extractions(conn, user_id, user["username"] if user else None, keys, created_at)
+        conn.execute(
+            """INSERT INTO task_history (user_id, email, password, totp_secret, success, keys, message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                result_dict.get("email", ""),
+                result_dict.get("password", ""),
+                result_dict.get("totp_secret", ""),
+                1 if result_dict.get("success") else 0,
+                json.dumps(keys, ensure_ascii=False),
+                result_dict.get("msg", ""),
+                created_at,
+            ),
+        )
 
 
 def get_history(user_id: int, limit: int = 500) -> list[dict]:
@@ -263,6 +352,22 @@ def login_required(f):
             if request.path.startswith("/api/") or request.path == "/stream":
                 return jsonify({"ok": False, "error": "未登录", "need_login": True}), 401
             return redirect(url_for("login_page"))
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_required(f):
+    """每次请求从数据库校验权限，不能依赖前端隐藏或会话中的角色。"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user_id" not in session:
+            if request.path in ("/admin", "/admin/"):
+                return redirect(url_for("login_page"))
+            return jsonify({"ok": False, "error": "未登录", "need_login": True}), 401
+        if not is_user_admin(session["user_id"]):
+            if request.path in ("/admin", "/admin/"):
+                abort(403)
+            return jsonify({"ok": False, "error": "仅管理员可访问后台"}), 403
         return f(*args, **kwargs)
     return decorated
 

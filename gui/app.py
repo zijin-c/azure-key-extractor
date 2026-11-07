@@ -30,10 +30,10 @@ from utils.process_manager import BrowserProcessManager, release_system_memory
 from utils.session_secret import load_session_secret
 from utils.totp_cache import totp_cache_scope, get_cached_totp, save_totp_cache
 from gui.auth import (
-    init_db, create_user, verify_user, login_required,
+    init_db, create_user, verify_user, login_required, admin_required,
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
     is_user_admin, list_users, delete_user, change_password,
-    save_user_setting, get_user_settings,
+    save_user_setting, get_user_settings, get_admin_stats,
 )
 
 if getattr(sys, 'frozen', False):
@@ -230,15 +230,12 @@ def auth_login():
 
 
 @app.route("/auth/register", methods=["POST"])
+@admin_required
 def auth_register():
     """只有管理员能注册新用户"""
     data = request.get_json(force=True)
     username = data.get("username", "").strip()
     password = data.get("password", "")
-
-    # 检查是否是管理员操作
-    if "user_id" not in session or not is_user_admin(session["user_id"]):
-        return jsonify({"ok": False, "msg": "仅管理员可创建新用户"})
 
     ok, msg = create_user(username, password)
     return jsonify({"ok": ok, "msg": msg})
@@ -260,19 +257,31 @@ def auth_me():
 
 
 # ── 管理员 API ────────────────────────────────────────────────
+@app.route("/admin")
+@app.route("/admin/")
+@admin_required
+def admin_page():
+    return render_template("admin.html", username=session.get("username", ""),
+                           current_user_id=session["user_id"])
+
+
+@app.route("/api/admin/stats")
+@admin_required
+def admin_stats():
+    response = jsonify({"ok": True, **get_admin_stats()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/admin/users")
-@login_required
+@admin_required
 def admin_list_users():
-    if not is_user_admin(session["user_id"]):
-        return jsonify({"ok": False, "error": "无权限"}), 403
     return jsonify({"ok": True, "users": list_users()})
 
 
 @app.route("/admin/users/create", methods=["POST"])
-@login_required
+@admin_required
 def admin_create_user():
-    if not is_user_admin(session["user_id"]):
-        return jsonify({"ok": False, "error": "无权限"}), 403
     data = request.get_json(force=True)
     username = data.get("username", "").strip()
     password = data.get("password", "")
@@ -282,20 +291,26 @@ def admin_create_user():
 
 
 @app.route("/admin/users/delete", methods=["POST"])
-@login_required
+@admin_required
 def admin_delete_user():
-    if not is_user_admin(session["user_id"]):
-        return jsonify({"ok": False, "error": "无权限"}), 403
     data = request.get_json(force=True)
     user_id = data.get("user_id")
     if user_id == session["user_id"]:
         return jsonify({"ok": False, "error": "不能删除自己"})
-    delete_user(user_id)
-    return jsonify({"ok": True})
+    ok = delete_user(user_id)
+    return jsonify({"ok": ok, "error": "" if ok else "用户不存在或不能删除管理员"})
+
+
+@app.route("/auth/password", methods=["POST"])
+@login_required
+def auth_change_password():
+    data = request.get_json(force=True)
+    ok = change_password(session["user_id"], data.get("password", ""))
+    return jsonify({"ok": ok, "msg": "密码已修改" if ok else "密码至少4位"})
 
 
 @app.route("/admin/users/password", methods=["POST"])
-@login_required
+@admin_required
 def admin_change_password():
     data = request.get_json(force=True)
     is_self = data.get("self", False)
@@ -306,9 +321,6 @@ def admin_change_password():
         ok = change_password(session["user_id"], new_password)
         return jsonify({"ok": ok, "msg": "密码已修改" if ok else "密码至少4位"})
 
-    # 管理员改别人密码
-    if not is_user_admin(session["user_id"]):
-        return jsonify({"ok": False, "error": "无权限"}), 403
     user_id = data.get("user_id")
     ok = change_password(user_id, new_password)
     return jsonify({"ok": ok, "msg": "密码已修改" if ok else "密码至少4位"})
@@ -372,6 +384,7 @@ def api_save_settings():
 def index():
     return render_template("index.html", sid=session.get("sid", ""),
                            username=session.get("username", ""),
+                           is_admin=is_user_admin(session["user_id"]),
                            products=PRODUCT_COLUMNS, product_short=PRODUCT_SHORT)
 
 

@@ -1,5 +1,28 @@
 # Azure Key 提取工具 — VPS 部署指南
 
+## 从 GitHub 全新一键部署
+
+使用 Ubuntu 22.04/24.04 或 Debian 12+，以 root 登录全新服务器后执行（目标目录需尚不存在）：
+
+```bash
+apt-get update && apt-get install -y git curl ca-certificates && git clone --depth 1 --branch main https://github.com/zijin-c/azure-key-extractor.git /opt/azure-key-extractor && cd /opt/azure-key-extractor && bash install.sh
+```
+
+脚本自动安装 Python 依赖、Chromium 和浏览器系统依赖，并启动 `azure-key` Systemd 服务、设置开机自启。浏览器系统依赖使用 [Playwright 官方安装命令](https://playwright.dev/python/docs/browsers#install-system-dependencies) 按发行版选择包名。
+
+完成后访问 `http://服务器IP:5010`，初始管理员为 `admin / admin123`；登录后修改密码。管理后台为 `/admin`。服务器安全组或防火墙需要允许 TCP 5010。查看日志：`journalctl -u azure-key -f`。
+
+全新部署会创建独立数据库，不会自动搬迁旧服务器的账号或累计统计。
+
+## 管理后台与累计统计
+
+- 管理员登录后，点击首页顶部「管理后台」，或访问 `/admin`。页面及所有后台接口均在服务端检查管理员权限；普通用户访问返回 403，未登录访问页面跳转登录。
+- 后台显示每个用户的累计 Key 数、现存历史条数、最近提取时间及最后登录时间，支持搜索、创建用户、重置密码和删除普通用户，并显示各产品累计数量。
+- 统计按「用户 + 产品 + Key」去重，空 Key 不计数，部分成功任务中已取得的 Key 也计入。重复提取不会增加数量，删除/清空历史不会减少数量，服务重启后仍保留；删除用户后保留该用户的累计统计，重新创建同名用户会作为新用户统计。
+- 首次更新启动时自动从全部现存历史补录，之后的新结果与统计在同一个数据库事务内保存。**更新前已删除的历史无法补录。** 无需手动执行迁移。
+- 累计统计位于 `data/users.db` 的独立 `key_extractions` 表，仅保存用户名、产品、Key 的 SHA-256 指纹和提取时间，不保存 Key 明文。更新和备份时请保留整个数据库。
+- 普通用户仍可在「个人设置」修改自己的密码，使用 `/auth/password` 接口。
+
 ## 网页用户隔离
 
 - 任务接口从已登录用户派生 `sid`；传入其他用户的 `sid` 返回 403。结果、状态、日志及导出仅读取当前用户的数据，服务重启后的队列结果也验证归属。

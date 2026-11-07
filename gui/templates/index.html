@@ -272,6 +272,9 @@ tr:hover td{background:rgba(108,140,255,.04)}
     <p>自动登录 Azure for Students → 提取 {{ products|length }} 个产品 License Key → Excel 导出</p>
   </div>
   <div class="topbar-right">
+    {% if is_admin %}
+    <a href="{{ url_for('admin_page') }}" style="font-size:.8rem;color:var(--accent);text-decoration:none;white-space:nowrap">管理后台</a>
+    {% endif %}
     <span id="mode-badge" class="idle">就绪</span>
     <span style="font-size:.8rem;color:var(--muted);padding:5px 10px;border:1px solid var(--border);border-radius:8px">👤 {{ username }}</span>
     <button onclick="openUserPanel()" title="个人设置" style="width:36px;height:36px;border:1px solid var(--border);background:var(--surface);border-radius:10px;font-size:1rem;cursor:pointer;color:var(--text);transition:all .2s">⚙️</button>
@@ -476,18 +479,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
       <button onclick="changeMyPassword()" style="padding:8px 16px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:.85rem;cursor:pointer">确认修改</button>
     </div>
 
-    <!-- 管理员面板（仅管理员可见） -->
-    <div id="admin-section" style="display:none">
-      <div style="padding:16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px">
-        <h4 style="font-size:.85rem;color:var(--accent);margin-bottom:12px">👥 用户管理（管理员）</h4>
-        <div id="user-list" style="margin-bottom:12px"></div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <input type="text" id="new-username" placeholder="新用户名" style="flex:1;min-width:100px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
-          <input type="password" id="new-user-pwd" placeholder="密码" style="flex:1;min-width:100px;padding:8px 12px;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:.85rem">
-          <button onclick="adminCreateUser()" style="padding:8px 14px;background:var(--green);color:#fff;border:none;border-radius:6px;font-size:.85rem;cursor:pointer;white-space:nowrap">+ 创建用户</button>
-        </div>
-      </div>
-    </div>
+
   </div>
 </div>
 
@@ -1306,26 +1298,8 @@ async function doLogout(){
 }
 
 // ── 用户/管理面板 ─────────────────────────────────────────
-let _isAdmin=false;
-(async function checkAdmin(){
-  try{
-    const r=await fetch('/auth/me');
-    const j=await r.json();
-    if(j.ok && j.is_admin) _isAdmin=true;
-  }catch(e){}
-})();
-
 function openUserPanel(){
-  const overlay=document.getElementById('user-panel-overlay');
-  overlay.style.display='flex';
-  if(_isAdmin){
-    document.getElementById('admin-section').style.display='block';
-    document.getElementById('panel-title').textContent='管理面板';
-    loadUserList();
-  }else{
-    document.getElementById('admin-section').style.display='none';
-    document.getElementById('panel-title').textContent='个人设置';
-  }
+  document.getElementById('user-panel-overlay').style.display='flex';
 }
 function closeUserPanel(){
   document.getElementById('user-panel-overlay').style.display='none';
@@ -1335,59 +1309,13 @@ async function changeMyPassword(){
   const pwd=document.getElementById('new-pwd').value;
   if(!pwd||pwd.length<4){showToast('密码至少4位','err');return;}
   try{
-    const r=await fetch('/admin/users/password',{method:'POST',
+    const r=await fetch('/auth/password',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({user_id:null,password:pwd,self:true})});
     const j=await r.json();
     showToast(j.msg||'已修改',j.ok?'ok':'err');
     if(j.ok)document.getElementById('new-pwd').value='';
   }catch(e){showToast('修改失败: '+e,'err');}
-}
-
-async function loadUserList(){
-  try{
-    const r=await fetch('/admin/users');
-    const j=await r.json();
-    if(!j.ok)return;
-    const div=document.getElementById('user-list');
-    div.innerHTML=j.users.map(u=>`
-      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-size:.82rem">
-        <span style="flex:1;font-weight:${u.is_admin?'700':'400'}">${u.is_admin?'👑 ':''}${u.username}</span>
-        <span style="color:var(--muted);font-size:.7rem">${u.last_login?u.last_login.substring(0,16):'从未登录'}</span>
-        ${!u.is_admin?`<button onclick="adminDeleteUser(${u.id},'${u.username}')" style="padding:3px 8px;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.25);border-radius:4px;color:var(--red);font-size:.7rem;cursor:pointer">删除</button>`:''}
-      </div>
-    `).join('');
-  }catch(e){}
-}
-
-async function adminCreateUser(){
-  const username=document.getElementById('new-username').value.trim();
-  const password=document.getElementById('new-user-pwd').value;
-  if(!username||!password){showToast('请填写用户名和密码','err');return;}
-  try{
-    const r=await fetch('/admin/users/create',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({username,password})});
-    const j=await r.json();
-    showToast(j.msg,j.ok?'ok':'err');
-    if(j.ok){
-      document.getElementById('new-username').value='';
-      document.getElementById('new-user-pwd').value='';
-      loadUserList();
-    }
-  }catch(e){showToast('创建失败: '+e,'err');}
-}
-
-async function adminDeleteUser(id,name){
-  if(!confirm(`确认删除用户 "${name}"？其所有历史记录也会被删除。`))return;
-  try{
-    const r=await fetch('/admin/users/delete',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({user_id:id})});
-    const j=await r.json();
-    showToast(j.ok?'已删除':j.error,j.ok?'ok':'err');
-    if(j.ok)loadUserList();
-  }catch(e){showToast('删除失败: '+e,'err');}
 }
 
 // 全局 401 拦截（session 过期时自动跳转登录）

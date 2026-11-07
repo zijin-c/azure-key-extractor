@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Azure Key Extractor - Linux VPS 全自动安装与 Systemd 守护进程配置脚本
-# 支持系统: Ubuntu 20.04+ / 22.04+ / 24.04 / Debian 11+ / 12 / CentOS 8+
+# 推荐系统: Ubuntu 22.04 / 24.04、Debian 12+（Python 3.10+、Systemd）
 # ==============================================================================
 
 set -e
@@ -65,11 +65,8 @@ echo -e "\n${GREEN}[1/5] 更新系统源并安装底层系统库与 Python 环�
 if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update -y
     $SUDO apt-get install -y \
-        python3 python3-pip python3-venv curl wget procps lsof xvfb \
-        libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
-        libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
-        libgbm1 libpango-1.0-0 libcairo2 libasound2 libatspi2.0-0 \
-        libwayland-client0 fonts-liberation fonts-noto-color-emoji
+        python3 python3-pip python3-venv git curl ca-certificates wget procps lsof xvfb \
+        fonts-liberation fonts-noto-color-emoji
 elif command -v dnf >/dev/null 2>&1; then
     $SUDO dnf update -y
     $SUDO dnf install -y python3 python3-pip python3-virtualenv curl wget procps-ng lsof xorg-x11-server-Xvfb
@@ -80,6 +77,10 @@ fi
 
 # 2. 创建独立虚拟环境
 echo -e "\n${GREEN}[2/5] 创建独立虚拟环境 (venv)...${NC}"
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+    echo -e "${RED}[错误] 需要 Python 3.10+，请使用 Ubuntu 22.04/24.04 或 Debian 12+${NC}"
+    exit 1
+fi
 if [ ! -d "venv" ]; then
     python3 -m venv venv
     echo -e "虚拟环境 venv 初始化完成"
@@ -95,7 +96,8 @@ export PLAYWRIGHT_BROWSERS_PATH="$SCRIPT_DIR/ms-playwright"
 mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
 
 if command -v apt-get >/dev/null 2>&1; then
-    python -m playwright install-deps chromium || true
+    # 由 Playwright 选择当前发行版的包名，兼容 Ubuntu 24.04 的 t64 系统库。
+    python -m playwright install-deps chromium
 fi
 
 echo -e "${CYAN}[提示] 正在全自动下载 Playwright Chromium 独立浏览器...${NC}"
