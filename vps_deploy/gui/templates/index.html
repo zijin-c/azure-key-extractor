@@ -429,12 +429,12 @@ tr:hover td{background:rgba(108,140,255,.04)}
   <div class="card" style="margin-top:18px">
     <div class="card-title">提取结果（含密码 / TOTP / Key）</div>
     <div class="tbl-actions">
-      <button class="btn-action green" onclick="exportExcel('all')">📥 导出全部历史</button>
-      <button class="btn-action green" onclick="exportExcel('success')">✅ 导出历史成功</button>
-      <button class="btn-action warn" onclick="exportExcel('failed')">❌ 导出历史失败</button>
+      <button class="btn-action green" onclick="exportExcel('all',this)">📥 导出全部历史</button>
+      <button class="btn-action green" onclick="exportExcel('success',this)">✅ 导出历史成功</button>
+      <button class="btn-action warn" onclick="exportExcel('failed',this)">❌ 导出历史失败</button>
       <div class="export-sep"></div>
-      <button class="btn-action accent" onclick="exportExcel('current-success')">🌟 导出本次成功</button>
-      <button class="btn-action accent" onclick="exportExcel('current-failed')">⛔ 导出本次失败</button>
+      <button class="btn-action accent" onclick="exportExcel('current-success',this)">🌟 导出本次成功</button>
+      <button class="btn-action accent" onclick="exportExcel('current-failed',this)">⛔ 导出本次失败</button>
       <div class="export-sep"></div>
       <button class="btn-action accent" id="btn-export-sel" onclick="exportSelected()" style="display:none">📤 导出选中</button>
       <button class="btn-action red" id="btn-del-sel" onclick="deleteSelected()" style="display:none">🗑 删除选中</button>
@@ -491,8 +491,9 @@ const SID  = _TPL.sid;
 const PRODUCTS      = _TPL.products;
 const PRODUCT_SHORT = _TPL.productShort;
 let evtSource=null, isRunning=false;
+let _startRequestActive=false;
 let userPolicy=_TPL.policy;
-window.addEventListener('session-invalidated',()=>{if(evtSource)evtSource.close();});
+window.addEventListener('session-invalidated',()=>{if(evtSource)evtSource.close();_draft.clear();++_resultsGeneration;});
 
 const LS={ACC:'azkey_accounts',PROXY:'azkey_proxy',
   HEADLESS:'azkey_headless',HISTORY:'azkey_history',CURRENT:'azkey_current',
@@ -642,7 +643,7 @@ function appendLog(ts,msg){
       updateProgress(_doneAccounts+1, _totalAccounts);
     }
     // 立即拉取最新结果增量更新
-    fetchAndAppendResults();
+    syncCurrentResults();
   }
 
   if(msg.includes('🏁 任务结束'))onTaskDone();
@@ -913,6 +914,7 @@ function toggleAutoCheck(){
 
 // ── 启动/停止 ─────────────────────────────────────────────
 async function startTask(){
+  if(_startRequestActive)return;
   const accounts=document.getElementById('accounts').value.trim();
   const headless=document.getElementById('headless-toggle').checked;
   const proxy=document.getElementById('proxy-input').value.trim();
@@ -969,23 +971,27 @@ async function startTask(){
     const parts=sep?line.split(sep):line.split(/\s+/);
     if(parts.length>=2)amap[parts[0].trim()]=line;
   });
-  lsSetJ(LS.AMAP,amap);
-  lsSetJ(LS.CURRENT,[]);  // 清空本次结果
-  _lastResultCount=0;      // 重置增量计数器
-  _progressOk=0; _progressFail=0;
-  _taskStartTime=Date.now();
-  if(_elapsedTimer)clearInterval(_elapsedTimer);
-  _elapsedTimer=setInterval(updateElapsed,1000);
-  clearLog();resetProductDots();
   const mode=document.querySelector('input[name="run-mode"]:checked')?.value || "azure_student";
-  const r=await fetch('/api/start',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
-
-  const j=await r.json();
-  if(!j.ok){if(j.policy)applyPolicy(j.policy);showToast('启动失败: '+j.error,'err');return;}
-  setRunning(true);connectSSE();
-  showToast(`任务已启动（${j.count} 个账号，${concurrency} 并发）`,'ok');
+  _startRequestActive=true;
+  ++_resultsGeneration; // 丢弃上一轮尚未返回的结果和完成通知。
+  const startButton=document.getElementById('btn-start');startButton.disabled=true;
+  try{
+    const r=await fetch('/api/start',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
+    const j=await r.json();
+    if(!j.ok){if(j.policy)applyPolicy(j.policy);showToast('启动失败: '+j.error,'err');return;}
+    // 服务端确认新任务已建立后才清空，启动失败时保留上一轮可导出的结果。
+    lsSetJ(LS.AMAP,amap);lsSetJ(LS.CURRENT,[]);
+    _taskDonePromise=null;
+    _progressOk=0;_progressFail=0;_taskStartTime=Date.now();
+    if(_elapsedTimer)clearInterval(_elapsedTimer);
+    _elapsedTimer=setInterval(updateElapsed,1000);
+    clearLog();resetProductDots();
+    setRunning(true);connectSSE();
+    showToast(`任务已启动（${j.count} 个账号，${concurrency} 并发）`,'ok');
+  }catch(e){showToast('启动失败: '+e.message,'err');}
+  finally{_startRequestActive=false;startButton.disabled=isRunning;}
 }
 
 async function stopTask(){
@@ -1013,7 +1019,7 @@ function setRunning(v){
   }
   // 运行时启动定时拉取结果
   if(v){
-    if(!_resultPollTimer) _resultPollTimer=setInterval(fetchAndAppendResults, 5000);
+    if(!_resultPollTimer) _resultPollTimer=setInterval(syncCurrentResults, 5000);
   }else{
     if(_resultPollTimer){clearInterval(_resultPollTimer);_resultPollTimer=null;}
   }
@@ -1029,50 +1035,50 @@ function resetProductDots(){
 }
 
 // ── 任务结束 ─────────────────────────────────────────────
-// 增量拉取结果（运行中实时更新历史表）
-let _fetchInFlight=false;
-let _lastResultCount=0;  // 上次拉取到的结果数量
+// /api/results 返回完整快照，不能把重新拉取的整批结果再次追加。
+let _resultsFetch=null, _resultsGeneration=0, _taskDonePromise=null;
+async function syncCurrentResults(){
+  const generation=_resultsGeneration;
+  if(_startRequestActive)return lsGetJ(LS.CURRENT,[]);
+  if(_resultsFetch?.generation===generation)return _resultsFetch.promise;
+  const pending={generation,promise:null};
+  pending.promise=(async()=>{
+    try{
+      const response=await fetch('/api/results?sid='+SID);
+      if(!response.ok)throw new Error('获取结果失败');
+      const rows=await response.json();
+      if(generation!==_resultsGeneration || !Array.isArray(rows))return lsGetJ(LS.CURRENT,[]);
+      // 自动重启后内存结果可能为空，保留上次成功同步的最终结果。
+      if(!rows.length)return lsGetJ(LS.CURRENT,[]);
+      const previous=lsGetJ(LS.CURRENT,[]);
+      const current=rows.map(r=>({ts:r.ts||r.created_at||'',email:r.email,password:r.password||'',
+        totp:r.totp_secret||r.totp||'',success:r.success,keys:r.keys||{},msg:r.msg||''}));
+      lsSetJ(LS.CURRENT,current);
+      resetProductDots();
+      const lastOk=current.filter(r=>r.success).pop();
+      if(lastOk){
+        PRODUCTS.forEach((p,i)=>{
+          const key=lastOk.keys[p];
+          if(key){document.getElementById('dot-'+i).className='product-dot got';document.getElementById('key-'+i).textContent=key;document.getElementById('prod-'+i).classList.add('got');}
+        });
+      }
+      await loadServerHistory();
+      if(generation!==_resultsGeneration)return lsGetJ(LS.CURRENT,[]);
+      const added=Math.max(0,current.length-previous.length);
+      if(added)showToast(`新增 ${added} 条结果`,'ok',2000);
+      return current;
+    }catch(e){console.warn('结果同步暂时失败，保留已同步数据:',e);return lsGetJ(LS.CURRENT,[]);}
+    finally{if(_resultsFetch===pending)_resultsFetch=null;}
+  })();
+  _resultsFetch=pending;
+  return pending.promise;
+}
 
-async function fetchAndAppendResults(){
-  if(_fetchInFlight)return;
-  _fetchInFlight=true;
-  try{
-    const rows=await fetch('/api/results?sid='+SID).then(r=>r.json()).catch(()=>[]);
-    if(!rows.length || rows.length <= _lastResultCount) return;
-
-    // 有新结果
-    const newRows = rows.slice(_lastResultCount);
-    _lastResultCount = rows.length;
-
-    let current=lsGetJ(LS.CURRENT,[]);
-    const ts=new Date().toLocaleString('zh-CN');
-
-    newRows.forEach(r=>{
-      const entry={ts,email:r.email,password:r.password||'',totp:r.totp_secret||'',
-        success:r.success,keys:r.keys||{},msg:r.msg||''};
-      current.push(entry);
-    });
-
-    lsSetJ(LS.CURRENT,current);
-
-    // 更新产品 dot（显示最新成功账号的 key）
-    const lastOk=newRows.filter(r=>r.success).pop();
-    if(lastOk&&lastOk.keys){
-      PRODUCTS.forEach((p,i)=>{
-        const k=lastOk.keys[p]||'';
-        const dot=document.getElementById('dot-'+i);
-        const keyEl=document.getElementById('key-'+i);
-        const item=document.getElementById('prod-'+i);
-        if(k){dot.className='product-dot got';keyEl.textContent=k;item.classList.add('got');}
-      });
-    }
-
-    // 从服务端重新加载历史
-    await loadServerHistory();
-    showToast(`新增 ${newRows.length} 条结果`,'ok',2000);
-  }finally{
-    _fetchInFlight=false;
-  }
+async function refreshCurrentResults(){
+  const generation=_resultsGeneration;
+  if(_resultsFetch?.generation===generation)await _resultsFetch.promise;
+  if(generation!==_resultsGeneration)return lsGetJ(LS.CURRENT,[]);
+  return syncCurrentResults();
 }
 
 // ── 服务端历史加载 ─────────────────────────────────────────
@@ -1088,25 +1094,26 @@ async function loadServerHistory(){
   renderHistory();
 }
 
-async function onTaskDone(){
-  setRunning(false);
-  // 等一下确保后端最后一个结果已写入
-  await new Promise(r => setTimeout(r, 2000));
-  // 强制重置锁，确保能拉取
-  _fetchInFlight = false;
-  _lastResultCount = 0;  // 重置计数，重新拉取全部结果
-  await fetchAndAppendResults();
-
-  const rows=await fetch('/api/results?sid='+SID).then(r=>r.json()).catch(()=>[]);
-  if(!rows.length)return;
-  // 清空 progress
-  if(_totalAccounts>0)updateProgress(_totalAccounts,_totalAccounts);
-  setTimeout(()=>{document.getElementById('progress-wrap').style.display='none';},3000);
-
-  const ok=rows.filter(r=>r.success).length;
-  showToast(`任务完成: ${ok} 成功 / ${rows.length-ok} 失败`,ok===rows.length?'ok':'info',5000);
-  document.getElementById('mode-badge').className='done';
-  document.getElementById('mode-badge').textContent='已完成';
+function onTaskDone(){
+  const generation=_resultsGeneration;
+  if(_startRequestActive)return Promise.resolve();
+  if(_taskDonePromise?.generation===generation)return _taskDonePromise.promise;
+  const pending={generation,promise:null};
+  pending.promise=(async()=>{
+    try{
+      setRunning(false);
+      const rows=await refreshCurrentResults();
+      if(generation!==_resultsGeneration || !rows.length)return;
+      if(_totalAccounts>0)updateProgress(_totalAccounts,_totalAccounts);
+      document.getElementById('progress-section').style.display='none';
+      const ok=rows.filter(r=>r.success).length;
+      showToast(`任务完成: ${ok} 成功 / ${rows.length-ok} 失败`,ok===rows.length?'ok':'info',5000);
+      document.getElementById('mode-badge').className='done';
+      document.getElementById('mode-badge').textContent='已完成';
+    }finally{if(_taskDonePromise===pending)_taskDonePromise=null;}
+  })();
+  _taskDonePromise=pending;
+  return pending.promise;
 }
 
 function renderHistory(){
@@ -1155,11 +1162,11 @@ function renderHistory(){
   });
 }
 
-async function exportExcel(filter){
-  const ev=event;const btn=ev.target;
+async function exportExcel(filter,btn){
   const orig=btn.textContent;
   btn.disabled=true;btn.textContent='导出中...';
   try{
+    if(filter.startsWith('current-'))await refreshCurrentResults();
     const history=_serverHistory;
     const current=lsGetJ(LS.CURRENT,[]);
     const dataMap={
@@ -1306,7 +1313,7 @@ function _doExportRows(rows, label){
 loadTheme();
 loadForm();
 loadServerHistory();  // 从服务端加载历史
-fetchAndAppendResults(); // 当前结果从服务端恢复，浏览器不保留账号凭据或 Key。
+syncCurrentResults(); // 当前结果从服务端恢复，浏览器不保留账号凭据或 Key。
 connectSSE();
 syncStatus();  // 立即同步状态，避免 3 秒延迟
 
