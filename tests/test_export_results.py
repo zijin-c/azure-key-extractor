@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.sync_api import sync_playwright
 
@@ -31,6 +31,10 @@ class ExportResultsTests(DatabaseTestCase):
         ]
         self.history = [{"id": index, **row} for index, row in enumerate(self.rows, 1)]
         self.start_response = {"ok": True, "count": 1}
+        self.policy = {"require_proxy": False, "max_concurrency": 20}
+        self.start_requests = []
+        self.history_requests = []
+        self.history_error = False
         self.result_requests = 0
         self.html = self.client(self.alice).get("/").get_data(as_text=True)
         self.pw = sync_playwright().start()
@@ -59,8 +63,25 @@ class ExportResultsTests(DatabaseTestCase):
             return route.abort()
         if url.path == "/api/results":
             self.result_requests += 1
-        data = {"/api/results": self.rows, "/api/history": {"ok": True, "rows": self.history},
-                "/api/settings": {"ok": True, "settings": {}, "policy": {"require_proxy": False, "max_concurrency": 20}},
+        if url.path == "/api/history":
+            if self.history_error:
+                return route.fulfill(status=503, body=json.dumps({"ok": False, "error": "synthetic unavailable"}), content_type="application/json")
+            query = parse_qs(url.query)
+            self.history_requests.append(query)
+            rows = self.history
+            filter_type = query.get('filter', ['all'])[0]
+            if filter_type in ('success', 'failed'):
+                rows = [row for row in rows if row['success'] == (filter_type == 'success')]
+            if query.get('all', ['0'])[0] != '1':
+                rows = rows[:500]
+            return route.fulfill(body=json.dumps({"ok": True, "rows": rows}), content_type="application/json")
+        if url.path == "/api/history/clear":
+            self.history = []
+        if url.path == "/api/start":
+            self.start_requests.append(route.request.post_data_json)
+        data = {"/api/results": self.rows,
+                "/api/settings": {"ok": True, "settings": {}, "policy": self.policy},
+                "/api/policy": {"ok": True, "policy": self.policy},
                 "/api/status": {"running": False, "results": len(self.rows)},
                 "/api/start": self.start_response}.get(url.path, {"ok": True})
         return route.fulfill(body=json.dumps(data), content_type="application/json")
@@ -80,8 +101,8 @@ class ExportResultsTests(DatabaseTestCase):
     def test_completion_does_not_append_the_whole_batch_twice(self):
         self.page.evaluate("onTaskDone()")
         self.assertEqual(len(self.current()), 2)
-        success = self.export("🌟 导出本次成功")
-        failure = self.export("⛔ 导出本次失败")
+        success = self.export("导出成功")
+        failure = self.export("导出失败")
         self.assertEqual(len(success["sheets"][0]["rows"]), 1)
         self.assertEqual(len(failure["sheets"][0]["rows"]), 1)
         self.assertEqual(success["sheets"][0]["rows"][0]["时间"], self.rows[0]["ts"])
@@ -93,7 +114,7 @@ class ExportResultsTests(DatabaseTestCase):
         self.page.evaluate("Promise.all([onTaskDone(),onTaskDone(),onTaskDone()])")
         self.page.evaluate("onTaskDone()")
         self.assertEqual(len(self.current()), 2)
-        book = self.export("🌟 导出本次成功")
+        book = self.export("导出成功")
         summary = dict(row for row in book["sheets"][1]["rows"] if len(row) == 2)
         self.assertEqual(summary["总账号数"], 1)
         self.assertEqual(summary["成功账号数"], 1)
@@ -117,6 +138,7 @@ class ExportResultsTests(DatabaseTestCase):
 
     def test_completion_waits_for_pending_poll_then_fetches_final_snapshot(self):
         final = self.rows + [{**self.rows[0], "email": "third@example.invalid", "ts": "2026-11-09 10:10:03"}]
+        self.history = [{"id": index, **row} for index, row in enumerate(final, 1)]
         observed = self.page.evaluate("""async ({previous,final})=>{
           const original=window.fetch;let calls=0,release;
           window.fetch=(url,options)=>{
@@ -132,7 +154,7 @@ class ExportResultsTests(DatabaseTestCase):
         }""", {"previous": self.rows, "final": final})
         self.assertEqual(observed["calls"], 2)
         self.assertEqual([row["email"] for row in observed["rows"]], [row["email"] for row in final])
-        self.assertEqual(len(self.export("🌟 导出本次成功")["sheets"][0]["rows"]), 2)
+        self.assertEqual(len(self.export("导出成功")["sheets"][0]["rows"]), 2)
 
     def test_old_response_cannot_restore_previous_batch_after_new_start(self):
         previous = self.rows
@@ -160,7 +182,7 @@ class ExportResultsTests(DatabaseTestCase):
         self.page.locator('#accounts').fill('new@example.invalid synthetic-password')
         self.page.evaluate("startTask()")
         self.assertEqual(len(self.current()), 2)
-        self.assertEqual(len(self.export("🌟 导出本次成功")["sheets"][0]["rows"]), 1)
+        self.assertEqual(len(self.export("导出成功")["sheets"][0]["rows"]), 1)
 
     def test_empty_or_failed_response_after_restart_retains_final_snapshot(self):
         self.rows = []
@@ -172,14 +194,14 @@ class ExportResultsTests(DatabaseTestCase):
           await syncCurrentResults();await onTaskDone();
         }""")
         self.assertEqual(len(self.current()), 2)
-        self.assertEqual(len(self.export("⛔ 导出本次失败")["sheets"][0]["rows"]), 1)
+        self.assertEqual(len(self.export("导出失败")["sheets"][0]["rows"]), 1)
 
     def test_legitimate_separate_history_attempts_are_preserved(self):
         self.history.append({**self.history[0], "id": 3, "ts": "2026-11-10 12:00:00"})
         self.page.evaluate("loadServerHistory()")
-        book = self.export("📥 导出全部历史")
+        book = self.export("导出成功")
         rows = book["sheets"][0]["rows"]
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 2)
         repeated = [row for row in rows if row["账号 (EDU 邮箱)"] == "first@example.invalid"]
         self.assertEqual({row["时间"] for row in repeated}, {"2026-11-09 10:00:01", "2026-11-10 12:00:00"})
 
@@ -194,3 +216,73 @@ class ExportResultsTests(DatabaseTestCase):
           release();await pending;return lsGetJ(LS.CURRENT,[]);
         }""", self.rows)
         self.assertEqual(current, [])
+
+    def test_only_three_actions_and_no_selection_controls(self):
+        self.assertEqual(self.page.locator('.tbl-actions button').all_text_contents(), ['导出成功', '导出失败', '🗑 清除历史'])
+        self.assertEqual(self.page.locator('#results-section input[type=checkbox]').count(), 0)
+
+    def test_concurrency_is_corrected_after_editing_without_blocking_empty_input(self):
+        self.policy['max_concurrency'] = 4
+        self.page.evaluate('policy=>applyPolicy(policy)', self.policy)
+        field = self.page.locator('#concurrency-input')
+        for typed, expected in [('10','4'), ('0','1'), ('-2','1'), ('2.8','2'), ('','1')]:
+            field.fill(typed)
+            self.assertEqual(field.input_value(), typed)
+            field.blur()
+            self.assertEqual(field.input_value(), expected)
+
+    def test_start_uses_latest_policy_instead_of_stale_page_limit(self):
+        self.policy['max_concurrency'] = 4
+        self.page.locator('#accounts').fill('new@example.invalid synthetic-password')
+        self.page.locator('#concurrency-input').fill('10')
+        self.page.evaluate('startTask()')
+        self.assertEqual(self.start_requests[-1]['concurrency'], 4)
+        self.assertEqual(self.page.locator('#concurrency-input').input_value(), '4')
+        self.assertIn('4 并发', self.page.locator('#toast-container').inner_text())
+
+    def test_start_displays_server_effective_concurrency_if_limit_changes_again(self):
+        self.policy['max_concurrency'] = 4
+        self.start_response = {'ok': True, 'count': 1, 'concurrency': 2, 'policy': {'require_proxy': False, 'max_concurrency': 2}}
+        self.page.locator('#accounts').fill('new@example.invalid synthetic-password')
+        self.page.locator('#concurrency-input').fill('10')
+        self.page.evaluate('startTask()')
+        self.assertEqual(self.start_requests[-1]['concurrency'], 4)
+        self.assertEqual(self.page.locator('#concurrency-input').input_value(), '2')
+        self.assertIn('2 并发', self.page.locator('#toast-container').inner_text())
+
+    def test_start_reads_latest_proxy_requirement_too(self):
+        self.policy['require_proxy'] = True
+        self.page.locator('#accounts').fill('new@example.invalid synthetic-password')
+        self.page.evaluate('startTask()')
+        self.assertEqual(self.start_requests, [])
+        self.assertIn('必须填写代理池', self.page.locator('#toast-container').inner_text())
+
+    def test_success_and_failure_exports_include_all_saved_batches_beyond_500(self):
+        self.history = [
+            {'id': index+1, **self.rows[0], 'email': f'success-{index}@example.invalid'} for index in range(620)
+        ] + [
+            {'id': index+621, **self.rows[1], 'email': f'failed-{index}@example.invalid'} for index in range(510)
+        ]
+        self.page.evaluate('loadServerHistory()')
+        self.assertEqual(self.page.locator('#results-body tr').count(), 500)
+        success = self.export('导出成功')['sheets'][0]['rows']
+        failed = self.export('导出失败')['sheets'][0]['rows']
+        self.assertEqual(len(success), 620)
+        self.assertEqual(len(failed), 510)
+        self.assertEqual(len({row['账号 (EDU 邮箱)'] for row in success}), 620)
+        self.assertEqual(self.history_requests[-2:], [{'all': ['1'], 'filter': ['success']}, {'all': ['1'], 'filter': ['failed']}])
+
+    def test_export_does_not_fall_back_to_cached_rows_on_history_fetch_failure(self):
+        self.history_error = True
+        self.page.get_by_role('button', name='导出成功', exact=True).click()
+        self.page.wait_for_function("document.getElementById('toast-container').textContent.includes('synthetic unavailable')")
+        self.assertEqual(self.page.evaluate('window.__exports.length'), 0)
+
+    def test_cleared_history_does_not_export_from_current_task_cache(self):
+        self.page.on('dialog', lambda dialog: dialog.accept())
+        self.page.get_by_role('button', name='🗑 清除历史', exact=True).click()
+        self.page.wait_for_function('_serverHistory.length===0')
+        self.page.evaluate('syncCurrentResults()')
+        self.assertEqual(len(self.current()), 2)
+        self.page.evaluate("exportExcel('success',document.querySelector('.tbl-actions button'))")
+        self.assertEqual(self.page.evaluate('window.__exports.length'), 0)

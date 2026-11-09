@@ -239,7 +239,6 @@ tr:hover td{background:rgba(108,140,255,.04)}
 .btn-action.accent:hover{background:rgba(108,140,255,.22)}
 .btn-action.red{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.25);color:var(--red)}
 .btn-action.red:hover{background:rgba(248,113,113,.22)}
-.export-sep{width:1px;height:18px;background:var(--border);flex-shrink:0;margin:0 4px}
 
 /* ── Toast ── */
 #toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;
@@ -429,22 +428,15 @@ tr:hover td{background:rgba(108,140,255,.04)}
   <div class="card" style="margin-top:18px">
     <div class="card-title">提取结果（含密码 / TOTP / Key）</div>
     <div class="tbl-actions">
-      <button class="btn-action green" onclick="exportExcel('all',this)">📥 导出全部历史</button>
-      <button class="btn-action green" onclick="exportExcel('success',this)">✅ 导出历史成功</button>
-      <button class="btn-action warn" onclick="exportExcel('failed',this)">❌ 导出历史失败</button>
-      <div class="export-sep"></div>
-      <button class="btn-action accent" onclick="exportExcel('current-success',this)">🌟 导出本次成功</button>
-      <button class="btn-action accent" onclick="exportExcel('current-failed',this)">⛔ 导出本次失败</button>
-      <div class="export-sep"></div>
-      <button class="btn-action accent" id="btn-export-sel" onclick="exportSelected()" style="display:none">📤 导出选中</button>
-      <button class="btn-action red" id="btn-del-sel" onclick="deleteSelected()" style="display:none">🗑 删除选中</button>
+      <button class="btn-action accent" onclick="exportExcel('success',this)">导出成功</button>
+      <button class="btn-action accent" onclick="exportExcel('failed',this)">导出失败</button>
       <button class="btn-action red" onclick="clearHistory()">🗑 清除历史</button>
     </div>
+    <p style="font-size:.72rem;color:var(--muted);margin:8px 0 12px">列表最多显示最近 500 条；导出包含当前用户全部已保存的成功或失败记录，清除历史后不再导出。</p>
     <div class="tbl-wrap">
       <table>
         <thead>
           <tr>
-            <th style="width:30px"><input type="checkbox" id="cb-all" onchange="toggleAllResultCb(this)" style="cursor:pointer"></th>
             <th>#</th>
             <th>账号 (EDU)</th>
             <th>密码</th>
@@ -506,12 +498,22 @@ const lsGetJ=(k,d)=>{try{return JSON.parse(lsGet(k,'null'))??d}catch(e){return d
 const lsSetJ=(k,v)=>lsSet(k,JSON.stringify(v));
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 
-function applyPolicy(policy){
+function normalizeConcurrency(notify=false){
+  const input=document.getElementById('concurrency-input');
+  const before=input.value, numeric=Number(before);
+  const maximum=Math.max(1,Number(userPolicy.max_concurrency)||1);
+  const value=Math.max(1,Math.min(maximum,Number.isFinite(numeric)?Math.trunc(numeric):1));
+  input.value=String(value);
+  if(notify&&before!==String(value))showToast(`并发数已调整为 ${value}，当前账号允许 1–${maximum} 线程`,'info');
+  return value;
+}
+
+function applyPolicy(policy,notify=false){
   if(!policy)return;
   userPolicy=policy;
   const input=document.getElementById('concurrency-input');
   input.max=policy.max_concurrency;
-  input.value=Math.max(1,Math.min(parseInt(input.value)||3,policy.max_concurrency));
+  normalizeConcurrency(notify);
   document.getElementById('concurrency-policy').textContent=`当前账号最多 ${policy.max_concurrency} 线程`;
   document.getElementById('proxy-policy').textContent=`🌐 代理池（支持多行/逗号分隔，轮询分发，${policy.require_proxy?'此账号必须填写':'留空直连'}）`;
 }
@@ -708,7 +710,7 @@ function saveForm(){
   const accounts = document.getElementById('accounts').value;
   const proxy = document.getElementById('proxy-input').value;
   const headless = document.getElementById('headless-toggle').checked ? '1' : '0';
-  const concurrency = document.getElementById('concurrency-input').value || '3';
+  const concurrency = String(normalizeConcurrency());
   const products = getSelectedProducts();
 
   lsSet(LS.ACC, accounts);
@@ -788,9 +790,12 @@ async function loadForm(){
     console.error('加载同步设置异常:', e);
   }
 }
-['accounts','proxy-input','concurrency-input'].forEach(id=>{
+['accounts','proxy-input'].forEach(id=>{
   const el = document.getElementById(id);
   if(el) el.addEventListener('input',saveForm);
+});
+for(const event of ['change','blur'])document.getElementById('concurrency-input').addEventListener(event,()=>{
+  normalizeConcurrency(true);saveForm();
 });
 document.getElementById('headless-toggle').addEventListener('change',saveForm);
 
@@ -918,70 +923,76 @@ async function startTask(){
   const accounts=document.getElementById('accounts').value.trim();
   const headless=document.getElementById('headless-toggle').checked;
   const proxy=document.getElementById('proxy-input').value.trim();
-  const concurrency=parseInt(document.getElementById('concurrency-input').value)||3;
   const selectedProducts=getSelectedProducts();
   if(!accounts){showToast('请填写账号列表','err');return;}
-  if(userPolicy.require_proxy && !proxy){showToast('管理员要求此账号必须填写代理池','err');return;}
-  if(concurrency<1 || concurrency>userPolicy.max_concurrency){showToast(`此账号最多允许 ${userPolicy.max_concurrency} 线程`,'err');return;}
   if(!selectedProducts.length){showToast('请至少选择一个产品','err');return;}
-  saveForm();
-  // 保存账号映射（用于失败恢复）
-  const amap={};
-  // 1) "账号:xxx 密码:yyy" 标签格式（同行多对）
-  const labeledRe=new RegExp(
-    `${_LBL_ACC}${_SEP_RE}(\\S+?@\\S+?)\\s*${_LBL_PWD}${_SEP_RE}(.+?)(?=${_LBL_ACC}${_SEP_RE}|\\s*$)`,
-    'gim'
-  );
-  const consumed=[];
-  let mm;
-  while((mm=labeledRe.exec(accounts))!==null){
-    const em=mm[1].replace(/[,;]+$/,'').trim();
-    const pw=mm[2].replace(/[,;\s]+$/,'').trim();
-    if(em&&pw)amap[em]=`${em}\t${pw}`;
-    consumed.push([mm.index,mm.index+mm[0].length]);
-  }
-  let leftover=accounts;
-  if(consumed.length){
-    const arr=accounts.split('');
-    consumed.forEach(([s,e])=>{for(let i=s;i<e;i++)arr[i]=' '});
-    leftover=arr.join('');
-  }
-
-  // 2) 跨行 "账号:xxx\n密码:yyy"
-  let pendingEm=null;
-  const remain=[];
-  leftover.split('\n').forEach(line=>{
-    const t=line.trim();
-    if(!t||t.startsWith('#')){remain.push(line);return;}
-    const ma=_ACC_LABEL_RE.exec(t);
-    const mp=_PWD_LABEL_RE.exec(t);
-    if(ma){pendingEm=ma[1].replace(/[,;]+$/,'').trim();return;}
-    if(mp&&pendingEm){
-      const pw=mp[1].replace(/[,;]+$/,'').trim();
-      if(pw)amap[pendingEm]=`${pendingEm}\t${pw}`;
-      pendingEm=null;return;
-    }
-    remain.push(line);
-  });
-
-  // 3) 普通行
-  remain.forEach(line=>{
-    line=line.trim();if(!line||line.startsWith('#'))return;
-    const sep=line.includes('----')?'----':(line.includes('\t')?'\t':null);
-    const parts=sep?line.split(sep):line.split(/\s+/);
-    if(parts.length>=2)amap[parts[0].trim()]=line;
-  });
-  const mode=document.querySelector('input[name="run-mode"]:checked')?.value || "azure_student";
   _startRequestActive=true;
-  ++_resultsGeneration; // 丢弃上一轮尚未返回的结果和完成通知。
   const startButton=document.getElementById('btn-start');startButton.disabled=true;
   try{
+    const policyResponse=await fetch('/api/policy',{cache:'no-store'});
+    const latest=await policyResponse.json();
+    if(!policyResponse.ok||!latest.ok||!latest.policy)throw new Error(latest.error||'无法读取最新并发限制，请重试');
+    applyPolicy(latest.policy,true);
+    const concurrency=normalizeConcurrency();
+    if(userPolicy.require_proxy&&!proxy){showToast('管理员要求此账号必须填写代理池','err');return;}
+    saveForm();
+    // 保存账号映射（用于失败恢复）
+    const amap={};
+    // 1) "账号:xxx 密码:yyy" 标签格式（同行多对）
+    const labeledRe=new RegExp(
+      `${_LBL_ACC}${_SEP_RE}(\\S+?@\\S+?)\\s*${_LBL_PWD}${_SEP_RE}(.+?)(?=${_LBL_ACC}${_SEP_RE}|\\s*$)`,
+      'gim'
+    );
+    const consumed=[];
+    let mm;
+    while((mm=labeledRe.exec(accounts))!==null){
+      const em=mm[1].replace(/[,;]+$/,'').trim();
+      const pw=mm[2].replace(/[,;\s]+$/,'').trim();
+      if(em&&pw)amap[em]=`${em}\t${pw}`;
+      consumed.push([mm.index,mm.index+mm[0].length]);
+    }
+    let leftover=accounts;
+    if(consumed.length){
+      const arr=accounts.split('');
+      consumed.forEach(([s,e])=>{for(let i=s;i<e;i++)arr[i]=' '});
+      leftover=arr.join('');
+    }
+
+    // 2) 跨行 "账号:xxx\n密码:yyy"
+    let pendingEm=null;
+    const remain=[];
+    leftover.split('\n').forEach(line=>{
+      const t=line.trim();
+      if(!t||t.startsWith('#')){remain.push(line);return;}
+      const ma=_ACC_LABEL_RE.exec(t);
+      const mp=_PWD_LABEL_RE.exec(t);
+      if(ma){pendingEm=ma[1].replace(/[,;]+$/,'').trim();return;}
+      if(mp&&pendingEm){
+        const pw=mp[1].replace(/[,;]+$/,'').trim();
+        if(pw)amap[pendingEm]=`${pendingEm}\t${pw}`;
+        pendingEm=null;return;
+      }
+      remain.push(line);
+    });
+
+    // 3) 普通行
+    remain.forEach(line=>{
+      line=line.trim();if(!line||line.startsWith('#'))return;
+      const sep=line.includes('----')?'----':(line.includes('\t')?'\t':null);
+      const parts=sep?line.split(sep):line.split(/\s+/);
+      if(parts.length>=2)amap[parts[0].trim()]=line;
+    });
+    const mode=document.querySelector('input[name="run-mode"]:checked')?.value || "azure_student";
+    ++_resultsGeneration;
     const r=await fetch('/api/start',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
     const j=await r.json();
-    if(!j.ok){if(j.policy)applyPolicy(j.policy);showToast('启动失败: '+j.error,'err');return;}
-    // 服务端确认新任务已建立后才清空，启动失败时保留上一轮可导出的结果。
+    if(!j.ok){if(j.policy)applyPolicy(j.policy,true);showToast('启动失败: '+j.error,'err');return;}
+    if(j.policy)applyPolicy(j.policy);
+    const actualConcurrency=j.concurrency??concurrency;
+    document.getElementById('concurrency-input').value=String(actualConcurrency);
+    lsSet('azure_concurrency',String(actualConcurrency));
     lsSetJ(LS.AMAP,amap);lsSetJ(LS.CURRENT,[]);
     _taskDonePromise=null;
     _progressOk=0;_progressFail=0;_taskStartTime=Date.now();
@@ -989,7 +1000,7 @@ async function startTask(){
     _elapsedTimer=setInterval(updateElapsed,1000);
     clearLog();resetProductDots();
     setRunning(true);connectSSE();
-    showToast(`任务已启动（${j.count} 个账号，${concurrency} 并发）`,'ok');
+    showToast(`任务已启动（${j.count} 个账号，${actualConcurrency} 并发）`,'ok');
   }catch(e){showToast('启动失败: '+e.message,'err');}
   finally{_startRequestActive=false;startButton.disabled=isRunning;}
 }
@@ -1142,13 +1153,10 @@ function renderHistory(){
   updateStat('s-rate', Math.round(ok/history.length*100)+'%');
 
   const tbody=document.getElementById('results-body');tbody.innerHTML='';
-  document.getElementById('cb-all').checked=false;
-  document.getElementById('btn-export-sel').style.display='none';
   history.forEach((r,i)=>{
     const tr=document.createElement('tr');
     const got=PRODUCTS.filter(p=>r.keys&&r.keys[p]).length;
-    let cells=`<td style="width:30px"><input type="checkbox" class="result-cb" data-idx="${r.id}" onchange="onResultCbChange()" style="cursor:pointer"></td>`;
-    cells+=`<td style="color:var(--muted);font-size:.7rem">${i+1}</td>`;
+    let cells=`<td style="color:var(--muted);font-size:.7rem">${i+1}</td>`;
     cells+=`<td class="email-cell" title="${esc(r.email)}">${esc(r.email)}</td>`;
     cells+=`<td class="pwd-cell" title="${esc(r.password||'')}">${esc(r.password||'—')}</td>`;
     cells+=`<td class="key-cell" title="${esc(r.totp_secret||'')}">${esc(r.totp_secret||'—')}</td>`;
@@ -1163,24 +1171,16 @@ function renderHistory(){
 }
 
 async function exportExcel(filter,btn){
+  if(!['success','failed'].includes(filter))return;
   const orig=btn.textContent;
   btn.disabled=true;btn.textContent='导出中...';
   try{
-    if(filter.startsWith('current-'))await refreshCurrentResults();
-    const history=_serverHistory;
-    const current=lsGetJ(LS.CURRENT,[]);
-    const dataMap={
-      'all':            history,
-      'success':        history.filter(r=>r.success),
-      'failed':         history.filter(r=>!r.success),
-      'current-success':current.filter(r=>r.success),
-      'current-failed': current.filter(r=>!r.success),
-    };
-    const labelMap={
-      'all':'全部历史','success':'历史成功','failed':'历史失败',
-      'current-success':'本次成功','current-failed':'本次失败',
-    };
-    const rows=dataMap[filter]||[];
+    // 每次导出读取该用户全部尚未清除的记录，不依赖最近任务缓存或列表的 500 条上限。
+    const response=await fetch('/api/history?all=1&filter='+filter,{cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok||!data.ok||!Array.isArray(data.rows))throw new Error(data.error||'读取已保存记录失败');
+    const labelMap={success:'成功',failed:'失败'};
+    const rows=data.rows;
     if(!rows.length){showToast('没有可导出的数据','err');return;}
 
     // 构建 Excel 数据（产品全称作为列标题）
@@ -1247,66 +1247,6 @@ function clearHistory(){
         showToast('历史已清除','ok');
       }else{showToast('清除失败','err');}
     }).catch(e=>showToast('清除失败: '+e,'err'));
-}
-
-function toggleAllResultCb(master){
-  document.querySelectorAll('.result-cb').forEach(cb=>{cb.checked=master.checked;});
-  onResultCbChange();
-}
-function onResultCbChange(){
-  const any=document.querySelectorAll('.result-cb:checked').length>0;
-  document.getElementById('btn-export-sel').style.display=any?'inline-block':'none';
-  document.getElementById('btn-del-sel').style.display=any?'inline-block':'none';
-}
-function exportSelected(){
-  const ids=new Set([...document.querySelectorAll('.result-cb:checked')].map(cb=>parseInt(cb.dataset.idx)));
-  if(!ids.size){showToast('请先勾选要导出的行','err');return;}
-  const rows=_serverHistory.filter(r=>ids.has(r.id));
-  if(!rows.length){showToast('没有可导出的数据','err');return;}
-  _doExportRows(rows, '选中');
-}
-
-function deleteSelected(){
-  const ids=[...document.querySelectorAll('.result-cb:checked')].map(cb=>parseInt(cb.dataset.idx));
-  if(!ids.length)return;
-  if(!confirm(`确认删除选中的 ${ids.length} 条记录？`))return;
-  fetch('/api/history/delete',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ids})
-  }).then(r=>r.json()).then(j=>{
-    if(j.ok){
-      loadServerHistory();
-      showToast(`已删除 ${j.deleted} 条记录`,'ok');
-    }else{showToast('删除失败','err');}
-  }).catch(e=>showToast('删除失败: '+e,'err'));
-}
-
-function _doExportRows(rows, label){
-  try{
-    const sheetData=rows.map((r,i)=>{
-      const row={
-        '#':i+1,'时间':r.ts||r.created_at,'账号 (EDU 邮箱)':r.email,
-        '密码':r.password||'','TOTP Secret':r.totp_secret||r.totp||'',
-        '状态':r.success?('✅ '+PRODUCTS.filter(p=>r.keys&&r.keys[p]).length+'/'+PRODUCTS.length):'❌ 失败',
-        '备注':r.msg||'',
-      };
-      PRODUCTS.forEach(p=>{row[p]=r.keys&&r.keys[p]?r.keys[p]:'';});
-      return row;
-    });
-    const ws=XLSX.utils.json_to_sheet(sheetData,{
-      header:['#','时间','账号 (EDU 邮箱)','密码','TOTP Secret','状态','备注',...PRODUCTS]
-    });
-    ws['!cols']=[{wch:4},{wch:18},{wch:38},{wch:22},{wch:28},{wch:10},{wch:30},
-      ...PRODUCTS.map(()=>({wch:42}))];
-    const wb=XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb,ws,'Azure Keys');
-    const ts=new Date().toISOString().slice(0,19).replace(/[-:T]/g,'').slice(0,15);
-    const fname=`azure_keys_${label}_${ts}.xlsx`;
-    XLSX.writeFile(wb,fname);
-    showToast(`已导出 ${rows.length} 条: ${fname}`,'ok',4000);
-  }catch(e){
-    showToast('导出异常: '+e,'err');
-  }
 }
 
 // ── 初始化 ─────────────────────────────────────────────────

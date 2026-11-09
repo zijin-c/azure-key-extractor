@@ -46,14 +46,19 @@ class UserPolicyTests(DatabaseTestCase):
         self.set_policy()
         client = self.client(self.alice)
         with patch.object(gui.threading.Thread, "start") as start:
-            for value in (3, 20, 100, 0, -1, True, 1.5, "2.0", None):
+            for value in (True, 1.5, "2.0", None, "invalid"):
                 with self.subTest(value=value):
                     response = client.post("/api/start", json={"accounts": "test@example.invalid password", "concurrency": value, "max_concurrency": 100})
                     self.assertEqual(response.status_code, 400)
             start.assert_not_called()
             self.assertIsNone(batch.BatchManager.get_active_task())
-            self.assertEqual(client.post("/api/start", json={"accounts": "test@example.invalid password", "concurrency": 2}).status_code, 200)
-            self.assertEqual(batch.BatchManager.get_active_task()["concurrency"], 2)
+            for requested, expected in ((3, 2), (20, 2), (100, 2), (0, 1), (-1, 1), (2, 2)):
+                response = client.post("/api/start", json={"accounts": "test@example.invalid password", "concurrency": requested, "max_concurrency": 100})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()["concurrency"], expected)
+                self.assertEqual(batch.BatchManager.get_active_task()["concurrency"], expected)
+                batch.BatchManager.clear_task()
+                gui._sessions.clear()
 
     def test_start_defaults_to_low_user_limit(self):
         self.set_policy(max_concurrency=1)
@@ -102,11 +107,25 @@ class UserPolicyTests(DatabaseTestCase):
         self.assertTrue(response.get_json()["ok"])
         executor.assert_called_once_with(max_workers=1)
 
-    def test_over_limit_settings_are_rejected_without_partial_save(self):
+    def test_over_limit_settings_are_clamped_and_saved(self):
         self.set_policy()
-        response = self.client(self.alice).post("/api/settings", json={"concurrency": 20, "accounts": "must-not-save"})
+        response = self.client(self.alice).post("/api/settings", json={"concurrency": 20, "accounts": "synthetic-accounts"})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertEqual(auth.get_user_settings(self.alice), {"concurrency": "2", "accounts": "synthetic-accounts"})
+
+    def test_invalid_concurrency_settings_are_rejected_without_partial_save(self):
+        self.set_policy()
+        response = self.client(self.alice).post("/api/settings", json={"concurrency": 1.5, "accounts": "must-not-save"})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(auth.get_user_settings(self.alice), {})
+
+    def test_policy_endpoint_reads_only_current_users_latest_policy(self):
+        client = self.client(self.alice)
+        self.assertEqual(self.client().get("/api/policy").status_code, 401)
+        self.set_policy(max_concurrency=4)
+        self.assertEqual(client.get(f"/api/policy?user_id={self.bob}").get_json()["policy"]["max_concurrency"], 4)
+        self.set_policy(max_concurrency=1)
+        self.assertEqual(client.get("/api/policy").get_json()["policy"]["max_concurrency"], 1)
 
     def test_recovered_and_following_batches_use_latest_concurrency(self):
         self.set_policy()

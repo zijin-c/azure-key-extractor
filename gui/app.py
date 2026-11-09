@@ -202,12 +202,10 @@ def _validated_proxy_pool(proxy_input):
 
 
 def _requested_concurrency(value, maximum):
-    if isinstance(value, bool) or not re.fullmatch(r"\d+", str(value).strip()):
+    if isinstance(value, bool) or not re.fullmatch(r"[+-]?\d+", str(value).strip()):
         raise ValueError("并发数必须为整数")
     count = int(value)
-    if not 1 <= count <= maximum:
-        raise ValueError(f"当前账号的并发数必须为 1–{maximum}")
-    return count
+    return max(1, min(count, maximum))
 
 
 def _owns_task(task):
@@ -415,7 +413,12 @@ def admin_user_policy():
 def api_history():
     """获取当前用户的历史记录"""
     user_id = session["user_id"]
-    rows = get_history(user_id)
+    all_rows = request.args.get("all", "0")
+    filter_type = request.args.get("filter", "all")
+    if all_rows not in ("0", "1") or filter_type not in ("all", "success", "failed"):
+        return jsonify({"ok": False, "error": "无效的历史筛选条件"}), 400
+    success = None if filter_type == "all" else filter_type == "success"
+    rows = get_history(user_id, limit=None if all_rows == "1" else 500, success=success)
     return jsonify({"ok": True, "rows": rows})
 
 
@@ -449,6 +452,12 @@ def api_get_settings():
     return jsonify({"ok": True, "settings": settings, "policy": get_user_policy(user_id)})
 
 
+@app.route("/api/policy")
+@login_required
+def api_user_policy():
+    return jsonify({"ok": True, "policy": get_user_policy(session["user_id"])})
+
+
 @app.route("/api/settings", methods=["POST"])
 @login_required
 def api_save_settings():
@@ -458,7 +467,7 @@ def api_save_settings():
     if "concurrency" in data:
         policy = get_user_policy(user_id)
         try:
-            _requested_concurrency(data["concurrency"], policy["max_concurrency"])
+            data["concurrency"] = _requested_concurrency(data["concurrency"], policy["max_concurrency"])
         except ValueError as error:
             return jsonify({"ok": False, "error": str(error)}), 400
     for key in ["accounts", "proxy", "headless", "products", "concurrency"]:
@@ -567,7 +576,7 @@ def api_start():
             BatchManager.clear_task()
             app.logger.exception("启动任务失败")
             return jsonify({"ok": False, "error": "启动任务失败，请检查服务日志"}), 500
-        return jsonify({"ok": True, "count": len(accounts)})
+        return jsonify({"ok": True, "count": len(accounts), "concurrency": concurrency, "policy": policy})
 
 
 

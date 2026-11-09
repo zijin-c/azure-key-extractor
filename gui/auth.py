@@ -502,24 +502,34 @@ def save_result(user_id: int, result_dict: dict):
         )
 
 
-def get_history(user_id: int, limit: int = 500) -> list[dict]:
+def get_history(user_id: int, limit: int | None = 500, success: bool | None = None) -> list[dict]:
     """获取用户历史记录"""
     conn = _get_db()
-    rows = conn.execute(
-        """SELECT id, email, password, totp_secret, success, keys, message, created_at
-           FROM task_history WHERE user_id = ? ORDER BY created_at DESC LIMIT ?""",
-        (user_id, limit),
-    ).fetchall()
+    query = """SELECT id, email, password, totp_secret, success, keys, message, created_at
+               FROM task_history WHERE user_id = ?"""
+    params = [user_id]
+    if success is not None:
+        query += " AND success = ?"
+        params.append(int(success))
+    query += " ORDER BY created_at DESC, id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(query, params).fetchall()
 
     results = []
     for r in rows:
+        try:
+            keys = json.loads(r["keys"] or "{}")
+        except (TypeError, ValueError):
+            keys = {}
         results.append({
             "id": r["id"],
             "email": r["email"],
             "password": r["password"],
             "totp_secret": r["totp_secret"],
             "success": bool(r["success"]),
-            "keys": json.loads(r["keys"]) if r["keys"] else {},
+            "keys": keys if isinstance(keys, dict) else {},
             "msg": r["message"],
             "ts": r["created_at"],
         })
