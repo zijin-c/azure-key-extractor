@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ target_user.username }} · 提取详情</title>
+<script src="{{ url_for('static', filename='session.js') }}" data-user-id="{{ current_user_id }}"></script>
+{% include '_admin_styles.html' %}
+</head>
+<body>
+<main class="wrap">
+  <nav class="topbar" aria-label="详情导航">
+    <div class="brand"><div class="logo" aria-hidden="true">▥</div><div><h1>用户提取详情</h1><div class="subtitle record-name">{{ target_user.username }} · #{{ target_user.id }}{% if target_user.deleted %} · 已删除，统计仍保留{% endif %}</div></div></div>
+    <div class="actions"><a href="{{ url_for('admin_page') }}">← 返回管理后台</a><button id="refresh" type="button">刷新详情</button></div>
+  </nav>
+  <p class="notice">时间段按记录中的首次提取时间归档。新增 Key 按「用户 + 产品 + Key」去重，首次成功账号按邮箱去重；重复提取不增加、不移动原有数量。日期沿用服务器记录时间。</p>
+  <section class="panel" aria-label="筛选条件">
+    <form id="filters" class="filters">
+      <label>开始日期<input id="start" type="date" aria-label="开始日期"></label>
+      <label>结束日期<input id="end" type="date" aria-label="结束日期"></label>
+      <label>时间分组<select id="group" aria-label="时间分组"><option value="hour">按小时</option><option value="day" selected>按天</option><option value="week">按周（周一起）</option><option value="month">按月</option></select></label>
+      <button class="primary" type="submit">查询</button>
+    </form>
+    <div class="presets" aria-label="快捷日期"><button type="button" data-days="1">今天</button><button type="button" data-days="7">近 7 天</button><button type="button" data-days="30">近 30 天</button><button type="button" data-days="all">全部时间</button></div>
+  </section>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
+  <div class="metrics">
+    <div class="metric"><span class="muted">时段新增 Key</span><strong id="range-keys">—</strong><div class="subtitle">首次出现在所选日期内</div></div>
+    <div class="metric"><span class="muted">时段首次成功账号</span><strong id="range-accounts">—</strong><div class="subtitle">同一邮箱仅计首次成功</div></div>
+    <div class="metric"><span class="muted">该用户累计 Key</span><strong id="lifetime-keys">—</strong><div class="subtitle">含已删除历史中的 Key</div></div>
+    <div class="metric"><span class="muted">该用户累计成功账号</span><strong id="lifetime-accounts">—</strong><div class="subtitle">不受日期筛选影响</div></div>
+  </div>
+  <p id="timing-note" class="detail-note"></p>
+  <div class="detail-layout">
+    <section class="panel" aria-labelledby="periods-title">
+      <div class="panel-head"><div><h2 id="periods-title">各时间段提取数量</h2><p id="range-label" class="subtitle" style="margin:7px 0 0">正在加载…</p></div></div>
+      <div class="scroll"><table><thead><tr><th>时间段（从新到旧）</th><th>新增 Key</th><th>首次成功账号</th><th>产品类型与数量</th></tr></thead><tbody id="periods"><tr><td class="empty" colspan="4">正在加载…</td></tr></tbody></table></div>
+      <p id="periods-note" class="detail-message">仅显示有新增数据的时间段。</p>
+    </section>
+    <section class="panel" aria-labelledby="types-title">
+      <div class="panel-head"><h2 id="types-title">所选时段的产品类型</h2></div>
+      <div class="scroll"><table><thead><tr><th>产品</th><th>新增 Key</th><th>占比</th></tr></thead><tbody id="types"><tr><td class="empty" colspan="3">正在加载…</td></tr></tbody></table></div>
+    </section>
+  </div>
+</main>
+<script>
+const TARGET_USER_ID={{ target_user.id | tojson }};
+const SERVER_TODAY={{ today | tojson }};
+const $=id=>document.getElementById(id);
+const number=value=>Number(value).toLocaleString('zh-CN');
+const groupNames={hour:'按小时',day:'按天',week:'按周（周一起）',month:'按月'};
+let requestSequence=0;
+function cell(row,text){const td=document.createElement('td');td.textContent=text;row.append(td);return td;}
+function empty(id,columns,message){const row=document.createElement('tr'),td=cell(row,message);td.colSpan=columns;td.className='empty';$(id).replaceChildren(row);}
+function setPreset(value){
+  $('end').value=value==='all'?'':SERVER_TODAY;
+  if(value==='all')$('start').value='';
+  else{const day=new Date(SERVER_TODAY+'T00:00:00Z');day.setUTCDate(day.getUTCDate()-Number(value)+1);$('start').value=day.toISOString().slice(0,10);}
+  document.querySelectorAll('[data-days]').forEach(button=>button.classList.toggle('active',button.dataset.days===value));
+}
+function resetFigures(){for(const id of ['range-keys','range-accounts','lifetime-keys','lifetime-accounts'])$(id).textContent='—';$('timing-note').textContent='';}
+async function loadDetails(){
+  const sequence=++requestSequence;
+  const start=$('start').value,end=$('end').value,group=$('group').value;
+  $('status').classList.remove('error');$('status').textContent='正在查询…';$('refresh').disabled=true;
+  resetFigures();empty('periods',4,'正在加载…');empty('types',3,'正在加载…');
+  $('range-label').textContent='正在加载…';$('periods-note').textContent='';
+  try{
+    if(start&&end&&start>end)throw new Error('开始日期不能晚于结束日期');
+    const params=new URLSearchParams({group});if(start)params.set('start',start);if(end)params.set('end',end);
+    const response=await fetch(`/api/admin/users/${TARGET_USER_ID}/details?${params}`,{cache:'no-store'});
+    const data=await response.json();
+    if(sequence!==requestSequence)return;
+    if(!response.ok||!data.ok)throw new Error(data.error||'查询失败');
+    $('range-keys').textContent=number(data.summary.new_keys);$('range-accounts').textContent=number(data.summary.new_successful_accounts);
+    $('lifetime-keys').textContent=number(data.lifetime.new_keys);$('lifetime-accounts').textContent=number(data.lifetime.new_successful_accounts);
+    $('range-label').textContent=`${start||'最早记录'} 至 ${end||'最新记录'} · ${groupNames[group]}`;
+    const timing=data.timing,notes=[];
+    if(timing.new_keys.inferred||timing.new_successful_accounts.inferred)notes.push('部分旧记录的日期按最早保留的历史估算，已删除的更早日期无法还原。');
+    if(timing.new_keys.unknown||timing.new_successful_accounts.unknown)notes.push(`日期未知：${number(timing.new_keys.unknown)} 个 Key、${number(timing.new_successful_accounts.unknown)} 个成功账号。选择“全部时间”时计入总数，限定日期时不计入。`);
+    $('timing-note').textContent=notes.join(' ');
+    $('periods').replaceChildren();const max=Math.max(1,...data.periods.map(period=>period.new_keys));
+    for(const period of data.periods){
+      const row=document.createElement('tr');cell(row,period.period===null?'日期未知':period.period);
+      const volume=document.createElement('div');volume.className='volume';const label=document.createElement('span');label.textContent=number(period.new_keys);
+      const bar=document.createElement('span');bar.className='bar';bar.setAttribute('aria-hidden','true');const fill=document.createElement('i');fill.style.width=(period.new_keys/max*100)+'%';bar.append(fill);volume.append(label,bar);cell(row,'').append(volume);
+      cell(row,number(period.new_successful_accounts));const types=cell(row,period.products.map(product=>`${product.product} × ${number(product.count)}`).join('；')||'—');types.className='types-cell';$('periods').append(row);
+    }
+    if(!data.periods.length)empty('periods',4,'所选时段暂无新增记录');
+    $('periods-note').textContent=data.truncated?'仅显示最近 500 个有数据的时间段，请缩短日期范围；上方汇总与产品数量仍包含整个所选时段。':'仅显示有新增数据的时间段；按周展示时，日期为该周周一。';
+    $('types').replaceChildren();
+    for(const product of data.products){const row=document.createElement('tr');cell(row,product.product).className='types-cell';cell(row,number(product.count));cell(row,(product.count/Math.max(1,data.summary.new_keys)*100).toFixed(1)+'%');$('types').append(row);}
+    if(!data.products.length)empty('types',3,'所选时段暂无新增 Key');
+    $('status').textContent='查询完成';
+  }catch(error){if(sequence!==requestSequence)return;$('status').textContent=error.message;$('status').classList.add('error');$('range-label').textContent='查询失败';empty('periods',4,'暂时无法加载，请重试');empty('types',3,'暂时无法加载');}
+  finally{if(sequence===requestSequence)$('refresh').disabled=false;}
+}
+$('filters').addEventListener('submit',event=>{event.preventDefault();loadDetails();});
+$('refresh').addEventListener('click',loadDetails);
+document.querySelectorAll('[data-days]').forEach(button=>button.addEventListener('click',()=>{setPreset(button.dataset.days);loadDetails();}));
+for(const id of ['start','end'])$(id).addEventListener('change',()=>document.querySelectorAll('[data-days]').forEach(button=>button.classList.remove('active')));
+setPreset('30');loadDetails();
+</script>
+</body>
+</html>

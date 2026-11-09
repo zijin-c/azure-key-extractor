@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import requests as _requests
-from flask import Flask, Response, jsonify, render_template, request, session, stream_with_context, send_file, redirect, url_for
+from flask import Flask, Response, abort, jsonify, render_template, request, session, stream_with_context, send_file, redirect, url_for
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -35,6 +35,7 @@ from gui.auth import (
     is_user_admin, list_users, delete_user, change_password,
     save_user_setting, get_user_settings, get_admin_stats,
     user_exists, get_user_policy, save_user_policy,
+    get_admin_user_identity, get_admin_user_details,
 )
 
 if getattr(sys, 'frozen', False):
@@ -314,6 +315,29 @@ def admin_stats():
     response = jsonify({"ok": True, **get_admin_stats()})
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.route("/admin/users/<int:user_id>")
+@admin_required
+def admin_user_page(user_id):
+    user = get_admin_user_identity(user_id)
+    if user is None:
+        abort(404)
+    return render_template("admin_user.html", target_user=user,
+                           current_user_id=session["user_id"], today=datetime.now().date().isoformat())
+
+
+@app.route("/api/admin/users/<int:user_id>/details")
+@admin_required
+def admin_user_details(user_id):
+    try:
+        details = get_admin_user_details(user_id, request.args.get("start") or None,
+                                         request.args.get("end") or None, request.args.get("group", "day"))
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    if details is None:
+        return jsonify({"ok": False, "error": "用户不存在或没有保留的统计"}), 404
+    return jsonify({"ok": True, **details})
 
 
 @app.route("/admin/users")

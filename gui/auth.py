@@ -8,7 +8,7 @@ import os
 import secrets
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime
 from functools import wraps
 
 from flask import abort, redirect, request, session, url_for, jsonify
@@ -80,6 +80,8 @@ def init_db():
             product TEXT NOT NULL,
             key_hash TEXT NOT NULL,
             extracted_at TEXT NOT NULL,
+            first_extracted_at TEXT,
+            time_inferred INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, product, key_hash)
         );
 
@@ -88,6 +90,8 @@ def init_db():
             username TEXT NOT NULL,
             email_hash TEXT NOT NULL,
             succeeded_at TEXT NOT NULL,
+            first_succeeded_at TEXT,
+            time_inferred INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, email_hash)
         );
 
@@ -97,6 +101,15 @@ def init_db():
             max_concurrency INTEGER NOT NULL DEFAULT 20 CHECK(max_concurrency BETWEEN 1 AND 20)
         );
     """)
+    # 旧账本仅保留最近时间，不能直接当作首次日期使用。
+    for table, column in (("key_extractions", "first_extracted_at"),
+                          ("successful_accounts", "first_succeeded_at")):
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        if "time_inferred" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN time_inferred INTEGER NOT NULL DEFAULT 1")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_first ON {table}(user_id, {column})")
     conn.commit()
 
     # 一次性补入升级前仍保留的历史；标记和统计在同一事务中提交。
@@ -113,7 +126,7 @@ def init_db():
                     keys = json.loads(row["keys"] or "{}")
                 except (ValueError, TypeError):
                     continue
-                _record_key_extractions(conn, row["user_id"], row["username"], keys, row["created_at"])
+                _record_key_extractions(conn, row["user_id"], row["username"], keys, row["created_at"], inferred=True)
             conn.execute("INSERT INTO settings (key, value) VALUES ('key_stats_backfilled_v1', '1')")
         if not conn.execute("SELECT 1 FROM settings WHERE key = 'account_stats_backfilled_v1'").fetchone():
             for row in conn.execute("""
@@ -121,8 +134,21 @@ def init_db():
                 FROM task_history h LEFT JOIN users u ON u.id = h.user_id
                 WHERE h.success = 1 ORDER BY h.id
             """):
-                _record_successful_account(conn, row["user_id"], row["username"], row["email"], row["created_at"])
+                _record_successful_account(conn, row["user_id"], row["username"], row["email"], row["created_at"], inferred=True)
             conn.execute("INSERT INTO settings (key, value) VALUES ('account_stats_backfilled_v1', '1')")
+        if not conn.execute("SELECT 1 FROM settings WHERE key = 'first_extraction_dates_v1'").fetchone():
+            for row in conn.execute("""
+                SELECT h.user_id, u.username, h.email, h.success, h.keys, h.created_at
+                FROM task_history h LEFT JOIN users u ON u.id = h.user_id ORDER BY h.id
+            """):
+                try:
+                    keys = json.loads(row["keys"] or "{}")
+                except (ValueError, TypeError):
+                    keys = {}
+                _record_key_extractions(conn, row["user_id"], row["username"], keys, row["created_at"], inferred=True)
+                if row["success"]:
+                    _record_successful_account(conn, row["user_id"], row["username"], row["email"], row["created_at"], inferred=True)
+            conn.execute("INSERT INTO settings (key, value) VALUES ('first_extraction_dates_v1', '1')")
 
     # 确保有默认管理员（首次启动时创建）
     admin = conn.execute("SELECT id FROM users WHERE is_admin = 1").fetchone()
@@ -268,20 +294,36 @@ def change_password(user_id: int, new_password: str) -> bool:
 
 
 # ── 历史记录 ─────────────────────────────────────────────────
-def _record_successful_account(conn, user_id, username, email, succeeded_at):
+def _stats_timestamp(value):
+    try:
+        # 保留记录中的墙上时间；旧记录未携带服务器时区，不能猜测其 UTC 偏移。
+        return datetime.fromisoformat(value).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_successful_account(conn, user_id, username, email, succeeded_at, inferred=False):
     """同一用户成功过的邮箱只计一次，不保留邮箱明文。"""
     if not isinstance(email, str) or not email.strip():
         return
     email_hash = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
     conn.execute("""
-        INSERT INTO successful_accounts (user_id, username, email_hash, succeeded_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO successful_accounts
+            (user_id, username, email_hash, succeeded_at, first_succeeded_at, time_inferred)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, email_hash) DO UPDATE SET
-            succeeded_at = MAX(successful_accounts.succeeded_at, excluded.succeeded_at)
-    """, (user_id, username or f"用户 #{user_id}", email_hash, succeeded_at))
+            succeeded_at = MAX(successful_accounts.succeeded_at, excluded.succeeded_at),
+            first_succeeded_at = CASE
+                WHEN successful_accounts.first_succeeded_at IS NULL AND successful_accounts.time_inferred = 1
+                     AND excluded.time_inferred = 0 THEN NULL
+                WHEN successful_accounts.first_succeeded_at IS NULL THEN excluded.first_succeeded_at
+                WHEN excluded.first_succeeded_at IS NULL THEN successful_accounts.first_succeeded_at
+                ELSE MIN(successful_accounts.first_succeeded_at, excluded.first_succeeded_at) END
+    """, (user_id, username or f"用户 #{user_id}", email_hash, succeeded_at,
+          _stats_timestamp(succeeded_at), int(inferred)))
 
 
-def _record_key_extractions(conn, user_id, username, keys, extracted_at):
+def _record_key_extractions(conn, user_id, username, keys, extracted_at, inferred=False):
     """按用户、产品、key 去重；失败任务中的部分有效结果也计入。"""
     if not isinstance(keys, dict):
         return
@@ -291,11 +333,98 @@ def _record_key_extractions(conn, user_id, username, keys, extracted_at):
         fingerprint = hashlib.sha256(key.strip().upper().encode("utf-8")).hexdigest()
         conn.execute(
             """INSERT INTO key_extractions
-               (user_id, username, product, key_hash, extracted_at) VALUES (?, ?, ?, ?, ?)
+               (user_id, username, product, key_hash, extracted_at, first_extracted_at, time_inferred)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id, product, key_hash) DO UPDATE SET
-                   extracted_at = MAX(key_extractions.extracted_at, excluded.extracted_at)""",
-            (user_id, username or f"用户 #{user_id}", product, fingerprint, extracted_at),
+                   extracted_at = MAX(key_extractions.extracted_at, excluded.extracted_at),
+                   first_extracted_at = CASE
+                       WHEN key_extractions.first_extracted_at IS NULL AND key_extractions.time_inferred = 1
+                            AND excluded.time_inferred = 0 THEN NULL
+                       WHEN key_extractions.first_extracted_at IS NULL THEN excluded.first_extracted_at
+                       WHEN excluded.first_extracted_at IS NULL THEN key_extractions.first_extracted_at
+                       ELSE MIN(key_extractions.first_extracted_at, excluded.first_extracted_at) END""",
+            (user_id, username or f"用户 #{user_id}", product, fingerprint, extracted_at,
+             _stats_timestamp(extracted_at), int(inferred)),
         )
+
+
+def get_admin_user_identity(user_id):
+    conn = _get_db()
+    row = conn.execute("SELECT id, username, is_admin, 0 AS deleted FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not row:
+        row = conn.execute("""
+            SELECT user_id AS id, username, 0 AS is_admin, 1 AS deleted
+            FROM key_extractions WHERE user_id = ?
+            UNION ALL SELECT user_id, username, 0, 1 FROM successful_accounts WHERE user_id = ? LIMIT 1
+        """, (user_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def get_admin_user_details(user_id, start=None, end=None, group="day"):
+    """按首次提取/首次成功统计新增量，不读取密码、TOTP 或 Key 明文。"""
+    formats = {"hour": "strftime('%Y-%m-%d %H:00:00', {column})",
+               "day": "substr({column}, 1, 10)",
+               "week": "date({column}, '-6 days', 'weekday 1')",
+               "month": "substr({column}, 1, 7)"}
+    if group not in formats:
+        raise ValueError("时间分组仅支持小时、天、周、月")
+    for value in (start, end):
+        if value is not None:
+            try:
+                if date.fromisoformat(value).isoformat() != value:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ValueError("日期格式必须为 YYYY-MM-DD") from None
+    if start and end and start > end:
+        raise ValueError("开始日期不能晚于结束日期")
+    conn = _get_db()
+    conn.execute("SAVEPOINT admin_user_details")
+    try:
+        user = get_admin_user_identity(user_id)
+        if user is None:
+            return None
+
+        periods, products, summary, lifetime, timing = {}, {}, {}, {}, {}
+        for table, column, metric in (("key_extractions", "first_extracted_at", "new_keys"),
+                                      ("successful_accounts", "first_succeeded_at", "new_successful_accounts")):
+            total = conn.execute(f"""
+                SELECT COUNT(*) AS total, COALESCE(SUM(time_inferred), 0) AS inferred,
+                       COALESCE(SUM({column} IS NULL), 0) AS unknown
+                FROM {table} WHERE user_id = ?
+            """, (user_id,)).fetchone()
+            lifetime[metric] = total["total"]
+            timing[metric] = {"inferred": total["inferred"], "unknown": total["unknown"]}
+            where, params = ["user_id = ?"], [user_id]
+            if start:
+                where.append(f"{column} >= ?")
+                params.append(start + " 00:00:00")
+            if end:
+                where.append(f"{column} <= ?")
+                params.append(end + " 23:59:59")
+            product_sql = "product" if table == "key_extractions" else "NULL"
+            bucket = formats[group].format(column=column)
+            rows = conn.execute(f"""
+                SELECT {bucket} AS period, {product_sql} AS product, COUNT(*) AS count
+                FROM {table} WHERE {' AND '.join(where)} GROUP BY period, 2
+            """, params).fetchall()
+            summary[metric] = sum(row["count"] for row in rows)
+            for row in rows:
+                period = periods.setdefault(row["period"], {"period": row["period"], "new_keys": 0,
+                                                           "new_successful_accounts": 0, "products": []})
+                period[metric] += row["count"]
+                if row["product"] is not None:
+                    products[row["product"]] = products.get(row["product"], 0) + row["count"]
+                    period["products"].append({"product": row["product"], "count": row["count"]})
+        timeline = sorted(periods.values(), key=lambda item: (item["period"] is not None, item["period"] or ""), reverse=True)
+        for period in timeline:
+            period["products"].sort(key=lambda item: (-item["count"], item["product"]))
+        return {"user": user, "range": {"start": start, "end": end, "group": group},
+                "summary": summary, "lifetime": lifetime, "timing": timing,
+                "periods": timeline[:500], "truncated": len(timeline) > 500,
+                "products": [{"product": product, "count": count}
+                             for product, count in sorted(products.items(), key=lambda item: (-item[1], item[0]))]}
+    finally:
+        conn.execute("RELEASE SAVEPOINT admin_user_details")
 
 
 def get_admin_stats() -> dict:
@@ -438,11 +567,11 @@ def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if "user_id" not in session:
-            if request.path in ("/admin", "/admin/"):
+            if request.endpoint in ("admin_page", "admin_user_page"):
                 return redirect(url_for("login_page"))
             return jsonify({"ok": False, "error": "未登录", "need_login": True}), 401
         if not is_user_admin(session["user_id"]):
-            if request.path in ("/admin", "/admin/"):
+            if request.endpoint in ("admin_page", "admin_user_page"):
                 abort(403)
             return jsonify({"ok": False, "error": "仅管理员可访问后台"}), 403
         return f(*args, **kwargs)
