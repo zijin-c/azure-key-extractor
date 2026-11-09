@@ -22,6 +22,7 @@ class DatabaseTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.addCleanup(self.close_db)
         for target, name, value in ((gui, "_sessions", {}), (gui, "_maintenance_pending", False),
+                                    (gui, "_startup_recovery_pending", False),
                                     (batch, "_QUEUE_FILE", str(Path(self.temp.name, "queue.json")))):
             patcher = patch.object(target, name, value)
             patcher.start()

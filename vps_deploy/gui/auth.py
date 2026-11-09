@@ -30,6 +30,14 @@ def _get_db() -> sqlite3.Connection:
     return _local.conn
 
 
+def close_db():
+    """任务线程结束后释放自己的 SQLite 连接。"""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        conn.close()
+        _local.conn = None
+
+
 def init_db():
     """初始化数据库表"""
     conn = _get_db()

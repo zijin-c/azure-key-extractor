@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from test_task_recovery import gui, batch
 from modules.pipeline import Account, KeyResult
 from utils import totp_cache
+from utils.task_scope import task_scope
 
 
 class UserIsolationTests(unittest.TestCase):
@@ -16,6 +17,7 @@ class UserIsolationTests(unittest.TestCase):
             (batch, "_QUEUE_FILE", str(Path(self.temp.name, "queue.json"))),
             (gui, "_sessions", {}),
             (gui, "_maintenance_pending", False),
+            (gui, "_startup_recovery_pending", False),
             (gui, "user_exists", lambda user_id: True),
             (gui, "get_user_policy", lambda user_id: {"require_proxy": False, "max_concurrency": 20}),
         ):
@@ -23,6 +25,9 @@ class UserIsolationTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         gui.app.testing = True
+        scope = task_scope(1)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
         self.result = KeyResult(Account("owner@example.invalid", "owner-password"), True,
                                 totp_secret="JBSWY3DPEHPK3PXP", keys={"Synthetic": "OWNER-KEY"})
         batch.BatchManager.init_task("user_1", 1, [self.result.account])
@@ -48,7 +53,12 @@ class UserIsolationTests(unittest.TestCase):
     def test_empty_session_does_not_inherit_global_results_or_status(self):
         client = self.client(2)
         self.assertEqual(client.get("/api/results").get_json(), [])
-        self.assertEqual(client.get("/api/status").get_json(), {"running": False, "results": 0})
+        status = client.get("/api/status").get_json()
+        self.assertFalse(status["running"])
+        self.assertEqual(status["results"], 0)
+        self.assertFalse(status["busy"])
+        self.assertTrue(status["can_start"])
+        self.assertEqual(status["state"], "idle")
         with patch.object(gui, "export_to_excel") as export:
             self.assertEqual(client.post("/api/export", json={}).status_code, 400)
             export.assert_not_called()
@@ -56,7 +66,7 @@ class UserIsolationTests(unittest.TestCase):
 
     def test_foreign_queue_cannot_be_stopped_even_without_sid(self):
         with patch.object(gui.BrowserProcessManager, "cleanup_all") as cleanup:
-            self.assertEqual(self.client(2).post("/api/stop", json={}).status_code, 403)
+            self.assertEqual(self.client(2).post("/api/stop", json={}).status_code, 200)
             cleanup.assert_not_called()
         self.assertEqual(batch.BatchManager.get_active_task()["status"], "running")
 
@@ -75,7 +85,7 @@ class UserIsolationTests(unittest.TestCase):
                 self.assertEqual(self.client(1).post(endpoint, json={}).status_code, 403)
             cleanup.assert_not_called()
 
-    def test_owner_stop_blocks_new_task_until_worker_finishes_cleanup(self):
+    def test_owner_cleanup_blocks_only_the_same_user_and_other_users_can_start(self):
         s = gui._get_sess("user_1")
         s.running = s.worker_active = True
         with patch.object(gui.BrowserProcessManager, "cleanup_all", return_value=0), patch.object(gui, "release_system_memory"):
@@ -84,7 +94,7 @@ class UserIsolationTests(unittest.TestCase):
         thread = MagicMock()
         with patch.object(gui.threading, "Thread", thread):
             request = {"accounts": "second@example.invalid password"}
-            self.assertEqual(self.client(2).post("/api/start", json=request).status_code, 400)
+            self.assertEqual(self.client(1).post("/api/start", json=request).status_code, 400)
             thread.assert_not_called()
             s.worker_active = False
             self.assertEqual(self.client(2).post("/api/start", json=request).status_code, 200)

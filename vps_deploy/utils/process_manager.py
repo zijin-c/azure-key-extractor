@@ -12,6 +12,7 @@ import asyncio
 import subprocess
 import threading
 from typing import Set, Dict, List, Optional
+from utils.task_scope import current_task_user
 
 # Windows API 结构体定义（基于 ctypes，毫秒级执行，零第三方依赖）
 if sys.platform == "win32":
@@ -50,10 +51,11 @@ def get_playwright_driver_pid(pw) -> Optional[int]:
 
 
 class BrowserProcessManager:
-    """全局进程生命周期管理器（线程安全）。"""
+    """按任务用户登记与清理进程；共享注册表受锁保护。"""
     _lock = threading.Lock()
     _active_driver_pids: Set[int] = set()
     _tracked_child_pids: Dict[int, Set[int]] = {}
+    _driver_owners: dict[int, int | None] = {}
 
     @classmethod
     def register_driver(cls, driver_pid: Optional[int]):
@@ -62,7 +64,17 @@ class BrowserProcessManager:
             return
         with cls._lock:
             cls._active_driver_pids.add(driver_pid)
+            cls._driver_owners[driver_pid] = current_task_user()
             cls._tracked_child_pids.setdefault(driver_pid, set())
+
+    @classmethod
+    def unregister_driver(cls, driver_pid: Optional[int]):
+        """已正常退出的代理进程及时注销，避免保留可能复用的 PID。"""
+        with cls._lock:
+            if driver_pid in cls._driver_owners and cls._driver_owners[driver_pid] == current_task_user():
+                cls._driver_owners.pop(driver_pid, None)
+                cls._active_driver_pids.discard(driver_pid)
+                cls._tracked_child_pids.pop(driver_pid, None)
 
     @classmethod
     def record_descendants(cls, driver_pid: Optional[int]) -> Set[int]:
@@ -71,6 +83,8 @@ class BrowserProcessManager:
             return set()
         descendants = cls._get_descendant_pids([driver_pid])
         with cls._lock:
+            if driver_pid in cls._driver_owners and cls._driver_owners[driver_pid] != current_task_user():
+                return set()
             if driver_pid in cls._tracked_child_pids:
                 cls._tracked_child_pids[driver_pid].update(descendants)
             else:
@@ -84,6 +98,10 @@ class BrowserProcessManager:
             return 0
 
         with cls._lock:
+            owner = cls._driver_owners.get(driver_pid)
+            if owner != current_task_user():
+                return 0
+            cls._driver_owners.pop(driver_pid, None)
             recorded_children = cls._tracked_child_pids.pop(driver_pid, set())
             cls._active_driver_pids.discard(driver_pid)
 
@@ -95,15 +113,20 @@ class BrowserProcessManager:
         return killed_count
 
     @classmethod
-    def cleanup_all(cls) -> int:
-        """全量清理：杀死所有登记过的 Driver 及其子进程，并针对专属参数进行孤儿进程二次扫描兜底。"""
+    def cleanup_all(cls, global_scope=False) -> int:
+        """用户任务仅清理自己的进程树；全局维护必须显式请求且调用方确保任务空闲。"""
+        scope = current_task_user()
+        if global_scope and scope is not None:
+            raise RuntimeError("用户范围不能执行全局进程清理")
         with cls._lock:
-            drivers = set(cls._active_driver_pids)
+            drivers = {pid for pid in cls._active_driver_pids
+                       if global_scope or cls._driver_owners.get(pid) == scope}
             all_known = set(drivers)
-            for c_set in cls._tracked_child_pids.values():
-                all_known.update(c_set)
-            cls._active_driver_pids.clear()
-            cls._tracked_child_pids.clear()
+            for pid in drivers:
+                all_known.update(cls._tracked_child_pids.pop(pid, set()))
+                cls._active_driver_pids.discard(pid)
+                cls._driver_owners.pop(pid, None)
+            other_users_active = bool(cls._active_driver_pids)
 
         # 1. 终止所有登记的进程及其子树
         if drivers:
@@ -113,7 +136,8 @@ class BrowserProcessManager:
         killed = cls._kill_pids(all_known)
 
         # 2. 针对本工具专属特征（如 shared_cache 路径、专用指纹参数）进行孤儿浏览器进程兜底清理
-        orphans = cls._find_orphan_browsers()
+        # 用户范围绝不扫描/终止其他用户的浏览器。全局维护仅在任务全空闲时开放。
+        orphans = cls._find_orphan_browsers() if scope is None and not other_users_active else set()
         if orphans:
             killed += cls._kill_pids(orphans)
 

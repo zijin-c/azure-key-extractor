@@ -21,6 +21,8 @@ Azure for Students — Academic Verification 表单填写
   7. 结果确认等待（最多 60s），若成功则放行提 Key；若超时则自动刷新页面重试！
 """
 
+from utils.task_scope import scoped_data_path
+
 import asyncio
 import logging
 import os
@@ -311,7 +313,7 @@ async def _fill_azure_profile_form(page: Page, ms_email: str, cb, diagnostics) -
 
             ss_dir = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "screenshots",
+                scoped_data_path("screenshots"),
             )
             os.makedirs(ss_dir, exist_ok=True)
             try:

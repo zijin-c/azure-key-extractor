@@ -9,6 +9,8 @@ Azure Education Software Key 提取模块
   5. 返回 dict {产品名: key}
 """
 
+from utils.task_scope import scoped_data_path
+
 import asyncio
 import base64
 import logging
@@ -767,7 +769,7 @@ async def _extract_key_from_panel(page: Page, product_name: str, cb: ProgressCal
                 _emit(cb, f"  🔘 再次触发 View Key 点击响应...")
 
     # 失败截图
-    ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
+    ss_dir = scoped_data_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots"))
     os.makedirs(ss_dir, exist_ok=True)
     slug = product_name.replace(" ", "_").replace("/", "_")[:30]
     try:
@@ -800,7 +802,7 @@ async def _close_panel(page: Page):
                     }
                 }
                 return false;
-            }""", list(config.PRODUCTS_TO_EXTRACT))
+            }""", list(config.get_products_to_extract()))
             if closed:
                 await asyncio.sleep(0.2)
                 return
@@ -1419,7 +1421,7 @@ async def extract_all_keys(
                             err_desc += f" [Transaction Id: {tx_id}]"
                         _emit(cb, f"  ❌ {err_desc}")
                         _emit(cb, "  💡 提示: 微软系统判定当前出口 IP 或账号环境存在异常（请检查代理纯净度或更换优质住宅代理）")
-                        ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
+                        ss_dir = scoped_data_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots"))
                         os.makedirs(ss_dir, exist_ok=True)
                         try:
                             await sw_page.screenshot(path=os.path.join(ss_dir, "risk_blocked.png"))
@@ -1548,7 +1550,7 @@ async def extract_all_keys(
                 pass
             return True
 
-        for product_name in config.PRODUCTS_TO_EXTRACT:
+        for product_name in config.get_products_to_extract():
             has_sw_dom = await _has_software_search(sw_page)
             if not has_sw_dom:
                 _emit(cb, "  ⚠️ 未检测到软件列表 DOM，尝试激活 Software 菜单或重新导航...")
@@ -1685,7 +1687,7 @@ async def extract_all_keys(
         raise
     except Exception as e:
         _emit(cb, f"  ❌ 提取 key 过程异常: {e}")
-        ss_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots")
+        ss_dir = scoped_data_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "screenshots"))
         os.makedirs(ss_dir, exist_ok=True)
         try:
             await sw_page.screenshot(path=os.path.join(ss_dir, "key_extract_error.png"))
@@ -1693,7 +1695,7 @@ async def extract_all_keys(
             pass
 
     success_count = len([k for k, v in keys.items() if v])
-    _emit(cb, f"  ℹ️  当前账号 key 提取流程结束（成功获取 {success_count}/{len(config.PRODUCTS_TO_EXTRACT)} 个产品 key），直接进入下一步")
+    _emit(cb, f"  ℹ️  当前账号 key 提取流程结束（成功获取 {success_count}/{len(config.get_products_to_extract())} 个产品 key），直接进入下一步")
 
     if updated_totp and ms_email:
         save_totp_cache(ms_email, updated_totp)

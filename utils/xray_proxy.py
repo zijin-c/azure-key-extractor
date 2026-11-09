@@ -179,8 +179,12 @@ class XrayProxyChain:
             except Exception:
                 try:
                     self._proc.kill()
+                    self._proc.wait(timeout=5)
                 except Exception:
                     pass
+            if self._proc.poll() is not None:
+                from utils.process_manager import BrowserProcessManager
+                BrowserProcessManager.unregister_driver(self._proc.pid)
             self._proc = None
         if self._cfg_path and os.path.exists(self._cfg_path):
             try:

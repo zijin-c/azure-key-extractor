@@ -5,9 +5,16 @@ from test_admin_stats import DatabaseTestCase
 from test_task_recovery import gui, batch
 from gui import auth
 from modules.pipeline import Account, KeyResult
+from utils.task_scope import task_scope
 
 
 class UserPolicyTests(DatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        scope = task_scope(self.alice)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+
     def set_policy(self, **overrides):
         data = {"user_id": self.alice, "require_proxy": False, "max_concurrency": 2}
         data.update(overrides)
@@ -190,12 +197,14 @@ class ExpandedIsolationTests(DatabaseTestCase):
             self.assertNotIn("user_id", session)
 
     def test_deleted_users_queued_tasks_are_not_recovered(self):
-        batch.BatchManager.init_task(f"user_{self.alice}", self.alice, [Account("one@example.invalid", "password")])
+        with task_scope(self.alice):
+            batch.BatchManager.init_task(f"user_{self.alice}", self.alice, [Account("one@example.invalid", "password")])
         auth.delete_user(self.alice)
         with patch.object(gui, "_run_batch_worker_impl") as worker:
             gui._run_batch_worker(f"user_{self.alice}")
             worker.assert_not_called()
-        self.assertIsNone(batch.BatchManager.get_active_task())
+        with task_scope(self.alice):
+            self.assertIsNone(batch.BatchManager.get_active_task())
 
     def test_private_pages_and_responses_cannot_be_reused_from_http_cache(self):
         client = self.client(self.alice)

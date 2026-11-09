@@ -276,7 +276,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
     {% if is_admin %}
     <a href="{{ url_for('admin_page') }}" style="font-size:.8rem;color:var(--accent);text-decoration:none;white-space:nowrap">管理后台</a>
     {% endif %}
-    <span id="mode-badge" class="idle">就绪</span>
+    <span id="mode-badge" class="idle">检查状态…</span>
     <span style="font-size:.8rem;color:var(--muted);padding:5px 10px;border:1px solid var(--border);border-radius:8px">👤 {{ username }}</span>
     <button onclick="openUserPanel()" title="个人设置" style="width:36px;height:36px;border:1px solid var(--border);background:var(--surface);border-radius:10px;font-size:1rem;cursor:pointer;color:var(--text);transition:all .2s">⚙️</button>
     <button id="theme-btn" onclick="toggleTheme()" title="切换主题">☀️</button>
@@ -368,7 +368,7 @@ tr:hover td{background:rgba(108,140,255,.04)}
 
       <div class="btn-row">
 
-        <button class="btn" id="btn-start" onclick="startTask()">▶ 开始提取</button>
+        <button class="btn" id="btn-start" onclick="startTask()" disabled>▶ 开始提取</button>
         <button class="btn" id="btn-stop" onclick="stopTask()" disabled>■ 停止</button>
       </div>
     </div>
@@ -484,6 +484,7 @@ const PRODUCTS      = _TPL.products;
 const PRODUCT_SHORT = _TPL.productShort;
 let evtSource=null, isRunning=false;
 let _startRequestActive=false;
+let _serverTaskStatus=null, _statusRequestId=0;
 let userPolicy=_TPL.policy;
 window.addEventListener('session-invalidated',()=>{if(evtSource)evtSource.close();_draft.clear();++_resultsGeneration;});
 
@@ -988,7 +989,7 @@ async function startTask(){
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
     const j=await r.json();
-    if(!j.ok){if(j.policy)applyPolicy(j.policy,true);showToast('启动失败: '+j.error,'err');return;}
+    if(!j.ok){if(j.policy)applyPolicy(j.policy,true);if(j.status)applyTaskStatus(j.status);showToast('启动失败: '+j.error,'err');return;}
     if(j.policy)applyPolicy(j.policy);
     const actualConcurrency=j.concurrency??concurrency;
     document.getElementById('concurrency-input').value=String(actualConcurrency);
@@ -999,16 +1000,17 @@ async function startTask(){
     if(_elapsedTimer)clearInterval(_elapsedTimer);
     _elapsedTimer=setInterval(updateElapsed,1000);
     clearLog();resetProductDots();
-    setRunning(true);connectSSE();
+    applyTaskStatus({running:true,busy:true,can_start:false,can_stop:true,state:'running',message:'当前账号的任务正在运行'});connectSSE();
     showToast(`任务已启动（${j.count} 个账号，${actualConcurrency} 并发）`,'ok');
   }catch(e){showToast('启动失败: '+e.message,'err');}
-  finally{_startRequestActive=false;startButton.disabled=isRunning;}
+  finally{_startRequestActive=false;startButton.disabled=_serverTaskStatus?.can_start!==true;}
 }
 
 async function stopTask(){
   await fetch('/api/stop',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({sid:SID})});
   showToast('停止指令已发送','warn');
+  await syncStatus();
 }
 
 function setRunning(v){
@@ -1036,6 +1038,25 @@ function setRunning(v){
   }
 }
 let _resultPollTimer=null;
+
+function applyTaskStatus(status){
+  ++_statusRequestId;
+  const busy=status.busy??status.running;
+  const canStart=status.can_start??!busy;
+  _serverTaskStatus={...status,busy,can_start:canStart};
+  setRunning(!!status.running);
+  document.getElementById('btn-start').disabled=_startRequestActive||!canStart;
+  document.getElementById('btn-stop').disabled=!(status.can_stop??status.running);
+  const names={idle:'就绪',running:'运行中',cleaning:'清理中',restarting:'重启中',batch_restarting:'批次重启中',recovering:'恢复中',occupied:'服务器忙碌',recovery_required:'任务待恢复',failed:'上次任务异常'};
+  const badge=document.getElementById('mode-badge');
+  badge.textContent=names[status.state]||(busy?'运行中':'就绪');
+  badge.title=status.message||'';
+  badge.className=busy?'running':'idle';
+  const text=document.getElementById('status-text');
+  text.textContent=status.message||(busy?'任务运行中':'就绪');
+  text.title=text.textContent;
+  if(status.state&&status.state!=='running')document.getElementById('progress-section').style.display='none';
+}
 
 function resetProductDots(){
   PRODUCTS.forEach((_,i)=>{
@@ -1112,15 +1133,18 @@ function onTaskDone(){
   const pending={generation,promise:null};
   pending.promise=(async()=>{
     try{
-      setRunning(false);
       const rows=await refreshCurrentResults();
       if(generation!==_resultsGeneration || !rows.length)return;
       if(_totalAccounts>0)updateProgress(_totalAccounts,_totalAccounts);
       document.getElementById('progress-section').style.display='none';
       const ok=rows.filter(r=>r.success).length;
       showToast(`任务完成: ${ok} 成功 / ${rows.length-ok} 失败`,ok===rows.length?'ok':'info',5000);
-      document.getElementById('mode-badge').className='done';
-      document.getElementById('mode-badge').textContent='已完成';
+      const status=await syncStatus();
+      if(generation!==_resultsGeneration)return;
+      if(status&&_serverTaskStatus?.can_start){
+        document.getElementById('mode-badge').className='done';
+        document.getElementById('mode-badge').textContent='已完成';
+      }
     }finally{if(_taskDonePromise===pending)_taskDonePromise=null;}
   })();
   _taskDonePromise=pending;
@@ -1288,8 +1312,24 @@ async function changeMyPassword(){
 }
 
 async function syncStatus(){
-  const s=await fetch('/api/status?sid='+SID).then(r=>r.json()).catch(()=>null);
-  if(s&&s.running!==isRunning)setRunning(s.running);
+  if(_startRequestActive)return null;
+  const requestId=++_statusRequestId;
+  try{
+    const response=await fetch('/api/status?sid='+SID,{cache:'no-store'});
+    if(!response.ok)throw new Error('读取任务状态失败');
+    const status=await response.json();
+    if(requestId!==_statusRequestId||_startRequestActive)return null;
+    applyTaskStatus(status);
+    return status;
+  }catch(e){
+    if(requestId===_statusRequestId&&!_startRequestActive){
+      _serverTaskStatus=null;
+      document.getElementById('btn-start').disabled=true;
+      document.getElementById('mode-badge').textContent='连接中…';
+      document.getElementById('status-text').textContent='暂时无法获取服务器状态，正在重试';
+    }
+    return null;
+  }
 }
 setInterval(syncStatus,3000);
 </script>

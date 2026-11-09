@@ -11,6 +11,7 @@ from gui import auth
 from modules import batch_manager as batch
 from modules.pipeline import Account, KeyResult
 from utils.session_secret import load_session_secret
+from utils.task_scope import task_scope
 
 
 with patch.object(auth, "init_db"), patch("utils.session_secret.load_session_secret", return_value="synthetic-session-secret-for-tests-123456"), patch("threading.Thread.start"):
@@ -41,6 +42,12 @@ class TaskRecoveryTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         gui._sessions.clear()
+        scope = task_scope(999)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        p = patch.object(gui, "_startup_recovery_pending", False)
+        p.start()
+        self.addCleanup(p.stop)
         p = patch.object(gui, "get_history", return_value=[])
         p.start()
         self.addCleanup(p.stop)
@@ -97,7 +104,7 @@ class TaskRecoveryTests(unittest.TestCase):
         self.assertFalse(gui._get_sess("user_999").running)
         self.assertFalse(batch.BatchManager.is_running())
 
-    def test_simultaneous_start_requests_only_create_one_task(self):
+    def test_simultaneous_different_users_each_create_their_own_task(self):
         def start(user):
             client = gui.app.test_client()
             with client.session_transaction() as session:
@@ -107,6 +114,19 @@ class TaskRecoveryTests(unittest.TestCase):
         with patch.object(gui, "threading", SimpleNamespace(Thread=thread)):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 statuses = list(executor.map(start, (991, 992)))
+        self.assertEqual(statuses, [200, 200])
+        self.assertEqual(thread.call_count, 2)
+
+    def test_simultaneous_same_user_still_creates_only_one_task(self):
+        def start(_):
+            client = gui.app.test_client()
+            with client.session_transaction() as session:
+                session.update(user_id=999, sid="user_999")
+            return client.post("/api/start", json={"accounts": "synthetic@example.invalid dummy"}).status_code
+        thread = MagicMock()
+        with patch.object(gui, "threading", SimpleNamespace(Thread=thread)):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                statuses = list(executor.map(start, range(2)))
         self.assertEqual(sorted(statuses), [200, 400])
         thread.assert_called_once()
 

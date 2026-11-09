@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def get_products_to_extract():
+    from utils.task_scope import current_task_products
+    products = current_task_products()
+    return list(products) if products is not None else list(PRODUCTS_TO_EXTRACT)
+
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
 # ── 浏览器 ───────────────────────────────────────────────────

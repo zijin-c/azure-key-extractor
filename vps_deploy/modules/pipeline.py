@@ -39,6 +39,7 @@ from utils.xray_proxy import XrayProxyChain
 from utils.captcha_detector import check_captcha_present
 from utils.process_manager import BrowserProcessManager, get_playwright_driver_pid, safe_close_playwright
 from utils.totp_cache import save_totp_cache, get_cached_totp
+from utils.task_scope import scoped_data_path
 
 log = logging.getLogger(__name__)
 ProgressCallback = Optional[Callable[[str], None]]
@@ -124,9 +125,9 @@ def _emit_traffic_summary(stats, proxy_obj, cb: ProgressCallback):
 
 def _persist_result(result: KeyResult):
     """追加写入 JSONL 结果文件（含密码，方便后续重新导出）。"""
-    fpath = os.path.join(_RESULTS_DIR, f"keys_{datetime.now().strftime('%Y%m%d')}.jsonl")
+    fpath = os.path.join(scoped_data_path(_RESULTS_DIR), f"keys_{datetime.now().strftime('%Y%m%d')}.jsonl")
     try:
-        os.makedirs(_RESULTS_DIR, exist_ok=True)
+        os.makedirs(scoped_data_path(_RESULTS_DIR), exist_ok=True)
         entry = {
             "ts":          result.ts,
             "email":       result.account.email,
@@ -587,13 +588,13 @@ async def process_account(
                 save_totp_cache(account.email, totp_secret)
             got_keys = {k: v for k, v in keys.items() if v}
             failed_keys = [k for k, v in keys.items() if not v]
-            _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key")
+            _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.get_products_to_extract())} 个 key")
             for prod, key in got_keys.items():
                 _emit(cb, f"    ✅ {prod[:40]}: {key}")
             for prod in failed_keys:
                 _emit(cb, f"    ❌ {prod[:40]}: 未获取")
             success = len(got_keys) > 0
-            msg = f"获取 {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key"
+            msg = f"获取 {len(got_keys)}/{len(config.get_products_to_extract())} 个 key"
             if failed_keys:
                 msg += f"，失败: {', '.join(p[:20] for p in failed_keys)}"
             result = KeyResult(account=account, success=success,
@@ -867,13 +868,13 @@ async def process_account(
                 _emit(cb, f"  💾 成功捕获并保存 2FA 密钥: {totp_secret}")
             got_keys = {k: v for k, v in keys.items() if v}
             failed_keys = [k for k, v in keys.items() if not v]
-            _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key")
+            _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.get_products_to_extract())} 个 key")
             for prod, key in got_keys.items():
                 _emit(cb, f"    ✅ {prod[:40]}: {key}")
             for prod in failed_keys:
                 _emit(cb, f"    ❌ {prod[:40]}: 未获取")
             success = len(got_keys) > 0
-            msg = f"获取 {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key"
+            msg = f"获取 {len(got_keys)}/{len(config.get_products_to_extract())} 个 key"
             if failed_keys:
                 msg += f"，失败: {', '.join(p[:20] for p in failed_keys)}"
             result = KeyResult(account=account, success=success,
@@ -901,14 +902,14 @@ async def process_account(
         got_keys = {k: v for k, v in keys.items() if v}
         failed_keys = [k for k, v in keys.items() if not v]
 
-        _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key")
+        _emit(cb, f"\n  📊 提取结果: {len(got_keys)}/{len(config.get_products_to_extract())} 个 key")
         for prod, key in got_keys.items():
             _emit(cb, f"    ✅ {prod[:40]}: {key}")
         for prod in failed_keys:
             _emit(cb, f"    ❌ {prod[:40]}: 未获取")
 
         success = len(got_keys) > 0
-        msg = f"获取 {len(got_keys)}/{len(config.PRODUCTS_TO_EXTRACT)} 个 key"
+        msg = f"获取 {len(got_keys)}/{len(config.get_products_to_extract())} 个 key"
         if failed_keys:
             msg += f"，失败: {', '.join(p[:20] for p in failed_keys)}"
 

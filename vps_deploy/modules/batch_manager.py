@@ -1,13 +1,7 @@
-"""
-批次任务管理器与服务自动重启控制
-------------------------------------
-核心机制:
-1. 账号按批次执行 (默认 15 个为一批次)。
-2. 每完成一批次，将未处理账号与已完成结果持久化至本地 JSON 文件，
-   随后触发程序强制重启（等同于在服务器上执行 `systemctl restart azure-key`），彻底杀死残留浏览器和驱动，释放全部系统内存。
-3. 重启后服务自动唤醒并检测待处理任务，无缝继续执行下一批次。
-4. 全部批次完成时，自动汇总导出完整 Excel，并执行最终强制重启以彻底清理残留。
-5. 最终重启后处于完全就绪的空闲状态，杜绝任何死循环。
+"""按用户持久化网页任务与批次进度。
+
+网页请求和任务线程通过 task_scope 选择 data/tasks/user_<id>.json。
+CLI 保留旧单文件路径。网页批次只做用户范围清理，不重启整个服务。
 """
 
 import os
@@ -25,6 +19,7 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from modules.pipeline import Account, KeyResult
 from utils.process_manager import BrowserProcessManager
+from utils.task_scope import current_task_user, task_scope
 
 log = logging.getLogger(__name__)
 _QUEUE_LOCK = threading.RLock()
@@ -88,20 +83,64 @@ def _dict_to_result(d: dict) -> KeyResult:
 
 
 class BatchManager:
-    """管理多批次任务持久化与服务自动重启调度器。"""
+    """管理用户队列持久化、批次推进与旧队列迁移。"""
+
+    @classmethod
+    def _queue_path(cls):
+        user_id = current_task_user()
+        if user_id is None:
+            return _QUEUE_FILE
+        return os.path.join(os.path.dirname(_QUEUE_FILE), "tasks", f"user_{user_id}.json")
+
+    @classmethod
+    @_locked_queue
+    def migrate_legacy_task(cls):
+        """升级时迁移旧单队列，不覆盖已经存在的用户队列。"""
+        if not os.path.isfile(_QUEUE_FILE):
+            return
+        with open(_QUEUE_FILE, encoding="utf-8") as file:
+            task = json.load(file)
+        user_id = task.get("user_id")
+        if type(user_id) is not int or user_id <= 0 or task.get("sid") != f"user_{user_id}":
+            raise ValueError("旧任务缺少有效归属，无法自动恢复")
+        with task_scope(user_id):
+            if not os.path.exists(cls._queue_path()):
+                cls._save_task_data(task)
+        os.replace(_QUEUE_FILE, _QUEUE_FILE + ".legacy")
+
+    @classmethod
+    @_locked_queue
+    def list_user_tasks(cls):
+        root = os.path.join(os.path.dirname(_QUEUE_FILE), "tasks")
+        if not os.path.isdir(root):
+            return []
+        tasks = []
+        for name in os.listdir(root):
+            if not name.startswith("user_") or not name.endswith(".json"):
+                continue
+            try:
+                user_id = int(name[5:-5])
+                with task_scope(user_id):
+                    task = cls.get_active_task()
+                if task and task.get("user_id") == user_id and task.get("sid") == f"user_{user_id}":
+                    tasks.append(task)
+            except (ValueError, OSError):
+                log.exception("无法读取用户队列 %s", name)
+        return tasks
 
     @classmethod
     @_locked_queue
     def _save_task_data(cls, data: dict):
         """原子写入任务队列文件，避免突然被终止时数据损坏。"""
-        os.makedirs(os.path.dirname(_QUEUE_FILE), exist_ok=True)
-        fd, tmp_file = tempfile.mkstemp(dir=os.path.dirname(_QUEUE_FILE), prefix=".task-")
+        queue_path = cls._queue_path()
+        os.makedirs(os.path.dirname(queue_path), exist_ok=True)
+        fd, tmp_file = tempfile.mkstemp(dir=os.path.dirname(queue_path), prefix=".task-")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_file, _QUEUE_FILE)
+            os.replace(tmp_file, queue_path)
         except Exception:
             log.exception("保存任务状态文件失败")
             raise
@@ -113,11 +152,16 @@ class BatchManager:
     @_locked_queue
     def get_active_task(cls) -> Optional[dict]:
         """读取当前正在进行的任务配置与状态。"""
-        if not os.path.exists(_QUEUE_FILE):
+        queue_path = cls._queue_path()
+        if not os.path.exists(queue_path):
             return None
         try:
-            with open(_QUEUE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(queue_path, "r", encoding="utf-8") as f:
+                task = json.load(f)
+            user_id = current_task_user()
+            if user_id is not None and (task.get("user_id") != user_id or task.get("sid") != f"user_{user_id}"):
+                raise ValueError("队列归属不匹配")
+            return task
         except Exception as e:
             log.warning(f"读取任务状态文件失败: {e}")
             return None
@@ -138,6 +182,9 @@ class BatchManager:
         batch_size: int = 0,
     ) -> dict:
         """初始化任务并持久化。"""
+        owner = current_task_user()
+        if owner is not None and (user_id != owner or sid != f"user_{owner}"):
+            raise ValueError("不能向其他用户的队列写入任务")
         total_accounts = len(accounts)
         if batch_size and int(batch_size) > 0:
             batch_size = int(batch_size)
@@ -252,6 +299,17 @@ class BatchManager:
 
     @classmethod
     @_locked_queue
+    def mark_failed(cls, sid: str):
+        """只释放指定任务的运行标记，保留已完成结果供导出/排查。"""
+        task = cls.get_active_task()
+        if task and task.get("sid") == sid and task.get("status") in (
+                "running", "batch_restarting", "all_done_restarting"):
+            task["status"] = "failed"
+            task["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cls._save_task_data(task)
+
+    @classmethod
+    @_locked_queue
     def stop_task(cls):
         """用户中止任务：清理/置停任务状态。"""
         task = cls.get_active_task()
@@ -265,9 +323,10 @@ class BatchManager:
     @_locked_queue
     def clear_task(cls):
         """彻底移除任务文件。"""
-        if os.path.exists(_QUEUE_FILE):
+        queue_path = cls._queue_path()
+        if os.path.exists(queue_path):
             try:
-                os.remove(_QUEUE_FILE)
+                os.remove(queue_path)
             except Exception as e:
                 log.warning(f"清除任务状态文件失败: {e}")
 
@@ -309,6 +368,8 @@ class BatchManager:
            若有守护进程 (Restart=always)，退出进程由 systemd 重新拉起；
            若在普通终端或 Windows 下，启动全新 Python 实例后退出当前进程。
         """
+        if current_task_user() is not None:
+            raise RuntimeError("用户任务不能重启整个服务，请使用用户范围清理")
         log.info("准备执行服务强制重启...")
         try:
             BrowserProcessManager.cleanup_all()

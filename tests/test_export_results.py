@@ -35,6 +35,8 @@ class ExportResultsTests(DatabaseTestCase):
         self.start_requests = []
         self.history_requests = []
         self.history_error = False
+        self.status = {"running": False, "results": len(self.rows), "busy": False, "can_start": True,
+                       "can_stop": False, "state": "idle", "message": "就绪"}
         self.result_requests = 0
         self.html = self.client(self.alice).get("/").get_data(as_text=True)
         self.pw = sync_playwright().start()
@@ -82,7 +84,7 @@ class ExportResultsTests(DatabaseTestCase):
         data = {"/api/results": self.rows,
                 "/api/settings": {"ok": True, "settings": {}, "policy": self.policy},
                 "/api/policy": {"ok": True, "policy": self.policy},
-                "/api/status": {"running": False, "results": len(self.rows)},
+                "/api/status": self.status,
                 "/api/start": self.start_response}.get(url.path, {"ok": True})
         return route.fulfill(body=json.dumps(data), content_type="application/json")
 
@@ -286,3 +288,44 @@ class ExportResultsTests(DatabaseTestCase):
         self.assertEqual(len(self.current()), 2)
         self.page.evaluate("exportExcel('success',document.querySelector('.tbl-actions button'))")
         self.assertEqual(self.page.evaluate('window.__exports.length'), 0)
+
+    def test_completion_log_does_not_show_ready_before_server_cleanup_finishes(self):
+        self.status = {'running':True,'busy':True,'can_start':False,'can_stop':False,'state':'cleaning','message':'任务正在收尾清理，完成后可启动'}
+        self.page.evaluate('onTaskDone()')
+        self.assertEqual(self.page.locator('#mode-badge').inner_text(),'清理中')
+        self.assertTrue(self.page.locator('#btn-start').is_disabled())
+        self.assertTrue(self.page.locator('#btn-stop').is_disabled())
+        self.assertFalse(self.page.locator('#progress-section').is_visible())
+        self.status = {**self.status,'running':False,'busy':False,'can_start':True,'state':'idle','message':'就绪'}
+        self.page.evaluate('syncStatus()')
+        self.assertTrue(self.page.locator('#btn-start').is_enabled())
+
+    def test_recovery_state_offers_stop_and_shows_actual_busy_reason(self):
+        self.status = {'running':True,'busy':True,'can_start':False,'can_stop':True,'state':'recovery_required','message':'发现未恢复的任务记录，可停止旧任务后重新启动'}
+        self.page.evaluate('syncStatus()')
+        self.assertEqual(self.page.locator('#mode-badge').inner_text(),'任务待恢复')
+        self.assertTrue(self.page.locator('#btn-start').is_disabled())
+        self.assertTrue(self.page.locator('#btn-stop').is_enabled())
+
+    def test_late_idle_response_cannot_reenable_start_for_new_running_task(self):
+        self.page.locator('#accounts').fill('new@example.invalid synthetic-password')
+        self.page.evaluate("""async()=>{
+          const original=window.fetch;let release;
+          window.fetch=(url,options)=>String(url).startsWith('/api/status')
+            ?new Promise(resolve=>{release=()=>resolve(new Response(JSON.stringify({running:false,busy:false,can_start:true,state:'idle'}),{status:200}));})
+            :original(url,options);
+          const check=syncStatus();await startTask();release();await check;
+        }""")
+        self.assertTrue(self.page.locator('#btn-start').is_disabled())
+        self.assertEqual(self.page.locator('#mode-badge').inner_text(),'运行中')
+
+    def test_unreachable_status_disables_start_until_reconnected(self):
+        self.page.evaluate("""async()=>{
+          const original=window.fetch;
+          window.fetch=(url,options)=>String(url).startsWith('/api/status')?Promise.reject(new Error('offline')):original(url,options);
+          await syncStatus();window.fetch=original;
+        }""")
+        self.assertTrue(self.page.locator('#btn-start').is_disabled())
+        self.assertEqual(self.page.locator('#mode-badge').inner_text(),'连接中…')
+        self.page.evaluate('syncStatus()')
+        self.assertTrue(self.page.locator('#btn-start').is_enabled())

@@ -11,6 +11,7 @@ import sys
 import threading
 import uuid
 import concurrent.futures
+from contextvars import copy_context
 from functools import wraps
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import requests as _requests
-from flask import Flask, Response, abort, jsonify, render_template, request, session, stream_with_context, send_file, redirect, url_for
+from flask import Flask, Response, abort, g, jsonify, render_template, request, session, stream_with_context, send_file, redirect, url_for
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -29,6 +30,7 @@ from utils.xray_proxy import XrayProxyChain
 from utils.process_manager import BrowserProcessManager, release_system_memory
 from utils.session_secret import load_session_secret
 from utils.totp_cache import totp_cache_scope, get_cached_totp, save_totp_cache
+from utils.task_scope import current_task_user, task_scope, system_task_scope
 from gui.auth import (
     init_db, create_user, verify_user, login_required, admin_required,
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
@@ -36,6 +38,7 @@ from gui.auth import (
     save_user_setting, get_user_settings, get_admin_stats,
     user_exists, get_user_policy, save_user_policy,
     get_admin_user_identity, get_admin_user_details,
+    close_db,
 )
 
 if getattr(sys, 'frozen', False):
@@ -47,6 +50,7 @@ app = Flask(__name__, template_folder=_tmpl_dir)
 app.secret_key = load_session_secret()
 _task_start_lock = threading.Lock()
 _maintenance_pending = False
+_startup_recovery_pending = True
 
 # 初始化数据库
 with app.app_context():
@@ -55,43 +59,43 @@ with app.app_context():
 
 def _startup_check_batch():
     """服务启动时检查是否有未完成的批次任务需要恢复，或刚完成所有任务后的最终清理。"""
+    global _startup_recovery_pending
     import time
     time.sleep(2.5)  # 等待 Flask 监听端口与完全就绪
     try:
-        task_info = BatchManager.get_active_task()
-        if not task_info:
-            return
-        status = task_info.get("status")
-        sid = task_info.get("sid", "")
-        if status in ("running", "batch_restarting"):
-            curr_b = task_info.get("current_batch_index", 0)
-            total_b = task_info.get("total_batches", 1)
-            total_accs = task_info.get("total_accounts", 0)
-            _push_log(sid, f"{'═'*50}")
-            _push_log(sid, f"✅ 服务已重启就绪！系统内存与所有残留进程已彻底清空。")
-            _push_log(sid, f"🚀 自动继续执行第 {curr_b + 1}/{total_b} 批次账号 (总计 {total_accs} 个)...")
-            _push_log(sid, f"{'═'*50}")
+        try:
+            BatchManager.migrate_legacy_task()
+        except Exception:
+            app.logger.exception("旧任务迁移失败，保留原文件供排查；继续恢复其他用户任务")
+        for task_info in BatchManager.list_user_tasks():
+            user_id = task_info["user_id"]
+            sid = task_info["sid"]
+            with task_scope(user_id):
+                status = task_info.get("status")
+                if status in ("running", "batch_restarting"):
+                    with _task_start_lock:
+                        s = _get_sess(sid)
+                        if s.worker_active:
+                            continue
+                        s.running = s.worker_active = True
+                        s.results = BatchManager.get_all_results()
+                        _push_log(sid, "🚀 服务已重启，正在独立恢复当前用户的任务…")
+                        try:
+                            threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
+                        except Exception:
+                            s.running = s.worker_active = False
+                            BatchManager.mark_failed(sid)
+                            app.logger.exception("恢复用户任务失败")
+                elif status == "all_done_restarting":
+                    _get_sess(sid).results = BatchManager.get_all_results()
+                    BatchManager.mark_all_done(restarting=False)
+                    _push_log(sid, "✅ 上次任务已完成，结果已恢复")
 
-            # 恢复 session 状态与已完成结果
-            s = _get_sess(sid)
-            with _task_start_lock:
-                s.running = True
-                s.worker_active = True
-                s.results = BatchManager.get_all_results()
-                try:
-                    threading.Thread(target=_run_batch_worker, args=(sid,), daemon=True).start()
-                except Exception:
-                    s.running = s.worker_active = False
-                    raise
-        elif status == "all_done_restarting":
-            if sid:
-                _push_log(sid, f"{'═'*50}")
-                _push_log(sid, f"✨ 服务已完成最终重启清理，当前处于纯净就绪空闲状态。")
-                _push_log(sid, f"{'═'*50}")
-            BatchManager.clear_task()
-            release_system_memory()
     except Exception as e:
         print(f"⚠️  启动恢复检查异常: {e}")
+    finally:
+        with _task_start_lock:
+            _startup_recovery_pending = False
 
 
 threading.Thread(target=_startup_check_batch, daemon=True).start()
@@ -103,7 +107,9 @@ def _periodic_memory_trim():
     while True:
         time.sleep(300)
         try:
-            if not BatchManager.is_running():
+            with _task_start_lock:
+                idle = not _any_task_busy()
+            if idle:
                 release_system_memory()
         except Exception:
             pass
@@ -125,12 +131,14 @@ class _Sess:
 
 
 _sessions: dict[str, _Sess] = {}
+_sessions_lock = threading.Lock()
 
 
 def _get_sess(sid: str) -> _Sess:
-    if sid not in _sessions:
-        _sessions[sid] = _Sess()
-    return _sessions[sid]
+    with _sessions_lock:
+        if sid not in _sessions:
+            _sessions[sid] = _Sess()
+        return _sessions[sid]
 
 
 def _push_log(sid: str, msg: str):
@@ -166,6 +174,8 @@ def _ensure_sid():
         expected_user = request.headers.get("X-User-ID")
         if expected_user is not None and expected_user != str(session["user_id"]):
             return jsonify({"ok": False, "error": "登录账号已切换，请刷新页面", "need_reload": True}), 409
+        g.task_context = task_scope(session["user_id"])
+        g.task_context.__enter__()
         if request.endpoint in {"api_status", "api_start", "api_stop", "api_restart", "api_cleanup", "api_results", "api_export", "stream"}:
             data = request.get_json(silent=True)
             supplied = request.args.getlist("sid")
@@ -182,6 +192,13 @@ def _private_response(response):
     if request.endpoint != "static":
         response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.teardown_request
+def _release_task_context(error):
+    context = g.pop("task_context", None)
+    if context is not None:
+        context.__exit__(None, None, None)
 
 
 def _validated_proxy_pool(proxy_input):
@@ -214,8 +231,53 @@ def _owns_task(task):
 
 def _task_busy():
     task = BatchManager.get_active_task()
-    return (_maintenance_pending or any(s.running or s.worker_active for s in _sessions.values())
+    sid = f"user_{current_task_user()}"
+    current = _sessions.get(sid)
+    return (_startup_recovery_pending or _maintenance_pending or bool(current and (current.running or current.worker_active))
             or bool(task and task.get("status") in ("running", "batch_restarting", "all_done_restarting")))
+
+
+def _any_task_busy():
+    return (any(s.running or s.worker_active for s in list(_sessions.values()))
+            or any(task.get("status") in ("running", "batch_restarting", "all_done_restarting")
+                   for task in BatchManager.list_user_tasks()))
+
+
+def _task_status():
+    """调用方持有启动锁；仅返回占用原因，不暴露其他用户的任务内容。"""
+    sid = session["sid"]
+    current = _get_sess(sid)
+    task = BatchManager.get_active_task()
+    owned = _owns_task(task)
+    own_active = current.running or current.worker_active
+    task_state = task.get("status") if task else None
+    queue_busy = task_state in ("running", "batch_restarting", "all_done_restarting")
+    busy = bool(_startup_recovery_pending or _maintenance_pending or own_active or queue_busy)
+    can_stop = bool(owned and queue_busy and not _maintenance_pending
+                    and not _startup_recovery_pending)
+    if _startup_recovery_pending:
+        state, message = "recovering", "服务正在检查并恢复任务，请稍候"
+    elif _maintenance_pending:
+        state, message = "restarting", "服务正在重启，请稍候"
+    elif task_state == "all_done_restarting":
+        state, message = "cleaning", "上次任务正在恢复收尾，请稍候，或停止旧任务后重新启动"
+    elif task_state == "batch_restarting":
+        state, message = "batch_restarting", "正在恢复当前用户的后续批次，请稍候"
+    elif own_active:
+        if not current.running or task_state not in ("running", "batch_restarting"):
+            state, message = "cleaning", "任务正在收尾清理，完成后可启动"
+        else:
+            state, message = "running", "当前账号的任务正在运行"
+    elif queue_busy:
+        state, message = "recovery_required", "发现未恢复的任务记录；可停止旧任务后重新启动，或检查服务日志"
+    elif owned and task_state == "failed":
+        state, message = "failed", "上次任务异常退出，已释放占用；可重新启动，详情见日志"
+    else:
+        state, message = "idle", "就绪"
+    return {"running": bool(own_active or owned and queue_busy),
+            "results": len(current.results) if current.results else (BatchManager.get_completed_count() if owned else 0),
+            "busy": busy, "can_start": not busy, "can_stop": can_stop,
+            "state": state, "message": message}
 
 
 def _own_results():
@@ -234,12 +296,13 @@ def _control_guard(admin_only=False):
             with _task_start_lock:
                 if admin_only and not is_user_admin(session["user_id"]):
                     return jsonify({"ok": False, "error": "仅管理员可以执行服务维护"}), 403
-                if _maintenance_pending:
+                if _maintenance_pending or _startup_recovery_pending:
                     return jsonify({"ok": False, "error": "服务正在重启"}), 409
-                task = BatchManager.get_active_task()
-                if _task_busy() and (not _owns_task(task) or any(
-                        sid != session["sid"] and (s.running or s.worker_active) for sid, s in _sessions.items())):
-                    return jsonify({"ok": False, "error": "其他用户的任务正在运行或清理中"}), 403
+                if admin_only:
+                    if _any_task_busy():
+                        return jsonify({"ok": False, "error": "仍有用户任务运行或清理中，不能执行全局维护"}), 403
+                    with system_task_scope():
+                        return function(*args, **kwargs)
                 return function(*args, **kwargs)
         return wrapped
     return decorate
@@ -490,13 +553,8 @@ def index():
 @app.route("/api/status")
 @login_required
 def api_status():
-    sid = session["sid"]
-    s = _get_sess(sid)
     with _task_start_lock:
-        owned = _owns_task(BatchManager.get_active_task())
-        is_running = s.running or s.worker_active or (owned and BatchManager.is_running())
-        results_count = len(s.results) if s.results else (BatchManager.get_completed_count() if owned else 0)
-    return jsonify({"running": is_running, "results": results_count})
+        return jsonify(_task_status())
 
 
 @app.route("/api/start", methods=["POST"])
@@ -510,7 +568,8 @@ def api_start():
 
     with _task_start_lock:
         if _task_busy():
-            return jsonify({"ok": False, "error": "已有任务在运行中或在批次重启过渡中"}), 400
+            status = _task_status()
+            return jsonify({"ok": False, "error": status["message"], "status": status}), 400
 
         raw_accounts = data.get("accounts", "").strip()
         headless     = data.get("headless", False)
@@ -648,7 +707,7 @@ def api_check_proxy():
 
     max_workers = min(len(proxy_list), policy["max_concurrency"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_check_one, (i, p)) for i, p in enumerate(proxy_list)]
+        futures = [executor.submit(copy_context().run, _check_one, (i, p)) for i, p in enumerate(proxy_list)]
         for f in concurrent.futures.as_completed(futures):
             idx, p_url, ip, err = f.result()
             results_map[idx] = (ip, err)
@@ -676,7 +735,7 @@ def api_stop():
     s    = _get_sess(sid)
     if not _owns_task(BatchManager.get_active_task()):
         return jsonify({"ok": True, "killed": 0})
-    if not s.running and not s.worker_active and not BatchManager.is_running():
+    if not s.running and not s.worker_active and not BatchManager.is_running() and BatchManager.get_active_task().get("status") != "all_done_restarting":
         return jsonify({"ok": True, "killed": 0})
     s.running = False
     BatchManager.stop_task()
@@ -725,7 +784,7 @@ def api_restart():
 def api_cleanup():
     """立即深度清理所有残留浏览器与驱动进程并回收内存。"""
     sid  = session["sid"]
-    killed = BrowserProcessManager.cleanup_all()
+    killed = BrowserProcessManager.cleanup_all(global_scope=True)
     release_system_memory()
     if sid:
         _push_log(sid, f"🧹 已彻底清理所有残留进程 (清理 {killed} 个进程) 并归还系统内存")
@@ -920,33 +979,49 @@ def _parse_accounts(raw: str) -> list[Account]:
 
 # ── 后台任务 (多批次运行与自动重启控制) ─────────────────────────
 def _run_batch_worker(sid: str):
+    match = re.fullmatch(r"user_([1-9]\d*)", sid)
+    if not match:
+        return
+    user_id = int(match.group(1))
     s = _get_sess(sid)
-    s.worker_active = True
-    try:
-        task = BatchManager.get_active_task()
-        if not task or task.get("sid") != sid or not task.get("user_id"):
-            s.running = False
-            return
-        if not user_exists(task["user_id"]):
-            _push_log(sid, "⚠️ 用户已删除，任务不再恢复")
-            BatchManager.stop_task()
-            return
-        with totp_cache_scope(task["user_id"]):
+    with task_scope(user_id):
+        s.worker_active = True
+        try:
+            task = BatchManager.get_active_task()
+            if not task or task.get("sid") != sid or task.get("user_id") != user_id:
+                s.running = False
+                return
+            if not user_exists(user_id):
+                _push_log(sid, "⚠️ 用户已删除，任务不再恢复")
+                BatchManager.stop_task()
+                return
+            with task_scope(user_id, task.get("selected_products") or PRODUCT_COLUMNS), totp_cache_scope(user_id):
+                try:
+                    for row in get_history(user_id):
+                        email, secret = row.get("email"), row.get("totp_secret")
+                        if email and secret and not get_cached_totp(email):
+                            save_totp_cache(email, secret)
+                except Exception:
+                    app.logger.warning("用户 2FA 历史缓存补充失败，将使用用户输入及专属缓存")
+                return _run_batch_worker_impl(sid)
+        except Exception:
+            app.logger.exception("后台任务异常退出")
+            _push_log(sid, "❌ 后台任务异常退出，已释放占用，请检查服务日志后重新启动")
+            with _task_start_lock:
+                BatchManager.mark_failed(sid)
+        finally:
             try:
-                for row in get_history(task["user_id"]):
-                    email, secret = row.get("email"), row.get("totp_secret")
-                    if email and secret and not get_cached_totp(email):
-                        save_totp_cache(email, secret)
-            except Exception:
-                app.logger.warning("用户 2FA 历史缓存补充失败，将使用用户输入及专属缓存")
-            return _run_batch_worker_impl(sid)
-    finally:
-        with _task_start_lock:
-            s.running = False
-            s.worker_active = False
+                BrowserProcessManager.cleanup_all()
+            finally:
+                with _task_start_lock:
+                    s.running = False
+                    s.worker_active = False
+                close_db()
 
 
 def _run_batch_worker_impl(sid: str):
+    if current_task_user() is None or sid != f"user_{current_task_user()}":
+        raise ValueError("用户任务必须在自己的范围内运行")
     s  = _get_sess(sid)
     pl = lambda msg: _push_log(sid, msg)
 
@@ -964,12 +1039,6 @@ def _run_batch_worker_impl(sid: str):
     user_id = task.get("user_id")
     concurrency = int(task.get("concurrency", 3))
     mode = task.get("mode", "azure_student")
-
-    # 动态设置要提取的产品列表
-    if selected_products and len(selected_products) > 0:
-        config.PRODUCTS_TO_EXTRACT = selected_products
-    else:
-        config.PRODUCTS_TO_EXTRACT = PRODUCT_COLUMNS.copy()
 
     _proxy_label = (
         f"VLESS链式" if vless_proxy else ('代理池模式' if proxy else '直连')
@@ -1005,7 +1074,7 @@ def _run_batch_worker_impl(sid: str):
             else:
                 pl(f"📦 启动任务  总账号数={total_accs}")
             pl(f"⚡ 运行模式={_mode_label}  并发进程={concurrency}  代理={_proxy_label}")
-            pl(f"📦 目标产品: {len(config.PRODUCTS_TO_EXTRACT)} 个")
+            pl(f"📦 目标产品: {len(config.get_products_to_extract())} 个")
             pl(f"{'═'*50}")
 
             loop = asyncio.new_event_loop()
@@ -1065,23 +1134,14 @@ def _run_batch_worker_impl(sid: str):
                     has_next = BatchManager.has_next_batch()
 
                     if has_next:
-                        if getattr(config, "AUTO_RESTART_ON_BATCH", False):
-                            # 开启了批次硬重启
-                            BatchManager.advance_to_next_batch(restarting=True)
-                            pl(f"{'═'*50}")
-                            pl(f"🔄 第 {batch_idx + 1}/{total_batches} 批次（共 {len(batch_accounts)} 个账号）处理完毕！")
-                            pl(f"⚡ 正在执行程序强制重启以彻底释放内存与浏览器残留（等同于 systemctl restart azure-key）...")
-                            pl(f"⏳ 服务将在重启后自动继续执行第 {batch_idx + 2}/{total_batches} 批次账号，请稍候...")
-                            pl(f"{'═'*50}")
-                            BatchManager.trigger_service_restart(delay=2.0)
-                            return
-                        else:
-                            # 未开启批次硬重启：无缝推进至下一批次继续执行
-                            BatchManager.advance_to_next_batch(restarting=False)
-                            continue
+                        # 网页任务仅清理自己的进程后继续，绝不重启整个服务。
+                        BatchManager.advance_to_next_batch(restarting=False)
+                        pl("🧹 当前批次已完成，清理当前用户的浏览器后继续下一批，不影响其他用户")
+                        BrowserProcessManager.cleanup_all()
+                        continue
                     else:
                         # 所有批次全部完成！
-                        BatchManager.mark_all_done(restarting=getattr(config, "AUTO_RESTART_ON_COMPLETE", True))
+                        BatchManager.mark_all_done(restarting=False)
                         all_results = BatchManager.get_all_results() or s.results
                         ok   = sum(1 for r in all_results if r.success)
                         fail = len(all_results) - ok
@@ -1101,19 +1161,13 @@ def _run_batch_worker_impl(sid: str):
                         # 自动导出汇总 Excel
                         if all_results:
                             try:
-                                fpath = export_to_excel(all_results)
+                                fpath = export_to_excel(all_results, f"azure_keys_{user_id}_{uuid.uuid4().hex}.xlsx")
                                 pl(f"📥 最终完整 Excel 已保存: {os.path.basename(fpath)}")
                             except Exception as e:
                                 pl(f"⚠️  Excel 导出失败: {e}")
 
                         pl("🏁 任务结束")
 
-                        if getattr(config, "AUTO_RESTART_ON_COMPLETE", True):
-                            pl(f"{'═'*50}")
-                            pl(f"🧹 全部任务已圆满结束，正在执行强制重启以彻底清理内存并杀死所有残留进程...")
-                            pl(f"{'═'*50}")
-                            BatchManager.trigger_service_restart(delay=2.0)
-                            return
                         break
 
                 except asyncio.CancelledError:
@@ -1122,7 +1176,7 @@ def _run_batch_worker_impl(sid: str):
                     break
                 except Exception as e:
                     pl(f"❌ 任务运行异常: {e}")
-                    BatchManager.stop_task()
+                    BatchManager.mark_failed(sid)
                     break
                 finally:
                     s.task_loop = None
@@ -1133,7 +1187,7 @@ def _run_batch_worker_impl(sid: str):
         s.running = False
         try:
             killed = BrowserProcessManager.cleanup_all()
-            pl(f"🧹 全部任务已结束，已彻底清理所有残留浏览器、驱动及代理进程 (共清理 {killed} 个进程)")
+            pl(f"🧹 当前用户任务已结束，已清理自己的浏览器、驱动及代理进程 (共清理 {killed} 个进程)")
         except Exception:
             pass
         release_system_memory()
