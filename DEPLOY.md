@@ -8,11 +8,26 @@
 apt-get update && apt-get install -y git curl ca-certificates && git clone --depth 1 --branch main https://github.com/zijin-c/azure-key-extractor.git /opt/azure-key-extractor && cd /opt/azure-key-extractor && bash install.sh
 ```
 
-脚本自动安装 Python 依赖、Chromium 和浏览器系统依赖，并启动 `azure-key` Systemd 服务、设置开机自启。浏览器系统依赖使用 [Playwright 官方安装命令](https://playwright.dev/python/docs/browsers#install-system-dependencies) 按发行版选择包名。
+脚本自动准备至少 8 GiB Swap，安装 Python 依赖、Chromium 和浏览器系统依赖，并启动 `azure-key` Systemd 服务、设置开机自启。浏览器系统依赖使用 [Playwright 官方安装命令](https://playwright.dev/python/docs/browsers#install-system-dependencies) 按发行版选择包名。
 
 完成后访问 `http://服务器IP:5010`，初始管理员为 `admin / admin123`；登录后修改密码。管理后台为 `/admin`。服务器安全组或防火墙需要允许 TCP 5010。查看日志：`journalctl -u azure-key -f`。
 
 全新部署会创建独立数据库，不会自动搬迁旧服务器的账号或累计统计。
+
+## 已部署服务器单独创建 8 GiB Swap
+
+以 root 登录，执行：
+
+```bash
+cd /opt/azure-key-extractor && git pull --ff-only && bash setup_swap.sh
+```
+
+- 此命令只配置 Swap，不重装应用依赖、不重启服务。新服务器的 `install.sh` 会自动执行相同步骤。
+- 按当前已启用的 Swap 总量补足至至少 8 GiB，已有约 8 GiB 或更多时跳过（允许少量 Swap 头部开销）；不会关闭或覆盖原有 Swap。新增文件通过 `mktemp` 创建为 `/swapfile-azure-key.<随机后缀>`，权限为 600，重复执行不会重复分配。
+- 启用成功后才向 `/etc/fstab` 添加独立条目，首次修改前备份到 `/etc/fstab.azure-key.bak`；重复执行不重复添加。重启后由系统自动启用。可用 `swapon --show` 和 `free -h` 检查。
+- 创建前检查磁盘剩余空间，并要求分配后至少保留 2 GiB。无 Swap 的服务器需约 10 GiB 空闲磁盘用于此步骤，另留应用和浏览器空间。Swap 是磁盘交换空间，不能替代实际内存或作为提高并发的保证。
+- 支持 ext2/3/4、XFS；Btrfs 会在写入前设置 NOCOW，仍需满足其单设备等 [官方 Swap 文件约束](https://btrfs.readthedocs.io/en/latest/Swapfile.html)。不支持的文件系统、VPS 禁止 `swapon`、写入或格式化失败会中止并提示，未启用的新文件会删除，原有 Swap 不受影响。
+- 脚本使用 [Linux Swap 启用及 fstab 配置方式](https://man7.org/linux/man-pages/man8/swapon.8.html)，不会执行 `swapoff` 或调整系统 swappiness。需要 root，独立运行需系统已有 `util-linux` 和 `coreutils`，Btrfs 另需 `e2fsprogs` 的 `chattr`；一键安装会安装这些工具。
 
 ## 管理后台与累计统计
 

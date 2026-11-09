@@ -66,14 +66,18 @@ if command -v apt-get >/dev/null 2>&1; then
     $SUDO apt-get update -y
     $SUDO apt-get install -y \
         python3 python3-pip python3-venv git curl ca-certificates wget procps lsof xvfb \
-        fonts-liberation fonts-noto-color-emoji
+        fonts-liberation fonts-noto-color-emoji util-linux coreutils e2fsprogs
 elif command -v dnf >/dev/null 2>&1; then
     $SUDO dnf update -y
-    $SUDO dnf install -y python3 python3-pip python3-virtualenv curl wget procps-ng lsof xorg-x11-server-Xvfb
+    $SUDO dnf install -y python3 python3-pip python3-virtualenv curl wget procps-ng lsof xorg-x11-server-Xvfb util-linux coreutils e2fsprogs
 elif command -v yum >/dev/null 2>&1; then
     $SUDO yum update -y
-    $SUDO yum install -y python3 python3-pip curl wget procps lsof xorg-x11-server-Xvfb
+    $SUDO yum install -y python3 python3-pip curl wget procps lsof xorg-x11-server-Xvfb util-linux coreutils e2fsprogs
 fi
+
+# 在安装浏览器前准备内存余量；已有足够 Swap 时不新增文件。
+echo -e "\n${GREEN}[Swap] 检查并配置至少 8 GiB Swap...${NC}"
+$SUDO bash "$SCRIPT_DIR/setup_swap.sh"
 
 # 2. 创建独立虚拟环境
 echo -e "\n${GREEN}[2/5] 创建独立虚拟环境 (venv)...${NC}"
