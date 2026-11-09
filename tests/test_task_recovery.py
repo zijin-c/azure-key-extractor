@@ -44,6 +44,11 @@ class TaskRecoveryTests(unittest.TestCase):
         p = patch.object(gui, "get_history", return_value=[])
         p.start()
         self.addCleanup(p.stop)
+        for name, value in (("user_exists", lambda user_id: True),
+                            ("get_user_policy", lambda user_id: {"require_proxy": False, "max_concurrency": 20})):
+            p = patch.object(gui, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         gui.app.testing = True
         self.first = Account("first@example.invalid", "synthetic")
         self.second = Account("second@example.invalid", "synthetic")

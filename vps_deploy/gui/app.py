@@ -34,6 +34,7 @@ from gui.auth import (
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
     is_user_admin, list_users, delete_user, change_password,
     save_user_setting, get_user_settings, get_admin_stats,
+    user_exists, get_user_policy, save_user_policy,
 )
 
 if getattr(sys, 'frozen', False):
@@ -149,13 +150,21 @@ def _push_log(sid: str, msg: str):
 
 @app.before_request
 def _ensure_sid():
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("Origin")
+        if (request.headers.get("Sec-Fetch-Site") == "cross-site"
+                or origin and urlsplit(origin).netloc.lower() != request.host.lower()):
+            return jsonify({"ok": False, "error": "拒绝跨站操作请求"}), 403
+    if "user_id" in session and not user_exists(session["user_id"]):
+        session.clear()
+        if request.endpoint not in {"login_page", "auth_login", "auth_logout"}:
+            return jsonify({"ok": False, "error": "用户已删除，请重新登录", "need_login": True}), 401
     if "user_id" in session:
         session["sid"] = f"user_{session['user_id']}"
-        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
-            origin = request.headers.get("Origin")
-            if (request.headers.get("Sec-Fetch-Site") == "cross-site"
-                    or origin and urlsplit(origin).netloc.lower() != request.host.lower()):
-                return jsonify({"ok": False, "error": "拒绝跨站操作请求"}), 403
+        # 旧标签页仍持有旧用户的数据，不能借切换后的浏览器 Cookie 写入新用户。
+        expected_user = request.headers.get("X-User-ID")
+        if expected_user is not None and expected_user != str(session["user_id"]):
+            return jsonify({"ok": False, "error": "登录账号已切换，请刷新页面", "need_reload": True}), 409
         if request.endpoint in {"api_status", "api_start", "api_stop", "api_restart", "api_cleanup", "api_results", "api_export", "stream"}:
             data = request.get_json(silent=True)
             supplied = request.args.getlist("sid")
@@ -165,6 +174,39 @@ def _ensure_sid():
                 return jsonify({"ok": False, "error": "不能访问其他用户的任务"}), 403
     elif "sid" not in session:
         session["sid"] = uuid.uuid4().hex
+
+
+@app.after_request
+def _private_response(response):
+    if request.endpoint != "static":
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _validated_proxy_pool(proxy_input):
+    """校验整个池，避免仅用非空文本绕过强制代理要求。"""
+    if proxy_input is not None and not isinstance(proxy_input, str):
+        raise ValueError("代理池必须为文本")
+    proxies = config.parse_proxy_list(proxy_input)
+    for index, proxy in enumerate(proxies, 1):
+        try:
+            parsed = urlsplit(proxy)
+            if (parsed.scheme not in {"http", "https", "socks4", "socks5"}
+                    or not parsed.hostname or not parsed.port
+                    or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+                raise ValueError()
+        except ValueError:
+            raise ValueError(f"代理池第 {index} 个节点格式无效，请填写 host:port 或完整代理 URL") from None
+    return proxies
+
+
+def _requested_concurrency(value, maximum):
+    if isinstance(value, bool) or not re.fullmatch(r"\d+", str(value).strip()):
+        raise ValueError("并发数必须为整数")
+    count = int(value)
+    if not 1 <= count <= maximum:
+        raise ValueError(f"当前账号的并发数必须为 1–{maximum}")
+    return count
 
 
 def _owns_task(task):
@@ -222,6 +264,7 @@ def auth_login():
     if not ok:
         return jsonify({"ok": False, "msg": "用户名或密码错误"})
 
+    session.clear()
     session["user_id"] = user_id
     session["username"] = username
     # 用 user_id 作为 sid，这样同一用户在不同设备共享任务状态
@@ -326,6 +369,22 @@ def admin_change_password():
     return jsonify({"ok": ok, "msg": "密码已修改" if ok else "密码至少4位"})
 
 
+@app.route("/admin/users/policy", methods=["POST"])
+@admin_required
+def admin_user_policy():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or type(data.get("user_id")) is not int:
+        return jsonify({"ok": False, "error": "用户 ID 必须为整数"}), 400
+    with _task_start_lock:
+        try:
+            ok = save_user_policy(data["user_id"], data.get("require_proxy"), data.get("max_concurrency"))
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+    if not ok:
+        return jsonify({"ok": False, "error": "用户不存在"}), 404
+    return jsonify({"ok": True, "msg": "已保存，下次任务及后续批次生效"})
+
+
 # ── 历史记录 API（服务端持久化）────────────────────────────────
 @app.route("/api/history")
 @login_required
@@ -363,7 +422,7 @@ def api_get_settings():
     """获取当前用户的专属设置"""
     user_id = session["user_id"]
     settings = get_user_settings(user_id)
-    return jsonify({"ok": True, "settings": settings})
+    return jsonify({"ok": True, "settings": settings, "policy": get_user_policy(user_id)})
 
 
 @app.route("/api/settings", methods=["POST"])
@@ -372,6 +431,12 @@ def api_save_settings():
     """保存当前用户的专属设置"""
     user_id = session["user_id"]
     data = request.get_json(force=True) or {}
+    if "concurrency" in data:
+        policy = get_user_policy(user_id)
+        try:
+            _requested_concurrency(data["concurrency"], policy["max_concurrency"])
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
     for key in ["accounts", "proxy", "headless", "products", "concurrency"]:
         if key in data:
             save_user_setting(user_id, key, str(data[key]))
@@ -385,6 +450,7 @@ def index():
     return render_template("index.html", sid=session.get("sid", ""),
                            username=session.get("username", ""),
                            is_admin=is_user_admin(session["user_id"]),
+                           user_id=session["user_id"], policy=get_user_policy(session["user_id"]),
                            products=PRODUCT_COLUMNS, product_short=PRODUCT_SHORT)
 
 
@@ -403,7 +469,9 @@ def api_status():
 @app.route("/api/start", methods=["POST"])
 @login_required
 def api_start():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("accounts", ""), str):
+        return jsonify({"ok": False, "error": "请提交有效的账号文本"}), 400
     sid  = session["sid"]
     s    = _get_sess(sid)
 
@@ -415,14 +483,22 @@ def api_start():
         headless     = data.get("headless", False)
         if sys.platform != "win32" and "DISPLAY" not in os.environ:
             headless = True
-        proxy        = data.get("proxy", "").strip() or None
+        proxy        = data.get("proxy")
         vless_proxy  = data.get("vless_proxy", "").strip() or None
         selected_products = data.get("products", None)  # 用户选择的产品列表
+        policy = get_user_policy(session["user_id"])
+        if policy is None:
+            return jsonify({"ok": False, "error": "用户不存在", "need_login": True}), 401
         try:
-            concurrency = max(1, min(20, int(data.get("concurrency", 3))))
+            concurrency = _requested_concurrency(data.get("concurrency", min(3, policy["max_concurrency"])),
+                                                 policy["max_concurrency"])
+            proxy_pool = _validated_proxy_pool(proxy)
+            if policy["require_proxy"] and not proxy_pool:
+                return jsonify({"ok": False, "error": "管理员要求此账号必须填写代理池，不能直连", "policy": policy}), 403
+            proxy = "\n".join(proxy_pool) or None
             batch_size = max(0, int(data.get("batch_size", getattr(config, "BATCH_SIZE", 0))))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "并发数和批次大小必须为整数"}), 400
+        except (TypeError, ValueError) as error:
+            return jsonify({"ok": False, "error": str(error), "policy": policy}), 400
         mode         = data.get("mode", "azure_student").strip()
 
         if not raw_accounts:
@@ -476,8 +552,15 @@ def api_start():
 @login_required
 def api_check_proxy():
     data       = request.get_json(force=True)
-    proxy_str  = data.get("proxy", "").strip()
+    proxy_str  = data.get("proxy")
     vless_str  = data.get("vless_proxy", "").strip()
+    policy = get_user_policy(session["user_id"])
+    try:
+        proxy_list = _validated_proxy_pool(proxy_str)
+    except ValueError as error:
+        return jsonify({"ok": False, "error": str(error)}), 400
+    if policy["require_proxy"] and not proxy_list:
+        return jsonify({"ok": False, "error": "管理员要求此账号必须填写代理池，不能直连"}), 403
 
     ip_check_urls = [
         ("https://api.ipify.org?format=json",  "json", "ip"),
@@ -503,15 +586,11 @@ def api_check_proxy():
                 last_err = str(e)
         return None, last_err
 
-    if not proxy_str:
+    if not proxy_list:
         ip, err = _get_ip()
         if ip:
             return jsonify({"ok": True, "ip": ip, "via_proxy": False, "msg": f"本机直连 IP: {ip}"})
         return jsonify({"ok": False, "error": f"无法获取本机 IP: {err}"})
-
-    proxy_list = config.parse_proxy_list(proxy_str)
-    if not proxy_list:
-        return jsonify({"ok": False, "error": "代理为空或格式无效"})
 
     # 全量检测代理池（并发检测所有节点，解除前10个上限）
     valid_count = 0
@@ -534,7 +613,7 @@ def api_check_proxy():
             ip, err = _get_ip(proxies)
         return idx, p_url, ip, err
 
-    max_workers = min(len(proxy_list), 50)
+    max_workers = min(len(proxy_list), policy["max_concurrency"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_check_one, (i, p)) for i, p in enumerate(proxy_list)]
         for f in concurrent.futures.as_completed(futures):
@@ -670,6 +749,7 @@ def api_export():
 @login_required
 def stream():
     sid = session["sid"]
+    user_id = session["user_id"]
     s   = _get_sess(sid)
 
     # 为每台连入的终端标签页/设备创建独立的日志队列并注册，实现广播分发
@@ -684,8 +764,12 @@ def stream():
 
             # 2. 持续订阅新的日志广播
             while True:
+                if not user_exists(user_id):
+                    return
                 try:
                     item = q.get(timeout=25)
+                    if not user_exists(user_id):
+                        return
                     yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                 except queue.Empty:
                     yield 'data: {"ping":1}\n\n'
@@ -810,6 +894,10 @@ def _run_batch_worker(sid: str):
         if not task or task.get("sid") != sid or not task.get("user_id"):
             s.running = False
             return
+        if not user_exists(task["user_id"]):
+            _push_log(sid, "⚠️ 用户已删除，任务不再恢复")
+            BatchManager.stop_task()
+            return
         with totp_cache_scope(task["user_id"]):
             try:
                 for row in get_history(task["user_id"]):
@@ -859,6 +947,22 @@ def _run_batch_worker_impl(sid: str):
         while s.running:
             task = BatchManager.get_active_task()
             if not task or task.get("status") not in ("running", "batch_restarting"):
+                break
+
+            # 重启恢复与后续批次同样校验最新策略，不能绕过后台限制。
+            policy = get_user_policy(user_id)
+            if policy is None:
+                pl("⚠️ 用户已删除，任务已停止")
+                BatchManager.stop_task()
+                break
+            concurrency = max(1, min(int(task.get("concurrency", 3)), policy["max_concurrency"]))
+            try:
+                pool = _validated_proxy_pool(proxy)
+                if policy["require_proxy"] and not pool:
+                    raise ValueError("管理员已要求使用代理，请填写代理池后重新启动任务")
+            except ValueError as error:
+                pl(f"⚠️ {error}")
+                BatchManager.stop_task()
                 break
 
             batch_accounts, batch_idx, total_batches, offset, total_accs = BatchManager.get_current_batch()

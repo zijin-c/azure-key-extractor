@@ -401,6 +401,7 @@ async function handleSubmit(e) {
     const j = await r.json();
 
     if (j.ok) {
+      try { localStorage.setItem('azkey_auth_change', Date.now()+':'+Math.random()); } catch (_) {}
       msg.className = 'msg ok';
       msg.textContent = j.msg || '成功';
       setTimeout(() => { window.location.href = '/'; }, 400);

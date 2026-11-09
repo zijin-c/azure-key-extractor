@@ -16,6 +16,8 @@ class UserIsolationTests(unittest.TestCase):
             (batch, "_QUEUE_FILE", str(Path(self.temp.name, "queue.json"))),
             (gui, "_sessions", {}),
             (gui, "_maintenance_pending", False),
+            (gui, "user_exists", lambda user_id: True),
+            (gui, "get_user_policy", lambda user_id: {"require_proxy": False, "max_concurrency": 20}),
         ):
             p = patch.object(target, name, value)
             p.start()

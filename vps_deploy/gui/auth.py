@@ -82,6 +82,20 @@ def init_db():
             extracted_at TEXT NOT NULL,
             PRIMARY KEY (user_id, product, key_hash)
         );
+
+        CREATE TABLE IF NOT EXISTS successful_accounts (
+            user_id INTEGER NOT NULL,
+            username TEXT NOT NULL,
+            email_hash TEXT NOT NULL,
+            succeeded_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, email_hash)
+        );
+
+        CREATE TABLE IF NOT EXISTS user_policies (
+            user_id INTEGER PRIMARY KEY,
+            require_proxy INTEGER NOT NULL DEFAULT 0 CHECK(require_proxy IN (0, 1)),
+            max_concurrency INTEGER NOT NULL DEFAULT 20 CHECK(max_concurrency BETWEEN 1 AND 20)
+        );
     """)
     conn.commit()
 
@@ -101,6 +115,14 @@ def init_db():
                     continue
                 _record_key_extractions(conn, row["user_id"], row["username"], keys, row["created_at"])
             conn.execute("INSERT INTO settings (key, value) VALUES ('key_stats_backfilled_v1', '1')")
+        if not conn.execute("SELECT 1 FROM settings WHERE key = 'account_stats_backfilled_v1'").fetchone():
+            for row in conn.execute("""
+                SELECT h.user_id, u.username, h.email, h.created_at
+                FROM task_history h LEFT JOIN users u ON u.id = h.user_id
+                WHERE h.success = 1 ORDER BY h.id
+            """):
+                _record_successful_account(conn, row["user_id"], row["username"], row["email"], row["created_at"])
+            conn.execute("INSERT INTO settings (key, value) VALUES ('account_stats_backfilled_v1', '1')")
 
     # 确保有默认管理员（首次启动时创建）
     admin = conn.execute("SELECT id FROM users WHERE is_admin = 1").fetchone()
@@ -180,6 +202,34 @@ def is_user_admin(user_id: int) -> bool:
     return bool(row and row["is_admin"])
 
 
+def user_exists(user_id: int) -> bool:
+    return bool(_get_db().execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone())
+
+
+def get_user_policy(user_id: int) -> dict | None:
+    row = _get_db().execute("""
+        SELECT COALESCE(p.require_proxy, 0) AS require_proxy,
+               COALESCE(p.max_concurrency, 20) AS max_concurrency
+        FROM users u LEFT JOIN user_policies p ON p.user_id = u.id WHERE u.id = ?
+    """, (user_id,)).fetchone()
+    return {"require_proxy": bool(row["require_proxy"]),
+            "max_concurrency": row["max_concurrency"]} if row else None
+
+
+def save_user_policy(user_id: int, require_proxy: bool, max_concurrency: int) -> bool:
+    if type(require_proxy) is not bool or type(max_concurrency) is not int or not 1 <= max_concurrency <= 20:
+        raise ValueError("强制代理必须为开关，并发上限必须为 1–20 的整数")
+    conn = _get_db()
+    with conn:
+        cur = conn.execute("""
+            INSERT INTO user_policies (user_id, require_proxy, max_concurrency)
+            SELECT id, ?, ? FROM users WHERE id = ?
+            ON CONFLICT(user_id) DO UPDATE SET require_proxy = excluded.require_proxy,
+                                               max_concurrency = excluded.max_concurrency
+        """, (int(require_proxy), max_concurrency, user_id))
+    return cur.rowcount > 0
+
+
 def list_users() -> list[dict]:
     """列出所有用户（管理员用）"""
     conn = _get_db()
@@ -198,6 +248,7 @@ def delete_user(user_id: int) -> bool:
             return False
         conn.execute("DELETE FROM task_history WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_policies WHERE user_id = ?", (user_id,))
     return True
 
 
@@ -217,6 +268,19 @@ def change_password(user_id: int, new_password: str) -> bool:
 
 
 # ── 历史记录 ─────────────────────────────────────────────────
+def _record_successful_account(conn, user_id, username, email, succeeded_at):
+    """同一用户成功过的邮箱只计一次，不保留邮箱明文。"""
+    if not isinstance(email, str) or not email.strip():
+        return
+    email_hash = hashlib.sha256(email.strip().casefold().encode("utf-8")).hexdigest()
+    conn.execute("""
+        INSERT INTO successful_accounts (user_id, username, email_hash, succeeded_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, email_hash) DO UPDATE SET
+            succeeded_at = MAX(successful_accounts.succeeded_at, excluded.succeeded_at)
+    """, (user_id, username or f"用户 #{user_id}", email_hash, succeeded_at))
+
+
 def _record_key_extractions(conn, user_id, username, keys, extracted_at):
     """按用户、产品、key 去重；失败任务中的部分有效结果也计入。"""
     if not isinstance(keys, dict):
@@ -244,16 +308,25 @@ def get_admin_stats() -> dict:
             FROM key_extractions GROUP BY user_id
         ), history AS (
             SELECT user_id, COUNT(*) AS history_count FROM task_history GROUP BY user_id
+        ), successes AS (
+            SELECT user_id, MIN(username) AS username, COUNT(*) AS successful_accounts
+            FROM successful_accounts GROUP BY user_id
         ), identities AS (
             SELECT id AS user_id FROM users UNION SELECT user_id FROM extracted
+            UNION SELECT user_id FROM successes
         )
-        SELECT i.user_id AS id, COALESCE(u.username, e.username) AS username,
+        SELECT i.user_id AS id, COALESCE(u.username, e.username, s.username) AS username,
                COALESCE(u.is_admin, 0) AS is_admin, u.created_at, u.last_login,
                u.id IS NULL AS deleted, COALESCE(e.extracted_keys, 0) AS extracted_keys,
-               COALESCE(h.history_count, 0) AS history_count, e.last_extracted_at
+               COALESCE(h.history_count, 0) AS history_count, e.last_extracted_at,
+               COALESCE(s.successful_accounts, 0) AS successful_accounts,
+               COALESCE(p.require_proxy, 0) AS require_proxy,
+               COALESCE(p.max_concurrency, 20) AS max_concurrency
         FROM identities i LEFT JOIN users u ON u.id = i.user_id
         LEFT JOIN extracted e ON e.user_id = i.user_id
         LEFT JOIN history h ON h.user_id = i.user_id
+        LEFT JOIN successes s ON s.user_id = i.user_id
+        LEFT JOIN user_policies p ON p.user_id = i.user_id
         ORDER BY extracted_keys DESC, i.user_id
     """).fetchall()
     users = [dict(row) for row in rows]
@@ -268,6 +341,7 @@ def get_admin_stats() -> dict:
             "active_users": sum(not user["deleted"] for user in users),
             "users_with_keys": sum(user["extracted_keys"] > 0 for user in users),
             "extracted_keys": sum(user["extracted_keys"] for user in users),
+            "successful_accounts": sum(user["successful_accounts"] for user in users),
         },
     }
 
@@ -280,6 +354,9 @@ def save_result(user_id: int, result_dict: dict):
     with conn:
         user = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
         _record_key_extractions(conn, user_id, user["username"] if user else None, keys, created_at)
+        if result_dict.get("success"):
+            _record_successful_account(conn, user_id, user["username"] if user else None,
+                                       result_dict.get("email"), created_at)
         conn.execute(
             """INSERT INTO task_history (user_id, email, password, totp_secret, success, keys, message, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",

@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Azure Education Key 提取工具</title>
+<script src="{{ url_for('static', filename='session.js') }}" data-user-id="{{ user_id }}"></script>
 <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <style>
 :root{
@@ -256,8 +257,9 @@ tr:hover td{background:rgba(108,140,255,.04)}
 
 <script id="tpl-data" type="application/json">
 {
-  "sid":          "{{ sid }}",
-  "username":     "{{ username }}",
+  "sid":          {{ sid | tojson }},
+  "username":     {{ username | tojson }},
+  "policy":       {{ policy | tojson }},
   "products":     {{ products | tojson }},
   "productShort": {{ product_short | tojson }}
 }
@@ -316,13 +318,13 @@ tr:hover td{background:rgba(108,140,255,.04)}
       <div class="field">
         <label for="concurrency-input">⚡ 并发进程数（同时运行几线程）</label>
         <div style="display:flex;align-items:center;gap:10px">
-          <input type="number" id="concurrency-input" min="1" max="20" value="3" style="width:100px;font-weight:600">
-          <span style="font-size:.72rem;color:var(--muted)">推荐 2 ~ 5 线程并发</span>
+          <input type="number" id="concurrency-input" min="1" max="{{ policy.max_concurrency }}" value="{{ [3, policy.max_concurrency]|min }}" style="width:100px;font-weight:600">
+          <span id="concurrency-policy" style="font-size:.72rem;color:var(--muted)">当前账号最多 {{ policy.max_concurrency }} 线程</span>
         </div>
       </div>
 
       <div class="field">
-        <label>🌐 代理池（支持多行/逗号分隔，轮询分发，留空直连）</label>
+        <label id="proxy-policy">🌐 代理池（支持多行/逗号分隔，轮询分发，{{ '此账号必须填写' if policy.require_proxy else '留空直连' }}）</label>
         <textarea id="proxy-input" style="min-height:70px;font-family:var(--mono);font-size:.74rem;line-height:1.4" placeholder="# 支持多代理自动轮询分发，每行一个:&#10;socks5://user:pass@1.2.3.4:1080&#10;socks5://user:pass@5.6.7.8:1080"></textarea>
         <div class="proxy-row" style="margin-top:6px">
           <button id="btn-check-ip" onclick="checkProxy()" style="flex:1">🔍 检测代理池</button>
@@ -489,15 +491,29 @@ const SID  = _TPL.sid;
 const PRODUCTS      = _TPL.products;
 const PRODUCT_SHORT = _TPL.productShort;
 let evtSource=null, isRunning=false;
+let userPolicy=_TPL.policy;
+window.addEventListener('session-invalidated',()=>{if(evtSource)evtSource.close();});
 
 const LS={ACC:'azkey_accounts',PROXY:'azkey_proxy',
   HEADLESS:'azkey_headless',HISTORY:'azkey_history',CURRENT:'azkey_current',
   THEME:'azkey_theme',AMAP:'azkey_account_map'};
-const lsGet=(k,d='')=>{try{return localStorage.getItem(k)??d}catch(e){return d}};
-const lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
-const lsGetJ=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}};
-const lsSetJ=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+// 账号、代理凭据、Key 仅在本页内存中缓存；持久化由服务端按用户隔离。
+const _draft=new Map();
+const lsGet=(k,d='')=>{if(k!==LS.THEME)return _draft.get(k)??d;try{return localStorage.getItem(k)??d}catch(e){return d}};
+const lsSet=(k,v)=>{if(k!==LS.THEME){_draft.set(k,v);return;}try{localStorage.setItem(k,v)}catch(e){}};
+const lsGetJ=(k,d)=>{try{return JSON.parse(lsGet(k,'null'))??d}catch(e){return d}};
+const lsSetJ=(k,v)=>lsSet(k,JSON.stringify(v));
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+
+function applyPolicy(policy){
+  if(!policy)return;
+  userPolicy=policy;
+  const input=document.getElementById('concurrency-input');
+  input.max=policy.max_concurrency;
+  input.value=Math.max(1,Math.min(parseInt(input.value)||3,policy.max_concurrency));
+  document.getElementById('concurrency-policy').textContent=`当前账号最多 ${policy.max_concurrency} 线程`;
+  document.getElementById('proxy-policy').textContent=`🌐 代理池（支持多行/逗号分隔，轮询分发，${policy.require_proxy?'此账号必须填写':'留空直连'}）`;
+}
 
 // ── Toast ──────────────────────────────────────────────────
 function showToast(msg,type='info',duration=2500){
@@ -721,7 +737,7 @@ function saveForm(){
 }
 
 async function loadForm(){
-  // 1. 优先使用本地缓存进行瞬间渲染，防止页面加载白屏
+  // 本页草稿仅驻留内存，跨页面从当前用户的服务端设置恢复。
   const acc = lsGet(LS.ACC, ''); if(acc) document.getElementById('accounts').value = acc;
   const proxy = lsGet(LS.PROXY, ''); if(proxy) document.getElementById('proxy-input').value = proxy;
   const concurrency = lsGet('azure_concurrency', '3'); if(concurrency) document.getElementById('concurrency-input').value = concurrency;
@@ -766,6 +782,7 @@ async function loadForm(){
       const n2 = document.querySelectorAll('.product-cb:checked').length;
       document.getElementById('product-count-label').textContent = `（已选 ${n2} 个）`;
     }
+    applyPolicy(j.policy);
   } catch(e) {
     console.error('加载同步设置异常:', e);
   }
@@ -902,6 +919,8 @@ async function startTask(){
   const concurrency=parseInt(document.getElementById('concurrency-input').value)||3;
   const selectedProducts=getSelectedProducts();
   if(!accounts){showToast('请填写账号列表','err');return;}
+  if(userPolicy.require_proxy && !proxy){showToast('管理员要求此账号必须填写代理池','err');return;}
+  if(concurrency<1 || concurrency>userPolicy.max_concurrency){showToast(`此账号最多允许 ${userPolicy.max_concurrency} 线程`,'err');return;}
   if(!selectedProducts.length){showToast('请至少选择一个产品','err');return;}
   saveForm();
   // 保存账号映射（用于失败恢复）
@@ -964,7 +983,7 @@ async function startTask(){
     body:JSON.stringify({accounts,headless,proxy,concurrency,sid:SID,products:selectedProducts,mode})});
 
   const j=await r.json();
-  if(!j.ok){showToast('启动失败: '+j.error,'err');return;}
+  if(!j.ok){if(j.policy)applyPolicy(j.policy);showToast('启动失败: '+j.error,'err');return;}
   setRunning(true);connectSSE();
   showToast(`任务已启动（${j.count} 个账号，${concurrency} 并发）`,'ok');
 }
@@ -1287,6 +1306,7 @@ function _doExportRows(rows, label){
 loadTheme();
 loadForm();
 loadServerHistory();  // 从服务端加载历史
+fetchAndAppendResults(); // 当前结果从服务端恢复，浏览器不保留账号凭据或 Key。
 connectSSE();
 syncStatus();  // 立即同步状态，避免 3 秒延迟
 
@@ -1294,6 +1314,8 @@ syncStatus();  // 立即同步状态，避免 3 秒延迟
 async function doLogout(){
   if(!confirm('确认退出登录？'))return;
   await fetch('/auth/logout',{method:'POST'});
+  _draft.clear();
+  try{localStorage.setItem('azkey_auth_change',Date.now()+':'+Math.random());}catch(e){}
   window.location.href='/login';
 }
 
@@ -1317,17 +1339,6 @@ async function changeMyPassword(){
     if(j.ok)document.getElementById('new-pwd').value='';
   }catch(e){showToast('修改失败: '+e,'err');}
 }
-
-// 全局 401 拦截（session 过期时自动跳转登录）
-const _origFetch = window.fetch;
-window.fetch = async function(...args){
-  const r = await _origFetch(...args);
-  if(r.status === 401){
-    const j = await r.clone().json().catch(()=>null);
-    if(j && j.need_login) window.location.href='/login';
-  }
-  return r;
-};
 
 async function syncStatus(){
   const s=await fetch('/api/status?sid='+SID).then(r=>r.json()).catch(()=>null);

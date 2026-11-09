@@ -7,11 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from test_task_recovery import gui
+from test_task_recovery import gui, batch
 from gui import auth
 
 
-class AdminStatsTests(unittest.TestCase):
+class DatabaseTestCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -21,6 +21,11 @@ class AdminStatsTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.addCleanup(self.close_db)
+        for target, name, value in ((gui, "_sessions", {}), (gui, "_maintenance_pending", False),
+                                    (batch, "_QUEUE_FILE", str(Path(self.temp.name, "queue.json")))):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         auth.init_db()
         auth.create_user("alice", "test-password")
         auth.create_user("bob", "test-password")
@@ -52,9 +57,11 @@ class AdminStatsTests(unittest.TestCase):
     def stats_user(self, user_id):
         return next(u for u in auth.get_admin_stats()["users"] if u["id"] == user_id)
 
+
+class AdminStatsTests(DatabaseTestCase):
     def test_all_admin_pages_and_apis_are_protected(self):
         gets = ("/admin", "/admin/", "/api/admin/stats", "/admin/users")
-        posts = ("/admin/users/create", "/admin/users/delete", "/admin/users/password", "/auth/register")
+        posts = ("/admin/users/create", "/admin/users/delete", "/admin/users/password", "/admin/users/policy", "/auth/register")
         for user_id in (None, self.alice):
             client = self.client(user_id)
             for path in gets:
@@ -106,6 +113,7 @@ class AdminStatsTests(unittest.TestCase):
         self.save(success=False, keys={})
         self.save(success=False, keys={"Visio": "", "Project": None, "Windows": "   ", "Invalid": []})
         self.assertEqual(self.stats_user(self.alice)["extracted_keys"], 0)
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 0)
         self.save(success=False, keys={"Visio": "SYNTHETIC-PARTIAL-KEY"})
         self.assertEqual(self.stats_user(self.alice)["extracted_keys"], 1)
 
@@ -141,7 +149,7 @@ class AdminStatsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         stats = response.get_json()
-        self.assertEqual(stats["summary"], {"active_users": 3, "users_with_keys": 1, "extracted_keys": 2})
+        self.assertEqual(stats["summary"], {"active_users": 3, "users_with_keys": 1, "extracted_keys": 2, "successful_accounts": 1})
         self.assertEqual(sum(p["extracted_keys"] for p in stats["products"]), 2)
         for secret in ("PRIVATE-PASSWORD", "PRIVATE-TOTP", "SYNTHETIC-KEY-A", "key_hash"):
             self.assertNotIn(secret, response.get_data(as_text=True))
@@ -157,6 +165,7 @@ class AdminStatsTests(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.save()
         self.assertEqual(self.stats_user(self.alice)["extracted_keys"], 0)
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 0)
 
     def test_existing_history_backfill_includes_all_rows_and_runs_once(self):
         conn = auth._get_db()
@@ -183,6 +192,47 @@ class AdminStatsTests(unittest.TestCase):
             list(pool.map(save_and_close, range(12)))
         self.assertEqual(self.stats_user(self.alice)["extracted_keys"], 13)
         self.assertEqual(self.stats_user(self.alice)["history_count"], 12)
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 1)
+
+    def test_successful_accounts_are_deduplicated_and_survive_deletion(self):
+        self.save(email=" First@Example.invalid ")
+        self.save(email="first@example.invalid", password="changed-password")
+        self.save(email="failed@example.invalid", success=False)
+        self.save(email="second@example.invalid")
+        self.save(self.bob, email="first@example.invalid")
+        self.save(email="")
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 2)
+        self.assertEqual(self.stats_user(self.bob)["successful_accounts"], 1)
+        auth.clear_history(self.alice)
+        auth.delete_user(self.alice)
+        self.close_db()
+        auth.init_db()
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 2)
+        self.assertTrue(self.stats_user(self.alice)["deleted"])
+        ledger = dict(auth._get_db().execute("SELECT * FROM successful_accounts LIMIT 1").fetchone())
+        self.assertEqual(len(ledger["email_hash"]), 64)
+        self.assertNotIn("@", json.dumps(ledger))
+
+    def test_success_without_keys_is_counted_by_result_status(self):
+        self.save(email="success@example.invalid", success=True, keys={})
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 1)
+        self.assertEqual(self.stats_user(self.alice)["extracted_keys"], 0)
+        auth.delete_user(self.alice)
+        self.assertTrue(self.stats_user(self.alice)["deleted"])
+
+    def test_success_backfill_uses_all_existing_history_once(self):
+        conn = auth._get_db()
+        conn.execute("DELETE FROM settings WHERE key='account_stats_backfilled_v1'")
+        conn.executemany("""INSERT INTO task_history
+            (user_id,email,password,success,created_at) VALUES (?,?,'',?,'2026-11-09 12:00:00')""",
+            [(self.alice, f"account-{i}@example.invalid", 1) for i in range(510)] +
+            [(self.alice, "ACCOUNT-0@example.invalid", 1), (self.alice, "failure@example.invalid", 0)])
+        conn.commit()
+        auth.init_db()
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 510)
+        auth.clear_history(self.alice)
+        auth.init_db()
+        self.assertEqual(self.stats_user(self.alice)["successful_accounts"], 510)
 
     def test_regular_user_can_still_change_own_password(self):
         response = self.client(self.alice).post("/auth/password", json={"password": "updated-password", "user_id": self.bob})
