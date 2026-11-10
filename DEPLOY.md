@@ -14,6 +14,22 @@ apt-get update && apt-get install -y git curl ca-certificates && git clone --dep
 
 全新部署会创建独立数据库，不会自动搬迁旧服务器的账号或累计统计。
 
+## 更新应用并确认实际运行版本
+
+单独更新应用并重启服务，不把可选的 Swap 配置放在重启前面：
+
+```bash
+cd /opt/azure-key-extractor && git pull --ff-only && systemctl restart azure-key
+systemctl show azure-key -p WorkingDirectory -p ExecStart -p MainPID --no-pager
+curl -fsSI --max-time 5 http://127.0.0.1:5010/login | grep -Ei '^X-Azure-Key-'
+```
+
+本版本响应头应包含 `X-Azure-Key-Version: 2026.11.10-entrypoint-fix` 和 `X-Azure-Key-Task-Isolation: per-user`。响应头来自运行中的 Python 进程，可以区别磁盘代码已更新但服务未重启的情况。若没有对应标识，请核对实际监听 5010 端口的进程、Systemd 的目录和启动命令，以及反向代理是否指向这台服务。
+
+`python run_gui.py`、`python app.py` 和 WSGI 的 `app:app` 均指向同一份 `gui.app` 后端；VPS 目录原先独立的旧版 `app.py` 已移除，避免绕过用户隔离。服务仍按现有单进程多线程方式运行，不要用多个 WSGI worker 同时管理同一套内存任务状态。
+
+如果旧命令使用 `git pull && bash setup_swap.sh && systemctl restart azure-key`，Swap 配置失败会使最后一步不执行。先按上面的命令更新服务，再单独执行需要的 Swap 配置。应用更新和重启不要求重新配置 Swap。
+
 ## 已部署服务器单独创建 8 GiB Swap
 
 以 root 登录，执行：

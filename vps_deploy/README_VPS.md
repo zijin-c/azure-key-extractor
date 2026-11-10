@@ -16,6 +16,10 @@ cd /opt/azure-key-extractor && git pull --ff-only && bash setup_swap.sh
 
 ### 管理后台与累计提取统计
 
+更新应用时执行 `cd /opt/azure-key-extractor && git pull --ff-only && systemctl restart azure-key`，Swap 可单独配置，避免 Swap 失败后 `&&` 阻止应用重启。更新后可用 `curl -fsSI --max-time 5 http://127.0.0.1:5010/login | grep -Ei '^X-Azure-Key-'` 核对运行进程：应返回 `2026.11.10-entrypoint-fix` 和 `per-user`。
+
+`run_gui.py`、`app.py` 和 WSGI `app:app` 均共用 `gui.app`，不再保留全站单队列的旧后端。若仍见旧提示，请检查 `systemctl show azure-key -p WorkingDirectory -p ExecStart -p MainPID --no-pager`，确认运行路径、进程启动时间及反向代理指向。
+
 现已支持多个用户同时运行自己的任务，同一用户仍只允许一个任务。任务队列、产品选择、浏览器/代理进程清理、结果和截图按用户隔离；停止 A 或 A 切换批次不会影响 B。每个用户继续遵守自己的代理要求与并发上限，总浏览器数会随同时运行的用户数增加。
 
 新队列在 `data/tasks/user_<id>.json`，旧 `data/task_queue.json` 首次升级时自动迁移并保留 `.legacy` 备份；启动会恢复各用户任务。网页任务不再根据 `AUTO_RESTART_ON_BATCH` / `AUTO_RESTART_ON_COMPLETE` 重启整个服务，批次只清理当前用户后继续；全局维护只能在所有用户空闲时由管理员执行。页面明确显示运行、清理、恢复、待恢复，避免页面显示“就绪”却无法启动。

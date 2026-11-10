@@ -31,6 +31,7 @@ from utils.process_manager import BrowserProcessManager, release_system_memory
 from utils.session_secret import load_session_secret
 from utils.totp_cache import totp_cache_scope, get_cached_totp, save_totp_cache
 from utils.task_scope import current_task_user, task_scope, system_task_scope
+from utils.build_info import APP_RELEASE, TASK_ISOLATION
 from gui.auth import (
     init_db, create_user, verify_user, login_required, admin_required,
     save_result, get_history, delete_history_items, clear_history as db_clear_history,
@@ -189,6 +190,8 @@ def _ensure_sid():
 
 @app.after_request
 def _private_response(response):
+    response.headers["X-Azure-Key-Version"] = APP_RELEASE
+    response.headers["X-Azure-Key-Task-Isolation"] = TASK_ISOLATION
     if request.endpoint != "static":
         response.headers["Cache-Control"] = "no-store"
     return response
